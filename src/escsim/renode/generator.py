@@ -2238,7 +2238,7 @@ def default_eeprom(path, model, extra=None):
     checkServo(), so a servo signal is ignored with no diagnostic.
     extra: additional overrides, e.g. CAN_NODE for a DroneCAN target."""
     try:
-        from escsim import params as sitl_params
+        from escsim.control import params as sitl_params
     except ImportError:
         raise Unsupported("ESCSim parameter support is not available; " "pass --eeprom")
     overrides = {"INPUT_SIGNAL_TYPE": 0}

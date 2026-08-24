@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 from importlib import resources
@@ -19,7 +19,6 @@ from urllib.request import Request, urlopen
 
 from escsim.settings import (
     DEFAULT_TARGETS_URL,
-    Settings,
     SettingsStore,
     TargetSourceSpec,
     default_cache_dir,
@@ -410,12 +409,7 @@ class TargetSourceManager:
 
         document = self.refresh(source)
         current = self.settings_store.load()
-        self.settings_store.save(
-            Settings(
-                targets_source=source,
-                artifact_base_url=current.artifact_base_url,
-            )
-        )
+        self.settings_store.save(replace(current, targets_source=source))
         return document
 
     def iter_cached(self) -> Iterator[TargetDocument]:

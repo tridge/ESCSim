@@ -20,6 +20,18 @@ def generator_command() -> list[str]:
     return [sys.executable, "-m", "escsim.renode.generator"]
 
 
+def generator_environment() -> dict[str, str]:
+    """Environment in which the internal generator can import this package."""
+    environment = os.environ.copy()
+    if not getattr(sys, "frozen", False):
+        source_root = str(Path(__file__).resolve().parents[2])
+        existing = environment.get("PYTHONPATH")
+        environment["PYTHONPATH"] = (
+            source_root if not existing else source_root + os.pathsep + existing
+        )
+    return environment
+
+
 @dataclass(frozen=True)
 class SessionSpec:
     target: str
@@ -97,13 +109,6 @@ class RenodeSession:
         if self.running():
             raise RuntimeError("Renode session is already running")
         self.spec.validate()
-        environment = os.environ.copy()
-        if not getattr(sys, "frozen", False):
-            source_root = str(Path(__file__).resolve().parents[2])
-            existing = environment.get("PYTHONPATH")
-            environment["PYTHONPATH"] = (
-                source_root if not existing else source_root + os.pathsep + existing
-            )
         self.process = ProcessTree(
             self.spec.command(),
             stdin=subprocess.PIPE,
@@ -111,7 +116,7 @@ class RenodeSession:
             stderr=subprocess.STDOUT,
             text=True,
             errors="replace",
-            env=environment,
+            env=generator_environment(),
         )
         self._pump = threading.Thread(target=self._pump_output, daemon=True)
         self._pump.start()

@@ -35,10 +35,24 @@ class TargetSourceSpec:
 
 
 @dataclass(frozen=True)
+class LauncherSettings:
+    """Selections restored when the desktop application is reopened."""
+
+    target: str = ""
+    bootloader: str = "auto"
+    firmware: str = "auto"
+    eeprom: str = "defaults"
+    configurator: str = "serial"
+    protocol: str = "4way"
+    can_bus: int = 8
+
+
+@dataclass(frozen=True)
 class Settings:
     schema: int = SETTINGS_SCHEMA
     targets_source: TargetSourceSpec = TargetSourceSpec()
     artifact_base_url: str = DEFAULT_ARTIFACT_BASE_URL
+    launcher: LauncherSettings = LauncherSettings()
 
 
 def default_config_dir() -> Path:
@@ -103,10 +117,31 @@ class SettingsStore:
         artifact_base_url = raw.get("artifact_base_url", DEFAULT_ARTIFACT_BASE_URL)
         if not isinstance(artifact_base_url, str) or not artifact_base_url:
             raise ValueError("artifact_base_url must be a non-empty string")
+        launcher_raw = raw.get("launcher", {})
+        if not isinstance(launcher_raw, dict):
+            raise ValueError("launcher must be an object")
+        launcher = LauncherSettings(
+            target=str(launcher_raw.get("target", "")),
+            bootloader=str(launcher_raw.get("bootloader", "auto")),
+            firmware=str(launcher_raw.get("firmware", "auto")),
+            eeprom=str(launcher_raw.get("eeprom", "defaults")),
+            configurator=str(launcher_raw.get("configurator", "serial")),
+            protocol=str(launcher_raw.get("protocol", "4way")),
+            can_bus=int(launcher_raw.get("can_bus", 8)),
+        )
+        if launcher.eeprom not in {"defaults", "blank"}:
+            raise ValueError("launcher eeprom must be defaults or blank")
+        if launcher.configurator not in {"serial", "usb", "off"}:
+            raise ValueError("launcher configurator must be serial, usb, or off")
+        if launcher.protocol not in {"4way", "direct"}:
+            raise ValueError("launcher protocol must be 4way or direct")
+        if not -1 <= launcher.can_bus <= 9:
+            raise ValueError("launcher can_bus must be -1..9")
         return Settings(
             schema=SETTINGS_SCHEMA,
             targets_source=source,
             artifact_base_url=artifact_base_url,
+            launcher=launcher,
         )
 
     def save(self, settings: Settings) -> None:

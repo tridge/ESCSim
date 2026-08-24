@@ -16,6 +16,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+gui = [
+    "dronecan",
+    "numpy>=2.0",
+    "pymavlink",
+    "pyqtgraph>=0.13",
+    "PySide6>=6.8",
+    "pyserial>=3.5",
+]
 test = [
     "pytest>=8",
 ]

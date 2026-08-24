@@ -82,6 +82,7 @@ def _renode_command(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="escsim")
     subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser("gui", help="open the Target and Control application")
     targets = subparsers.add_parser("targets", help="manage the targets.h source")
     actions = targets.add_subparsers(dest="targets_action", required=True)
     for name in ("status", "refresh", "list", "use-default"):
@@ -111,10 +112,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     effective_argv = sys.argv[1:] if argv is None else argv
+    if not effective_argv:
+        effective_argv = ["gui"]
     if effective_argv[:1] == ["--internal-generator"]:
         from escsim.renode.generator import main as generator_main
 
         return generator_main(effective_argv[1:])
+    if effective_argv[:1] == ["gui"]:
+        from escsim.gui import main as gui_main
+
+        return gui_main(effective_argv[1:])
     parser = build_parser()
     args = parser.parse_args(effective_argv)
     try:

@@ -25,8 +25,12 @@ def parse_elapsed(value: str) -> float:
     return days * 86400 + int(hours) * 3600 + int(fields[1]) * 60 + float(fields[2])
 
 
-def clean_monitor_text(data: bytes | str) -> str:
-    text = data.decode("utf-8", errors="replace") if isinstance(data, bytes) else data
+def clean_monitor_text(data: bytes | bytearray | str) -> str:
+    text = (
+        bytes(data).decode("utf-8", errors="replace")
+        if isinstance(data, (bytes, bytearray))
+        else data
+    )
     text = ANSI_RE.sub("", text).replace("\r", "")
     return text.replace("\ufffd", "")
 

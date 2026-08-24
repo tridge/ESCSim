@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 
@@ -12,7 +13,11 @@ from escsim.renode.monitor import (
     startup_error,
 )
 from escsim.renode.process import ProcessTree
-from escsim.renode.session import SessionSpec, generator_command
+from escsim.renode.session import (
+    SessionSpec,
+    generator_command,
+    generator_environment,
+)
 
 
 def test_elapsed_and_metrics_parsing():
@@ -39,6 +44,7 @@ def test_monitor_text_and_startup_error():
     assert "\x1b" not in clean_monitor_text(data)
     assert startup_error(data) == "Error while loading ELF: bad file"
     assert startup_error("(am32) ") is None
+    assert "error" in clean_monitor_text(bytearray(b"error\r\n"))
 
 
 def test_process_tree_starts_and_stops():
@@ -95,6 +101,16 @@ def test_session_spec_builds_package_command(tmp_path):
 def test_frozen_generator_command(monkeypatch):
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     assert generator_command() == [sys.executable, "--internal-generator"]
+
+
+def test_generator_environment_supports_source_and_frozen(monkeypatch):
+    monkeypatch.setenv("PYTHONPATH", "/existing")
+    environment = generator_environment()
+    assert environment["PYTHONPATH"].endswith("/existing")
+    assert "src" in environment["PYTHONPATH"].split(os.pathsep)[0]
+
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    assert generator_environment()["PYTHONPATH"] == "/existing"
 
 
 def test_session_spec_rejects_missing_files_and_ports(tmp_path):
