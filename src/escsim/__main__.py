@@ -37,6 +37,48 @@ def _targets_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _generate_command(args: argparse.Namespace) -> int:
+    from escsim.renode.generator import Unsupported, generate
+
+    try:
+        resc, repl = generate(
+            args.target,
+            str(args.outdir),
+            sigrok=args.sigrok,
+            bootloader_elf=str(args.bootloader) if args.bootloader else None,
+            no_firmware=args.no_firmware,
+        )
+    except Unsupported as error:
+        print(f"unsupported target: {error}", file=sys.stderr)
+        return 77
+    print(repl)
+    print(resc)
+    return 0
+
+
+def _renode_command(args: argparse.Namespace) -> int:
+    from escsim.renode import download
+
+    if args.renode_action == "status":
+        executable = download.cached(args.cache or download.default_cache())
+        if executable is None:
+            print("Renode is not cached")
+            return 1
+        print(executable)
+        return 0
+
+    def progress(received: int, size: int) -> None:
+        print(f"\rDownloading Renode: {received * 100 // size}%", end="", flush=True)
+
+    executable, metadata, installed = download.install_current(
+        args.cache, progress=progress
+    )
+    if installed:
+        print()
+    print(f"Renode {metadata.get('renode_version')} at {executable}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="escsim")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -49,12 +91,32 @@ def build_parser() -> argparse.ArgumentParser:
     set_file = actions.add_parser("set-file")
     set_file.add_argument("path")
     targets.set_defaults(handler=_targets_command)
+
+    generate = subparsers.add_parser("generate", help="generate a Renode target")
+    generate.add_argument("target")
+    generate.add_argument("--outdir", type=Path, required=True)
+    generate.add_argument("--sigrok", action="store_true")
+    generate.add_argument("--bootloader", type=Path)
+    generate.add_argument("--no-firmware", action="store_true")
+    generate.set_defaults(handler=_generate_command)
+
+    renode = subparsers.add_parser("renode", help="manage the verified Renode runtime")
+    renode_actions = renode.add_subparsers(dest="renode_action", required=True)
+    for name in ("status", "install"):
+        action = renode_actions.add_parser(name)
+        action.add_argument("--cache", type=Path, default=None)
+    renode.set_defaults(handler=_renode_command)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
+    effective_argv = sys.argv[1:] if argv is None else argv
+    if effective_argv[:1] == ["--internal-generator"]:
+        from escsim.renode.generator import main as generator_main
+
+        return generator_main(effective_argv[1:])
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(effective_argv)
     try:
         return args.handler(args)
     except (TargetSourceError, ValueError) as error:

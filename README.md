@@ -27,3 +27,31 @@ escsim targets refresh
 escsim targets list
 pytest
 ```
+
+## Renode target generation
+
+The target generator and all Renode platform/peripheral resources are part of
+the ESCSim package. Target preprocessing is performed in-process and checked
+against GCC in the tests; GCC is not used at runtime.
+
+```sh
+escsim renode install
+escsim generate VIMDRONES_L431 --outdir /tmp/escsim-target
+```
+
+The native motor model is built with CMake:
+
+```sh
+cmake -S native/am32sim -B build/native -DCMAKE_BUILD_TYPE=Release
+cmake --build build/native
+ctest --test-dir build/native --output-on-failure
+```
+
+The downloader uses the same verified `firmware.ardupilot.org` packages and
+cache as ArduPilot's Renode launcher. Firmware and bootloader catalog support
+will be added in a later implementation stage.
+
+## Licensing
+
+ESCSim is licensed under GPL-3.0-only. See [THIRD_PARTY.md](THIRD_PARTY.md)
+for resources derived from other projects.

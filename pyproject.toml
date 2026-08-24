@@ -7,11 +7,12 @@ name = "escsim"
 version = "0.1.0.dev0"
 description = "Standalone Renode-based AM32 ESC simulator"
 readme = "README.md"
-requires-python = ">=3.10"
-license = "GPL-3.0-or-later"
+requires-python = ">=3.12"
+license = "GPL-3.0-only"
 authors = [{name = "AM32 project"}]
 dependencies = [
     "platformdirs>=4.0",
+    "pyelftools>=0.32",
 ]
 
 [project.optional-dependencies]
@@ -24,6 +25,19 @@ escsim = "escsim.__main__:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
+include-package-data = true
+license-files = ["LICENSE", "licenses/*.txt"]
+
+[tool.setuptools.package-data]
+escsim = [
+    "resources/*.h",
+    "renode/resources/models/*.json",
+    "renode/resources/peripherals/*/*.cs",
+    "renode/resources/platforms/*.repl",
+    "renode/resources/scripts/*.py",
+    "renode/resources/scripts/*.resc",
+    "renode/resources/sim/*",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -31,3 +45,6 @@ where = ["src"]
 [tool.pytest.ini_options]
 addopts = "-ra"
 testpaths = ["tests"]
+
+[tool.ruff]
+extend-exclude = ["src/escsim/renode/resources/scripts"]

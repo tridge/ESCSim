@@ -1,0 +1,79 @@
+:name: AM32 G071
+:description: boots an AM32 STM32G071 firmware ELF
+
+# Common to every G071 target. Do not include this directly - include a
+# generated per-target .resc, which sets $platform and then comes here.
+# See am32_f051.resc for what the variables mean; the differences from
+# the F051 are noted below.
+
+$resources?=@.
+$elf?=@none
+$eeprom?=@none
+$platform?=@none
+
+# first, because each .cs is compiled on its own against the ones
+# included before it: the comparator interface has to exist before
+# anything implements it or looks one up
+include $resources/peripherals/common/IAM32Comparator.cs
+include $resources/peripherals/common/AM32_RegisterFile.cs
+include $resources/peripherals/stm32/AM32_STM32F0_DMA.cs
+include $resources/peripherals/stm32/AM32_STM32_CaptureTimer.cs
+include $resources/peripherals/stm32/AM32_STM32_AdvancedTimer.cs
+include $resources/peripherals/stm32/AM32_STM32_BasicTimer.cs
+include $resources/peripherals/stm32/AM32_STM32_FreeRunningTimer.cs
+include $resources/peripherals/stm32/AM32_STM32G0_EXTI.cs
+include $resources/peripherals/stm32/AM32_STM32G0_Comp.cs
+include $resources/peripherals/stm32/AM32_STM32_IWDG.cs
+include $resources/peripherals/common/AM32ThrottleGenerator.cs
+include $resources/peripherals/common/AM32_F051_Bridge.cs
+include $resources/peripherals/common/AM32_Sigrok.cs
+# after the bridge, which it samples for the physics sensor values
+include $resources/peripherals/stm32/AM32_STM32F0_ADC.cs
+# the LED strip decoder, whose type the guilink names
+include $resources/peripherals/common/AM32_Ws2812.cs
+# after the bridge and the generator, whose types it names
+include $resources/peripherals/common/AM32_GuiLink.cs
+
+mach create "am32"
+machine LoadPlatformDescription $platform
+
+sysbus LoadELF $elf
+
+# set by the generated per-target script: a 128k part keeps its settings
+# at 0x0801F800 where a 64k one uses 0x0800F800
+$eeprom_addr?=0x0800F800
+sysbus LoadBinary $eeprom $eeprom_addr
+
+# Factory temperature calibration, at the G0's addresses. Note these are
+# not the F051's values with different addresses: the G0 sensor voltage
+# RISES with temperature, and its calibration is taken at 3.0V rather
+# than 3.3V and at 130C rather than 110C for the second point. These are
+# representative STM32G0 numbers rather than any particular die.
+sysbus WriteWord 0x1FFF75A8 990
+sysbus WriteWord 0x1FFF75CA 1290
+
+# The G0 core is a Cortex-M0+, which does have a VTOR, and the firmware
+# sets it itself in initAfterJump(). Pointing the CPU at the flash table
+# is still needed for the reset vector, before any of that runs.
+cpu VectorTableOffset 0x08001000
+
+# ... and again after every reset. The firmware reboots itself on signal
+# loss, which any interactive session hits within a minute, and Renode
+# restores the CPU's default vector table at 0 when it resets. Nothing
+# is mapped there but an empty 4K bootloader region, so SP and PC both
+# read zero, the CPU halts with "PC does not lay in memory", and the ESC
+# is dead for the rest of the run while the emulation carries on looking
+# healthy. Renode says as much when this macro is missing: "No action
+# for reset - macro <machine>.reset is not registered".
+macro reset
+"""
+    cpu VectorTableOffset 0x08001000
+"""
+
+
+# 64MHz Cortex-M0+, one instruction per cycle; see am32_f051.resc for
+# why this is set rather than left at Renode's 100 MIPS default.
+cpu PerformanceInMips 64
+
+emulation SetGlobalQuantum "0.001"
+emulation SetGlobalAdvanceImmediately true

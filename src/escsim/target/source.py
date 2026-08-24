@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import hashlib
+from importlib import resources
 import ipaddress
 import json
 import os
@@ -17,6 +18,7 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from escsim.settings import (
+    DEFAULT_TARGETS_URL,
     Settings,
     SettingsStore,
     TargetSourceSpec,
@@ -374,7 +376,34 @@ class TargetSourceManager:
         cached = self._cached(source)
         if cached:
             return cached
-        return self.refresh(source)
+        try:
+            return self.refresh(source)
+        except TargetSourceError:
+            if source != TargetSourceSpec("url", DEFAULT_TARGETS_URL):
+                raise
+            return self.bundled_default()
+
+    @staticmethod
+    def bundled_default() -> TargetDocument:
+        """The release snapshot used for a network-free first start."""
+
+        resource = resources.files("escsim").joinpath("resources", "default-targets.h")
+        try:
+            content = resource.read_bytes()
+        except OSError as error:
+            raise TargetSourceError(
+                "default targets.h is unavailable and no cached copy exists"
+            ) from error
+        digest, targets = validate_targets_header(content)
+        return TargetDocument(
+            content=content,
+            sha256=digest,
+            targets=targets,
+            source=TargetSourceSpec("url", DEFAULT_TARGETS_URL),
+            fetched_at="bundled",
+            last_checked_at="bundled",
+            from_cache=True,
+        )
 
     def select(self, source: TargetSourceSpec) -> TargetDocument:
         """Validate/cache a new source before persisting the selection."""

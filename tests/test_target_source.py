@@ -173,6 +173,19 @@ def test_failed_refresh_keeps_previous_cache(tmp_path):
     assert cached.from_cache
 
 
+def test_default_source_falls_back_to_packaged_snapshot(tmp_path, monkeypatch):
+    subject = manager(tmp_path)
+
+    def unavailable(_source, _cached):
+        raise TargetSourceError("offline")
+
+    monkeypatch.setattr(subject, "_fetch_url", unavailable)
+    document = subject.active()
+    assert document.fetched_at == "bundled"
+    assert document.from_cache
+    assert "VIMDRONES_L431" in document.targets
+
+
 def test_non_loopback_http_is_rejected(tmp_path):
     subject = manager(tmp_path)
     source = TargetSourceSpec("url", "http://example.com/targets.h")
