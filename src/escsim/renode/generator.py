@@ -37,7 +37,11 @@ import sys
 
 from escsim.settings import default_cache_dir
 from escsim.target.preprocessor import PreprocessorError, preprocess_macros
-from escsim.target.source import TargetSourceError, TargetSourceManager
+from escsim.target.source import (
+    TargetSourceError,
+    TargetSourceManager,
+    validate_targets_header,
+)
 
 
 _RESOURCE_STACK = ExitStack()
@@ -845,9 +849,9 @@ def capture_input_af(family, timer, port, pin, channel=0):
     return None
 
 
-def config(target, nm="arm-none-eabi-gcc"):
+def config(target, nm="arm-none-eabi-gcc", targets_text=None):
     """everything the .repl needs, or Unsupported with the reason"""
-    m = macros(target, nm)
+    m = macros(target, nm, targets_text=targets_text)
     if "FILE_NAME" not in m:
         raise Unsupported("%s is not a target in targets.h" % target)
 
@@ -2199,9 +2203,10 @@ def generate(
     sigrok=False,
     bootloader_elf=None,
     no_firmware=False,
+    targets_text=None,
 ):
     """write the pair, return (resc, repl). Raises Unsupported."""
-    cfg = config(target, nm)
+    cfg = config(target, nm, targets_text=targets_text)
     os.makedirs(outdir, exist_ok=True)
     repl = os.path.join(outdir, "%s.repl" % target)
     resc = os.path.join(outdir, "%s.resc" % target)
@@ -2893,6 +2898,10 @@ def main(argv=None):
     ap.add_argument(
         "--outdir", default=None, help="default: the user cache work directory"
     )
+    ap.add_argument(
+        "--targets-file",
+        help="historical targets.h snapshot paired with a published firmware",
+    )
     ap.add_argument("--nm", default=None, help=argparse.SUPPRESS)
     ap.add_argument(
         "--nm-bin",
@@ -3096,6 +3105,15 @@ def main(argv=None):
             )
         print("Renode host CPU affinity: %d" % args.cpusel)
 
+    targets_text = None
+    if args.targets_file:
+        try:
+            with open(args.targets_file, "rb") as stream:
+                targets_content = stream.read(2 * 1024 * 1024 + 1)
+            validate_targets_header(targets_content)
+            targets_text = targets_content.decode("utf-8")
+        except (OSError, UnicodeError, TargetSourceError) as error:
+            ap.error("cannot load --targets-file: %s" % error)
     if args.list:
         for t in all_targets(args.nm):
             print(t)
@@ -3106,7 +3124,7 @@ def main(argv=None):
         import json
 
         try:
-            cfg = config(args.target, args.nm)
+            cfg = config(args.target, args.nm, targets_text=targets_text)
         except Unsupported as e:
             print(json.dumps({"error": str(e)}))
             return 77
@@ -3138,7 +3156,7 @@ def main(argv=None):
     if args.blank_eeprom and args.eeprom is not None:
         ap.error("--blank-eeprom and --eeprom are mutually exclusive")
     try:
-        cfg = config(args.target, args.nm)
+        cfg = config(args.target, args.nm, targets_text=targets_text)
         resc, repl = generate(
             args.target,
             outdir,
@@ -3146,6 +3164,7 @@ def main(argv=None):
             sigrok=args.sigrok,
             bootloader_elf=args.bootloader_elf,
             no_firmware=args.no_firmware,
+            targets_text=targets_text,
         )
     except Unsupported as e:
         print("SKIP: %s" % e)

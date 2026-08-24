@@ -1,0 +1,7 @@
+ESCSIM_SOURCE=/opt/ESCSim
+AM32_SOURCE=/srv/git/AM32
+AM32_BOOTLOADER_SOURCE=/srv/git/AM32-bootloader
+ESCSIM_WORK_ROOT=/var/lib/escsim-builder
+ESCSIM_DOCUMENT_ROOT=/var/www/am32.tridgell.net/html/ESCSim
+ESCSIM_CHANNEL=nightly
+ESCSIM_JOBS=8

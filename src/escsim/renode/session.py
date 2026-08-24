@@ -39,6 +39,7 @@ class SessionSpec:
     eeprom: Path
     model: Path
     bootloader: Path | None = None
+    targets_header: Path | None = None
     renode: Path | None = None
     gui_port: int = 57733
     state_port: int = 57734
@@ -67,6 +68,8 @@ class SessionSpec:
         ]
         if self.bootloader is not None:
             command.extend(("--bootloader-elf", str(self.bootloader)))
+        if self.targets_header is not None:
+            command.extend(("--targets-file", str(self.targets_header)))
         if self.renode is not None:
             command.extend(("--renode", str(self.renode)))
         if self.can_bus >= 0:
@@ -83,6 +86,8 @@ class SessionSpec:
                 raise ValueError(f"no {label} at {path}")
         if self.bootloader is not None and not Path(self.bootloader).is_file():
             raise ValueError(f"no bootloader at {self.bootloader}")
+        if self.targets_header is not None and not Path(self.targets_header).is_file():
+            raise ValueError(f"no targets.h at {self.targets_header}")
         if self.renode is not None and not Path(self.renode).is_file():
             raise ValueError(f"no Renode executable at {self.renode}")
         for label, port in (

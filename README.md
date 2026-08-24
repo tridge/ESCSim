@@ -48,8 +48,9 @@ ctest --test-dir build/native --output-on-failure
 ```
 
 The downloader uses the same verified `firmware.ardupilot.org` packages and
-cache as ArduPilot's Renode launcher. Firmware and bootloader catalog support
-will be added in a later implementation stage.
+cache as ArduPilot's Renode launcher. Versioned firmware/bootloader downloads
+and the fjall publisher are covered in
+[docs/artifact-repository.md](docs/artifact-repository.md).
 
 ## Licensing
 

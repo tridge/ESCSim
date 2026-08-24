@@ -1,0 +1,18 @@
+[Unit]
+Description=Build and publish ESCSim firmware artifacts
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=escsim-publisher
+Group=escsim-publisher
+EnvironmentFile=/etc/escsim-publisher.conf
+ExecStart=/opt/ESCSim/scripts/publish-from-checkouts.sh
+TimeoutStartSec=6h
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/escsim-builder /var/www/am32.tridgell.net/html/ESCSim

@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://am32.tridgell.net/ESCSim/schemas/catalog-v1.schema.json",
+  "title": "ESCSim artifact catalog v1",
+  "type": "object",
+  "required": ["schema_version", "generated_at", "channels", "releases"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "generated_at": {"type": "string"},
+    "channels": {"type": "object"},
+    "releases": {
+      "type": "object",
+      "required": ["firmware", "bootloader"],
+      "properties": {
+        "firmware": {"$ref": "#/$defs/releases"},
+        "bootloader": {"$ref": "#/$defs/releases"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "$defs": {
+    "releases": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "channel", "revision", "manifest", "targets"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$"},
+          "channel": {"enum": ["stable", "development", "nightly"]},
+          "revision": {"type": "string"},
+          "manifest": {"type": "string"},
+          "targets": {"type": "array", "items": {"type": "string"}, "maxItems": 2000}
+        },
+        "additionalProperties": false
+      },
+      "maxItems": 1000
+    }
+  },
+  "additionalProperties": false
+}

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from pathlib import Path
 import sys
 
-from escsim.settings import DEFAULT_TARGETS_URL, TargetSourceSpec
+from escsim.artifacts.catalog import CatalogError
+from escsim.settings import DEFAULT_TARGETS_URL, SettingsStore, TargetSourceSpec
 from escsim.target.source import TargetSourceError, TargetSourceManager
 
 
@@ -79,6 +81,32 @@ def _renode_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _artifacts_command(args: argparse.Namespace) -> int:
+    from escsim.artifacts.catalog import ArtifactRepository
+
+    if args.artifact_action == "set-base":
+        ArtifactRepository(args.url, args.cache)
+        store = SettingsStore()
+        store.save(replace(store.load(), artifact_base_url=args.url.rstrip("/") + "/"))
+        print(store.load().artifact_base_url)
+        return 0
+    repository = ArtifactRepository(args.base_url, args.cache)
+    if args.artifact_action in {"list", "refresh"}:
+        catalog = repository.catalog(refresh=args.artifact_action == "refresh")
+        for project in ("firmware", "bootloader"):
+            for release in catalog["releases"][project]:
+                print(
+                    f"{project} {release['id']} {release['channel']} "
+                    f"({len(release['targets'])} targets)"
+                )
+        return 0
+    installed = repository.install(args.project, args.release, args.target)
+    print(installed.image)
+    if installed.targets_header:
+        print(installed.targets_header)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="escsim")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -107,6 +135,25 @@ def build_parser() -> argparse.ArgumentParser:
         action = renode_actions.add_parser(name)
         action.add_argument("--cache", type=Path, default=None)
     renode.set_defaults(handler=_renode_command)
+
+    artifacts = subparsers.add_parser(
+        "artifacts", help="manage versioned firmware and bootloader downloads"
+    )
+    artifact_actions = artifacts.add_subparsers(dest="artifact_action", required=True)
+    for name in ("list", "refresh"):
+        action = artifact_actions.add_parser(name)
+        action.add_argument("--base-url")
+        action.add_argument("--cache", type=Path)
+    set_base = artifact_actions.add_parser("set-base")
+    set_base.add_argument("url")
+    set_base.add_argument("--cache", type=Path)
+    install = artifact_actions.add_parser("install")
+    install.add_argument("project", choices=("firmware", "bootloader"))
+    install.add_argument("release")
+    install.add_argument("target")
+    install.add_argument("--base-url")
+    install.add_argument("--cache", type=Path)
+    artifacts.set_defaults(handler=_artifacts_command)
     return parser
 
 
@@ -126,7 +173,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(effective_argv)
     try:
         return args.handler(args)
-    except (TargetSourceError, ValueError) as error:
+    except (CatalogError, TargetSourceError, ValueError) as error:
         parser.error(str(error))
         return 2
 

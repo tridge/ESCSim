@@ -55,6 +55,7 @@ from types import SimpleNamespace
 from escsim.control import msp_stub_fc
 from escsim.control import ui as sitl_gui
 from escsim.control import usbip as sitl_usbip
+from escsim.artifacts.catalog import ArtifactRepository
 from escsim.renode import download as renode_download
 from escsim.renode import monitor as renode_monitor
 from escsim.renode.generator import (
@@ -203,6 +204,7 @@ class Lab(object):
         self.info = None  # {'family','pin','dronecan'}
         self.bootloader = "auto"  # auto | none | path
         self.firmware = "auto"  # auto | none | path
+        self.targets_header = None
         self.eeprom = "defaults"  # defaults | blank
         self.metrics = None  # latest monitor sample
         self.generation = 0  # invalidates old pollers
@@ -325,6 +327,8 @@ class Lab(object):
             if not os.path.isfile(self.firmware):
                 return "no firmware at %s" % self.firmware
             cmd += ["--elf", self.firmware]
+        if self.targets_header is not None:
+            cmd += ["--targets-file", self.targets_header]
         if self.eeprom == "blank":
             cmd += ["--blank-eeprom"]
         if self.info["dronecan"]:
@@ -671,6 +675,8 @@ def main(argv=None):
     settings_store = SettingsStore()
     preferences = settings_store.load().launcher
     lab.bootloader = preferences.bootloader
+    artifact_repository = ArtifactRepository()
+    artifact_catalog = [None]
 
     class LauncherWindow(QWidget):
         def closeEvent(self, event):
@@ -790,19 +796,42 @@ def main(argv=None):
     grid.addWidget(bl_browse, 2, 3)
 
     def refresh_bootloaders():
+        desired = lab.bootloader
+        bl_combo.blockSignals(True)
         bl_combo.clear()
         hits = lab.matched_bootloaders()
+        bl_combo.addItem("Auto (published stable or local match)", "auto")
+        catalog = artifact_catalog[0]
+        if catalog is not None:
+            for release in catalog["releases"]["bootloader"]:
+                bl_combo.addItem(
+                    "Published V%s (%s)" % (release["id"], release["channel"]),
+                    "catalog:bootloader:%s" % release["id"],
+                )
         for h in hits:
             bl_combo.addItem(os.path.basename(h), h)
         bl_combo.addItem("None (boot straight into the app)", "none")
-        selected = bl_combo.findData(lab.bootloader)
-        if selected < 0 and lab.bootloader not in ("auto", "none"):
-            bl_combo.insertItem(0, os.path.basename(lab.bootloader), lab.bootloader)
+        selected = bl_combo.findData(desired)
+        if desired == "auto" and catalog is not None:
+            selected = -1
+        if (
+            selected < 0
+            and desired not in ("auto", "none")
+            and not desired.startswith("catalog:")
+        ):
+            bl_combo.insertItem(0, os.path.basename(desired), desired)
             selected = 0
         if selected >= 0:
             bl_combo.setCurrentIndex(selected)
+        elif catalog is not None:
+            stable = catalog.get("channels", {}).get("stable", {}).get("bootloader")
+            published = bl_combo.findData("catalog:bootloader:%s" % stable)
+            bl_combo.setCurrentIndex(published if published >= 0 else 0)
         elif not hits:
-            bl_combo.setCurrentIndex(bl_combo.count() - 1)
+            bl_combo.setCurrentIndex(0)
+        bl_combo.blockSignals(False)
+        if not (desired.startswith("catalog:") and catalog is None):
+            bl_changed()
 
     def bl_changed():
         data = bl_combo.currentData()
@@ -828,7 +857,9 @@ def main(argv=None):
     fw_combo = QComboBox()
     fw_combo.addItem("Auto (newest obj/AM32_<TARGET>_*.elf)", "auto")
     fw_combo.addItem("None (blank flash, factory-fresh ESC)", "none")
-    if preferences.firmware not in ("auto", "none"):
+    if preferences.firmware.startswith("catalog:"):
+        fw_combo.setCurrentIndex(fw_combo.findData("auto"))
+    elif preferences.firmware not in ("auto", "none"):
         fw_combo.insertItem(
             0, os.path.basename(preferences.firmware), preferences.firmware
         )
@@ -855,6 +886,28 @@ def main(argv=None):
             fw_combo.setCurrentIndex(0)
 
     fw_browse.clicked.connect(browse_fw)
+
+    def refresh_firmware_releases():
+        for index in reversed(range(fw_combo.count())):
+            data = fw_combo.itemData(index)
+            if isinstance(data, str) and data.startswith("catalog:firmware:"):
+                fw_combo.removeItem(index)
+        catalog = artifact_catalog[0]
+        if catalog is None or not lab.target:
+            return
+        for release in catalog["releases"]["firmware"]:
+            if lab.target in release["targets"]:
+                fw_combo.addItem(
+                    "Published %s (%s)" % (release["id"], release["channel"]),
+                    "catalog:firmware:%s" % release["id"],
+                )
+        desired = preferences.firmware
+        if desired == "auto":
+            stable = catalog.get("channels", {}).get("stable", {}).get("firmware")
+            desired = "catalog:firmware:%s" % stable
+        index = fw_combo.findData(desired)
+        if index >= 0:
+            fw_combo.setCurrentIndex(index)
 
     grid.addWidget(QLabel("CAN bus"), 4, 0)
     can_spin = QSpinBox()
@@ -1077,8 +1130,10 @@ def main(argv=None):
 
     download_renode.clicked.connect(start_renode_download)
 
-    def do_start():
-        lab.firmware = fw_combo.currentData() or "auto"
+    def start_lab(firmware, bootloader, targets_header=None):
+        lab.firmware = firmware
+        lab.bootloader = bootloader
+        lab.targets_header = targets_header
         lab.eeprom = ee_combo.currentData()
         lab.conf = conf_combo.currentData()
         lab.protocol = proto_combo.currentData()
@@ -1091,6 +1146,62 @@ def main(argv=None):
             return
         start_btn.setEnabled(False)
         stop_btn.setEnabled(True)
+
+    def do_start():
+        firmware = fw_combo.currentData() or "auto"
+        bootloader = bl_combo.currentData() or "auto"
+        firmware_catalog = isinstance(firmware, str) and firmware.startswith(
+            "catalog:firmware:"
+        )
+        bootloader_catalog = isinstance(bootloader, str) and bootloader.startswith(
+            "catalog:bootloader:"
+        )
+        if not firmware_catalog and not bootloader_catalog:
+            start_lab(firmware, bootloader)
+            return
+        selected_target = lab.target
+        firmware_metadata = dict(lab.info or {})
+        for control in (target_filter, target_combo, fw_combo, bl_combo):
+            control.setEnabled(False)
+        start_btn.setEnabled(False)
+        status_label.setText("downloading verified firmware/bootloader...")
+
+        def install_artifacts():
+            try:
+                header = None
+                selected_metadata = firmware_metadata
+                installed_firmware = firmware
+                if firmware_catalog:
+                    release = firmware.rsplit(":", 1)[1]
+                    installed = artifact_repository.install(
+                        "firmware", release, selected_target
+                    )
+                    installed_firmware = os.fspath(installed.image)
+                    header = os.fspath(installed.targets_header)
+                    selected_metadata = installed.metadata
+                installed_bootloader = bootloader
+                if bootloader_catalog:
+                    release = bootloader.rsplit(":", 1)[1]
+                    variant = artifact_repository.compatible_bootloader(
+                        release, selected_metadata
+                    )
+                    installed = artifact_repository.install(
+                        "bootloader", release, variant["name"]
+                    )
+                    installed_bootloader = os.fspath(installed.image)
+                lab.log_q.put(
+                    (
+                        "__artifacts_ready__",
+                        installed_firmware,
+                        installed_bootloader,
+                        header,
+                        selected_target,
+                    )
+                )
+            except Exception as error:
+                lab.log_q.put(("__artifacts_error__", str(error)))
+
+        threading.Thread(target=install_artifacts, daemon=True).start()
 
     def save_preferences():
         current = settings_store.load()
@@ -1201,6 +1312,7 @@ def main(argv=None):
                 )
                 can_spin.setEnabled(bool(info["dronecan"]))
                 refresh_bootloaders()
+                refresh_firmware_releases()
                 rebuild_control_panel()
                 continue
             if isinstance(item, tuple) and item[0] == "__targets__":
@@ -1226,6 +1338,39 @@ def main(argv=None):
                 source_file_btn.setEnabled(True)
                 info_label.setText("targets.h failed: %s" % item[1])
                 lines.append("[targets] %s" % item[1])
+                continue
+            if isinstance(item, tuple) and item[0] == "__artifact_catalog__":
+                artifact_catalog[0] = item[1]
+                refresh_bootloaders()
+                refresh_firmware_releases()
+                lines.append(
+                    "[artifacts] %u firmware and %u bootloader releases"
+                    % (
+                        len(item[1]["releases"]["firmware"]),
+                        len(item[1]["releases"]["bootloader"]),
+                    )
+                )
+                continue
+            if isinstance(item, tuple) and item[0] == "__artifact_catalog_error__":
+                lines.append("[artifacts] catalog unavailable: %s" % item[1])
+                continue
+            if isinstance(item, tuple) and item[0] == "__artifacts_ready__":
+                _tag, firmware, bootloader, header, selected_target = item
+                for control in (target_filter, target_combo, fw_combo, bl_combo):
+                    control.setEnabled(True)
+                start_btn.setEnabled(True)
+                if lab.target != selected_target:
+                    lab.status = "target changed while artifacts were downloading"
+                    lines.append("[artifacts] " + lab.status)
+                else:
+                    start_lab(firmware, bootloader, header)
+                continue
+            if isinstance(item, tuple) and item[0] == "__artifacts_error__":
+                for control in (target_filter, target_combo, fw_combo, bl_combo):
+                    control.setEnabled(True)
+                start_btn.setEnabled(True)
+                lab.status = "artifact download failed: %s" % item[1]
+                lines.append("[artifacts] %s" % item[1])
                 continue
             lab.saw_log_line(item)
             lines.append(item)
@@ -1336,7 +1481,15 @@ def main(argv=None):
         lab.log_q.put("%u targets" % len(found))
         lab.log_q.put(("__targets__", found))
 
+    def artifacts_thread():
+        try:
+            catalog = artifact_repository.catalog(refresh=True)
+            lab.log_q.put(("__artifact_catalog__", catalog))
+        except Exception as error:
+            lab.log_q.put(("__artifact_catalog_error__", str(error)))
+
     threading.Thread(target=targets_thread, daemon=True).start()
+    threading.Thread(target=artifacts_thread, daemon=True).start()
     threading.Thread(target=check_renode_download, daemon=True).start()
 
     signal.signal(signal.SIGINT, lambda *a: app.quit())

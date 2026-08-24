@@ -30,6 +30,7 @@ test = [
 
 [project.scripts]
 escsim = "escsim.__main__:main"
+escsim-publisher = "escsim.artifacts.publisher:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
