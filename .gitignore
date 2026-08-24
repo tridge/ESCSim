@@ -9,3 +9,6 @@ build/
 dist/
 wheelhouse/
 *.log
+/plan.md
+src/escsim/renode/lib/*
+!src/escsim/renode/lib/.gitkeep

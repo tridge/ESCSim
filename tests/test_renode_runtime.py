@@ -98,6 +98,22 @@ def test_session_spec_builds_package_command(tmp_path):
     assert command[command.index("--can-bus") + 1] == "8"
 
 
+def test_session_spec_passes_historical_targets_header(tmp_path):
+    files = make_session_files(tmp_path)
+    header = tmp_path / "targets.h"
+    header.write_text("snapshot")
+    spec = SessionSpec(
+        target="VIMDRONES_L431",
+        firmware=files["firmware.elf"],
+        eeprom=files["eeprom.bin"],
+        model=files["model.json"],
+        targets_header=header,
+    )
+    spec.validate()
+    command = spec.command()
+    assert command[command.index("--targets-file") + 1] == str(header)
+
+
 def test_frozen_generator_command(monkeypatch):
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     assert generator_command() == [sys.executable, "--internal-generator"]

@@ -61,4 +61,5 @@ def test_native_library_does_not_trust_working_directory(tmp_path, monkeypatch):
     attacker_library.write_bytes(b"not trusted")
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("ESCSIM_AM32SIM_LIBRARY", raising=False)
-    assert generator.native_library_path() is None
+    selected = generator.native_library_path()
+    assert selected is None or Path(selected) != attacker_library

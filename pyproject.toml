@@ -19,7 +19,6 @@ dependencies = [
 gui = [
     "dronecan",
     "numpy>=2.0",
-    "pymavlink",
     "pyqtgraph>=0.13",
     "PySide6>=6.8",
     "pyserial>=3.5",
@@ -46,6 +45,7 @@ escsim = [
     "renode/resources/scripts/*.py",
     "renode/resources/scripts/*.resc",
     "renode/resources/sim/*",
+    "renode/lib/*",
 ]
 
 [tool.setuptools.packages.find]

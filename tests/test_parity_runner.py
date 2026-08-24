@@ -1,0 +1,71 @@
+from __future__ import annotations
+
+import importlib.util
+import json
+from pathlib import Path
+
+
+ROOT = Path(__file__).parents[1]
+
+
+def load_runner():
+    path = ROOT / "scripts" / "run-parity-tests.py"
+    spec = importlib.util.spec_from_file_location("escsim_parity_runner", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_parity_sweep_records_all_results_before_failing(tmp_path, monkeypatch):
+    runner = load_runner()
+
+    class Repository:
+        def catalog(self, refresh=False):
+            assert refresh
+            return {"channels": {"stable": {"firmware": "2.21"}}}
+
+    calls = []
+
+    def run_one(_repository, _renode, target, protocol, release):
+        calls.append((target, protocol, release))
+        if target == "FIRST" and protocol == "pwm":
+            raise RuntimeError("deliberate first-case failure")
+        return {"target": target, "protocol": protocol, "status": "passed"}
+
+    monkeypatch.setattr(runner, "ArtifactRepository", lambda _url: Repository())
+    monkeypatch.setattr(runner, "run_one", run_one)
+    output = tmp_path / "report.json"
+    status = runner.main(
+        [
+            "--base-url",
+            "https://example.invalid/v1/",
+            "--renode",
+            str(tmp_path / "renode"),
+            "--targets",
+            "FIRST",
+            "SECOND",
+            "--protocols",
+            "pwm",
+            "dshot600",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert status == 1
+    assert calls == [
+        ("FIRST", "pwm", "2.21"),
+        ("FIRST", "dshot600", "2.21"),
+        ("SECOND", "pwm", "2.21"),
+        ("SECOND", "dshot600", "2.21"),
+    ]
+    report = json.loads(output.read_text())
+    assert len(report["results"]) == 4
+    assert report["results"][0] == {
+        "target": "FIRST",
+        "protocol": "pwm",
+        "status": "failed",
+        "error": "deliberate first-case failure",
+    }
+    assert all(item["status"] == "passed" for item in report["results"][1:])

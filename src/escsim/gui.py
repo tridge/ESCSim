@@ -353,32 +353,31 @@ class Lab(object):
         # platform becomes an immediate launcher error instead of a two-minute
         # wait at the last ordinary log line.
         monitor = renode_monitor.MonitorClient("127.0.0.1", self.args.monitor_port)
-        try:
-            text = None
-            while time.time() < deadline and self.runner.running():
-                try:
-                    text = monitor.connect(timeout=max(1, deadline - time.time()))
-                    break
-                except OSError:
-                    monitor.close()
-                    time.sleep(0.2)
-                except TimeoutError:
-                    break
-            if text is not None:
-                error = renode_monitor.startup_error(text)
-                if error is not None:
-                    self.status = "emulator setup failed: " + error
-                    self.start_failed = True
-                    self.log("[monitor] " + error)
-                    self.runner.stop()
-                    return
-        finally:
-            monitor.close()
+        text = None
+        while time.time() < deadline and self.runner.running():
+            try:
+                text = monitor.connect(timeout=max(1, deadline - time.time()))
+                break
+            except OSError:
+                monitor.close()
+                time.sleep(0.2)
+            except TimeoutError:
+                break
+        if text is not None:
+            error = renode_monitor.startup_error(text)
+            if error is not None:
+                monitor.close()
+                self.status = "emulator setup failed: " + error
+                self.start_failed = True
+                self.log("[monitor] " + error)
+                self.runner.stop()
+                return
         while time.time() < deadline and self.runner.running():
             if self.emulator_ready or self.start_failed:
                 break
             time.sleep(0.3)
         if not self.emulator_ready:
+            monitor.close()
             # a half-started emulator (a failed port bind still leaves
             # the machine running) must not linger and block the retry
             self.runner.stop()
@@ -387,7 +386,9 @@ class Lab(object):
             return
         self.generation += 1
         threading.Thread(
-            target=self._metrics_loop, args=(self.generation,), daemon=True
+            target=self._metrics_loop,
+            args=(self.generation, monitor),
+            daemon=True,
         ).start()
         if bl is not None:
             self._enter_bootloader()
@@ -420,29 +421,36 @@ class Lab(object):
             s.close()
         self.log("holding the signal wire; ESC reset into the bootloader")
 
-    def _metrics_loop(self, generation):
+    def _metrics_loop(self, generation, client=None):
         """poll the Renode monitor for PC and timing, and derive the
         realtime speedup from virtual-vs-wall deltas over a sliding
         window (Renode advances in bursts, so an instant ratio just
         flaps around the true speed)"""
-        client = renode_monitor.MonitorClient("127.0.0.1", self.args.monitor_port)
+        client = client or renode_monitor.MonitorClient(
+            "127.0.0.1", self.args.monitor_port
+        )
         history = []
         try:
-            deadline = time.monotonic() + 45
-            while time.monotonic() < deadline:
-                if generation != self.generation or not self.runner.running():
+            if client.socket is None:
+                deadline = time.monotonic() + 45
+                while time.monotonic() < deadline:
+                    if generation != self.generation or not self.runner.running():
+                        return
+                    try:
+                        client.connect()
+                        break
+                    except (OSError, TimeoutError):
+                        client.close()
+                        time.sleep(0.5)
+                else:
+                    self.log_q.put(
+                        (
+                            "__monitor_error__",
+                            generation,
+                            "monitor did not become ready",
+                        )
+                    )
                     return
-                try:
-                    client.connect()
-                    break
-                except (OSError, TimeoutError):
-                    client.close()
-                    time.sleep(0.5)
-            else:
-                self.log_q.put(
-                    ("__monitor_error__", generation, "monitor did not become ready")
-                )
-                return
             while generation == self.generation and self.runner.running():
                 try:
                     current = renode_monitor.parse_metrics(
@@ -1418,7 +1426,14 @@ def main(argv=None):
                 time.sleep(0.2)
             return "OK" if lab.target == rest else "ERR resolve timeout"
         if cmd == "bootloader":
-            lab.bootloader = rest or "auto"
+            selection = rest or "auto"
+            index = bl_combo.findData(selection)
+            if index < 0:
+                if selection.startswith("catalog:"):
+                    return "ERR no bootloader %s" % selection
+                bl_combo.insertItem(0, os.path.basename(selection), selection)
+                index = 0
+            bl_combo.setCurrentIndex(index)
             return "OK"
         if cmd == "firmware":
             if rest in ("", "auto", "none"):

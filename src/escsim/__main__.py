@@ -158,6 +158,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    if getattr(sys, "frozen", False):
+        import multiprocessing
+
+        multiprocessing.freeze_support()
     effective_argv = sys.argv[1:] if argv is None else argv
     if not effective_argv:
         effective_argv = ["gui"]

@@ -1,11 +1,12 @@
 # ESCSim
 
 ESCSim is a standalone, Renode-based simulator for real AM32 ESC firmware.
-It is being extracted from AM32's in-tree Renode support so that end users do
-not need an AM32 source checkout or embedded compiler toolchain.
+It contains the combined Target and Control application, downloads verified
+Renode/firmware/bootloader releases, and does not require an AM32 checkout or
+embedded compiler toolchain at runtime.
 
-The implementation is currently under construction. See [plan.md](plan.md)
-for the staged migration and release plan.
+See the [five-minute quick start](docs/quickstart.md). Release packaging and
+the current parity matrix are in [docs/packaging.md](docs/packaging.md).
 
 ## Target definitions
 
@@ -21,7 +22,8 @@ copy is cached by content hash and the selected source persists across runs.
 From a source checkout:
 
 ```sh
-python3 -m pip install -e '.[test]'
+python3 -m pip install -e '.[test,gui]'
+escsim
 escsim targets status
 escsim targets refresh
 escsim targets list

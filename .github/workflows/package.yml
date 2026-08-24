@@ -1,0 +1,44 @@
+name: package
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  application:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -U pip
+      - run: python -m pip install -e '.[gui]' pyinstaller
+      - run: python scripts/build-package.py
+      - name: Smoke packaged CLI (POSIX)
+        if: runner.os != 'Windows'
+        run: ./dist/ESCSim/ESCSim targets status
+      - name: Smoke packaged CLI (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\dist\ESCSim\ESCSim.exe targets status
+      - name: Build Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          & 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' packaging\ESCSim.iss
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ESCSim-${{ runner.os }}-${{ runner.arch }}
+          path: |
+            dist/ESCSim/
+            dist/ESCSim.app/
+            dist/installer/ESCSim-installer.exe
+          if-no-files-found: error
