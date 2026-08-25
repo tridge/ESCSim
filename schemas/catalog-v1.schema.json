@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://am32.tridgell.net/ESCSim/schemas/catalog-v1.schema.json",
+  "$id": "https://firmware.ardupilot.org/Tools/AM32-tools/ESCSim/schemas/catalog-v1.schema.json",
   "title": "ESCSim artifact catalog v1",
   "type": "object",
   "required": ["schema_version", "generated_at", "channels", "releases"],

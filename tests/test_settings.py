@@ -32,6 +32,19 @@ def test_round_trip_is_versioned_and_atomic(tmp_path):
     assert not list(tmp_path.glob("*.tmp"))
 
 
+def test_obsolete_default_artifact_host_is_migrated(tmp_path):
+    store = SettingsStore(tmp_path)
+    store.path.write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "artifact_base_url": "https://am32.tridgell.net/ESCSim/v1/",
+            }
+        )
+    )
+    assert store.load().artifact_base_url == DEFAULT_ARTIFACT_BASE_URL
+
+
 @pytest.mark.parametrize(
     "payload, message",
     [

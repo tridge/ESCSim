@@ -45,34 +45,15 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     native_build = ROOT / "build" / f"package-native-{platform.system().lower()}"
+    make_build = (Path("../..") / native_build.relative_to(ROOT)).as_posix()
     run(
         [
-            "cmake",
-            "-S",
-            "native/am32sim",
-            "-B",
-            str(native_build),
-            f"-DCMAKE_BUILD_TYPE={args.configuration}",
-        ]
-    )
-    run(
-        [
-            "cmake",
-            "--build",
-            str(native_build),
-            "--config",
-            args.configuration,
-            "--parallel",
-        ]
-    )
-    run(
-        [
-            "ctest",
-            "--test-dir",
-            str(native_build),
+            os.environ.get("MAKE", "make"),
             "-C",
-            args.configuration,
-            "--output-on-failure",
+            "native/am32sim",
+            f"BUILD_DIR={make_build}",
+            f"CONFIGURATION={args.configuration}",
+            "test",
         ]
     )
 

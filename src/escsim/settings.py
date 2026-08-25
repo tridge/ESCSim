@@ -16,7 +16,10 @@ DEFAULT_TARGETS_URL = (
     "https://raw.githubusercontent.com/am32-firmware/AM32/"
     "refs/heads/main/Inc/targets.h"
 )
-DEFAULT_ARTIFACT_BASE_URL = "https://am32.tridgell.net/ESCSim/v1/"
+DEFAULT_ARTIFACT_BASE_URL = (
+    "https://firmware.ardupilot.org/Tools/AM32-tools/ESCSim/v1/"
+)
+_LEGACY_ARTIFACT_BASE_URLS = {"https://am32.tridgell.net/ESCSim/v1/"}
 SETTINGS_SCHEMA = 1
 
 
@@ -117,6 +120,8 @@ class SettingsStore:
         artifact_base_url = raw.get("artifact_base_url", DEFAULT_ARTIFACT_BASE_URL)
         if not isinstance(artifact_base_url, str) or not artifact_base_url:
             raise ValueError("artifact_base_url must be a non-empty string")
+        if artifact_base_url in _LEGACY_ARTIFACT_BASE_URLS:
+            artifact_base_url = DEFAULT_ARTIFACT_BASE_URL
         launcher_raw = raw.get("launcher", {})
         if not isinstance(launcher_raw, dict):
             raise ValueError("launcher must be an object")

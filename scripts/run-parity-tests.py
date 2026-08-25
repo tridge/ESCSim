@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import platform
 import socket
 import subprocess
 import threading
@@ -18,6 +19,20 @@ from escsim.control.backend import DshotPanel, SimStream
 from escsim.renode import download as renode_download
 from escsim.renode.process import ProcessTree
 from escsim.renode.session import generator_command, generator_environment
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def built_native_library() -> Path | None:
+    if os.name == "nt":
+        name = "am32sim.dll"
+    elif platform.system() == "Darwin":
+        name = "libam32sim.dylib"
+    else:
+        name = "libam32sim.so"
+    candidate = ROOT / "build" / f"package-native-{platform.system().lower()}" / name
+    return candidate if candidate.is_file() else None
 
 
 def free_port(tcp=False) -> int:
@@ -57,6 +72,11 @@ def run_one(repository, renode, target, protocol, release) -> dict:
         os.fspath(renode),
     ]
     lines: list[str] = []
+    environment = generator_environment()
+    if not environment.get("ESCSIM_AM32SIM_LIBRARY"):
+        native_library = built_native_library()
+        if native_library is not None:
+            environment["ESCSIM_AM32SIM_LIBRARY"] = os.fspath(native_library)
     tree = ProcessTree(
         command,
         stdin=subprocess.PIPE,
@@ -64,7 +84,7 @@ def run_one(repository, renode, target, protocol, release) -> dict:
         stderr=subprocess.STDOUT,
         text=True,
         errors="replace",
-        env=generator_environment(),
+        env=environment,
     )
 
     def drain():

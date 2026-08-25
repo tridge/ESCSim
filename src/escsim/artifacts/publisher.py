@@ -64,6 +64,7 @@ def _json_write(path: Path, value: object) -> None:
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
+        temporary.chmod(0o644)
         os.replace(temporary, path)
     except BaseException:
         temporary.unlink(missing_ok=True)
@@ -77,6 +78,7 @@ def _copy(source: Path, root: Path, relative: str) -> dict:
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(f".{destination.name}.tmp.{os.getpid()}")
     shutil.copyfile(source, temporary)
+    temporary.chmod(0o644)
     os.replace(temporary, destination)
     content = destination.read_bytes()
     return {
@@ -256,7 +258,9 @@ def finish(root: Path, catalog: dict) -> None:
         + "".join(rows)
         + "</table>\n"
     )
-    (root / "index.html").write_text(index, encoding="utf-8")
+    index_path = root / "index.html"
+    index_path.write_text(index, encoding="utf-8")
+    index_path.chmod(0o644)
 
 
 def validate_repository(root: Path) -> None:

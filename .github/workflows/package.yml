@@ -18,9 +18,21 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+      - uses: msys2/setup-msys2@v2
+        if: runner.os == 'Windows'
+        with:
+          msystem: UCRT64
+          install: make mingw-w64-ucrt-x86_64-gcc
+          path-type: inherit
       - run: python -m pip install -U pip
       - run: python -m pip install -e '.[gui]' pyinstaller
-      - run: python scripts/build-package.py
+      - name: Build application (POSIX)
+        if: runner.os != 'Windows'
+        run: make package PYTHON=python
+      - name: Build application (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: make package PYTHON=python
       - name: Smoke packaged CLI (POSIX)
         if: runner.os != 'Windows'
         run: ./dist/ESCSim/ESCSim targets status

@@ -30,6 +30,21 @@ escsim targets list
 pytest
 ```
 
+Or use the top-level Makefile to build the native library and Python wheel,
+run all tests, install the complete GUI application, or create a standalone
+application bundle:
+
+```sh
+make
+make test
+make install
+make package
+```
+
+`make install` uses the current `python3`. Select a virtual environment or a
+user install when needed, for example `make install PYTHON=.venv/bin/python`
+or `make install PIP_INSTALL_FLAGS=--user`.
+
 ## Renode target generation
 
 The target generator and all Renode platform/peripheral resources are part of
@@ -41,17 +56,16 @@ escsim renode install
 escsim generate VIMDRONES_L431 --outdir /tmp/escsim-target
 ```
 
-The native motor model is built with CMake:
+The native motor model can also be built directly with its small portable
+Makefile:
 
 ```sh
-cmake -S native/am32sim -B build/native -DCMAKE_BUILD_TYPE=Release
-cmake --build build/native
-ctest --test-dir build/native --output-on-failure
+make -C native/am32sim test
 ```
 
 The downloader uses the same verified `firmware.ardupilot.org` packages and
 cache as ArduPilot's Renode launcher. Versioned firmware/bootloader downloads
-and the fjall publisher are covered in
+and the artifact publisher are covered in
 [docs/artifact-repository.md](docs/artifact-repository.md).
 
 ## Licensing

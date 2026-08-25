@@ -17,6 +17,7 @@ jobs:
       - run: python -m pip install -e '.[test,gui]' ruff
       - run: ruff format --check .
       - run: ruff check .
-      - run: QT_QPA_PLATFORM=offscreen pytest -q
+      - run: make
+      - run: QT_QPA_PLATFORM=offscreen make test
       - run: shellcheck scripts/*.sh
       - run: sh -n scripts/publish-from-checkouts.sh

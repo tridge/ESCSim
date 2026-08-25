@@ -69,3 +69,13 @@ def test_parity_sweep_records_all_results_before_failing(tmp_path, monkeypatch):
         "error": "deliberate first-case failure",
     }
     assert all(item["status"] == "passed" for item in report["results"][1:])
+
+
+def test_parity_runner_finds_makefile_native_output(tmp_path, monkeypatch):
+    runner = load_runner()
+    monkeypatch.setattr(runner, "ROOT", tmp_path)
+    monkeypatch.setattr(runner.platform, "system", lambda: "Linux")
+    library = tmp_path / "build" / "package-native-linux" / "libam32sim.so"
+    library.parent.mkdir(parents=True)
+    library.write_bytes(b"native")
+    assert runner.built_native_library() == library

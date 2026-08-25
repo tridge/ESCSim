@@ -3353,7 +3353,7 @@ def main(argv=None):
     else:
         print(
             "no native am32sim library, so the motor will not turn; "
-            "build it with CMake or set ESCSIM_AM32SIM_LIBRARY"
+            "build it with make or set ESCSIM_AM32SIM_LIBRARY"
         )
 
     # the emulated ESC on the SITL's multicast CAN bus, where

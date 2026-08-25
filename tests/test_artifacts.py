@@ -5,6 +5,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import json
 import io
 from pathlib import Path
+import stat
 import threading
 
 import pytest
@@ -65,6 +66,13 @@ def make_repository(tmp_path: Path) -> Path:
     finish(root, catalog)
     validate_repository(root)
     return root
+
+
+def test_published_files_are_publicly_readable(tmp_path):
+    root = make_repository(tmp_path)
+    for path in root.rglob("*"):
+        if path.is_file():
+            assert stat.S_IMODE(path.stat().st_mode) == 0o644, path
 
 
 def test_publish_fetch_install_and_offline_cache(tmp_path):

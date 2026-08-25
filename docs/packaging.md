@@ -2,15 +2,25 @@
 
 ## Local builds
 
-Install the GUI and packaging dependencies, then build the native library and
-self-contained application:
+The top-level Makefile builds the native library and Python wheel. It can also
+run the complete test suite or install the Python GUI and native library
+together:
+
+```sh
+make
+make test
+make install
+```
+
+Install the packaging dependencies, then build the self-contained application:
 
 ```sh
 python3 -m pip install -e '.[gui]' pyinstaller
-python3 scripts/build-package.py
+make package
 ```
 
-The script runs the native CTest, stages exactly one platform library under
+The script builds and smoke-tests the native library with GNU Make, stages
+exactly one platform library under
 `escsim/renode/lib`, and invokes `packaging/escsim.spec`. Outputs are:
 
 - Windows: `dist/ESCSim/`, then compile `packaging/ESCSim.iss` to produce
@@ -26,7 +36,8 @@ must sign the executable/installer and notarize the macOS app before upload.
 ## Continuous integration
 
 - `checks.yml`: Ruff, the Python/GUI suite, ShellCheck, and publisher syntax.
-- `native.yml`: CMake/CTest and native artifacts on Linux, Windows, macOS.
+- `native.yml`: Makefile smoke tests and native artifacts on Linux, Windows,
+  macOS.
 - `package.yml`: three-platform PyInstaller builds, packaged CLI smoke, and
   the Windows Inno Setup installer.
 - `publisher.yml`: catalog/publisher fixture and schema tests.
