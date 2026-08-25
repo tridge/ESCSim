@@ -29,7 +29,7 @@ endif
 NATIVE_LIBRARY := $(NATIVE_BUILD_DIR)/$(NATIVE_NAME)
 
 .DEFAULT_GOAL := all
-.PHONY: all native wheel test native-test python-test package install \
+.PHONY: all native wheel test native-test python-test package windows-installer install \
 	parity-all-mcus windows-usbip-test publish clean
 
 all: native wheel
@@ -54,6 +54,9 @@ python-test:
 
 package:
 	$(PYTHON) scripts/build-package.py --configuration $(CONFIGURATION)
+
+windows-installer: package
+	$(PYTHON) scripts/build-windows-installer.py
 
 parity-all-mcus:
 	$(PYTHON) scripts/build-package.py --skip-pyinstaller \

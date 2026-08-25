@@ -40,6 +40,7 @@ license-files = ["LICENSE", "licenses/*.txt"]
 [tool.setuptools.package-data]
 escsim = [
     "resources/*.h",
+    "resources/*.png",
     "renode/resources/models/*.json",
     "renode/resources/peripherals/*/*.cs",
     "renode/resources/platforms/*.repl",

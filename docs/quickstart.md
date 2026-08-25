@@ -3,10 +3,11 @@
 ## Installed application
 
 On Windows, run `ESCSim-installer.exe`, accept the per-user installation, and
-open ESCSim from the Start menu. The public installer does **not** install a
-USB/IP kernel driver; PWM, DShot, DroneCAN, graphs, and simulation work without
-one. Browser configurator access over virtual USB remains an explicit lab
-feature until a safe signed Windows client is available.
+open ESCSim from the Start menu. If usbip-win2 is absent, the installer offers
+the bundled signed driver needed for browser configurator access. That optional
+step requires administrator approval, temporarily reconnects USB devices, and
+may require a reboot. PWM, DShot, DroneCAN, graphs, and simulation work without
+the driver.
 
 Linux and macOS archives can be unpacked and launched directly. A source setup
 is:
@@ -56,8 +57,9 @@ published images.
 - Linux virtual USB uses `vhci_hcd`; run the explicit USB/IP rule installer
   only if browser access is needed and the documented local privilege tradeoff
   is acceptable.
-- Windows virtual USB is opt-in and requires a separately installed safe,
-  signed USB/IP client. ESCSim never installs a kernel driver automatically.
+- Windows virtual USB is opt-in. The interactive installer offers the bundled,
+  SHA-256-verified usbip-win2 0.9.7.7 client when it is missing and warns before
+  starting its elevated driver setup.
 
 ## Command line
 

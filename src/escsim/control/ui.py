@@ -50,7 +50,15 @@ import time
 
 try:
     from PySide6.QtCore import Qt, QTimer, QRectF, QLineF
-    from PySide6.QtGui import QFontDatabase, QPen, QBrush, QColor, QPainter, QIcon
+    from PySide6.QtGui import (
+        QFontDatabase,
+        QPen,
+        QBrush,
+        QColor,
+        QPainter,
+        QIcon,
+        QPixmap,
+    )
     from PySide6.QtWidgets import (
         QApplication,
         QCheckBox,
@@ -815,8 +823,13 @@ def create_ui(args=None, app=None, container=None):
 
     if owns_app:
         app = QApplication(sys.argv)
+        icon_data = resources.files("escsim").joinpath("resources", "escsim.png")
+        icon_pixmap = QPixmap()
+        icon_pixmap.loadFromData(icon_data.read_bytes(), "PNG")
+        app.setWindowIcon(QIcon(icon_pixmap))
     app.setStyle("Fusion")
     win = container if container is not None else QWidget()
+    win.setWindowIcon(app.windowIcon())
     win.setWindowTitle("AM32 Renode control" if renode else "AM32 SITL control")
     top = QGridLayout(win)
 
@@ -1567,6 +1580,11 @@ def create_ui(args=None, app=None, container=None):
     else:
         g4.addWidget(speed_1x, 2, 4)
 
+    # The control panel is normally built before the emulator starts. SimStream
+    # retains this target and applies it as soon as the first state packet
+    # arrives, so a fast host no longer leaves Renode free-running by default.
+    speed_changed()
+
     # stuck rotor: block the prop with a virtual obstruction, from
     # free to completely stuck, to exercise the firmware's stuck
     # rotor protection
@@ -1636,6 +1654,37 @@ def create_ui(args=None, app=None, container=None):
         "speedup slider - slow motion sounds lower, as physics should."
     )
     g4.addWidget(motor_audio_check, 4, 3)
+    g4.addWidget(QLabel("Audio output:"), 4, 4)
+    audio_output = QComboBox()
+    audio_devices = []
+    try:
+        from PySide6.QtMultimedia import QMediaDevices
+
+        audio_devices = list(QMediaDevices.audioOutputs())
+        default_device = QMediaDevices.defaultAudioOutput()
+        default_id = default_device.id() if not default_device.isNull() else None
+        for device in audio_devices:
+            label = device.description()
+            if device.id() == default_id:
+                label += " (default)"
+            audio_output.addItem(label)
+        for index, device in enumerate(audio_devices):
+            if device.id() == default_id:
+                audio_output.setCurrentIndex(index)
+                break
+    except Exception as ex:
+        audio_output.addItem("Unavailable: %s" % ex)
+    if not audio_devices:
+        if audio_output.count() == 0:
+            audio_output.addItem("No audio output devices")
+        audio_output.setEnabled(False)
+    audio_output.setToolTip(
+        "Output endpoint used for ESC and motor audio. If sound is not\n"
+        "audible over Remote Desktop, select the redirected endpoint here."
+    )
+    g4.addWidget(audio_output, 4, 5)
+    audio_status = QLabel("")
+    g4.addWidget(audio_status, 6, 0, 1, 6)
     if renode:
         # Clean synthesized tones still depend on the SITL's fake output
         # timer. Renode does serve the physics-derived motor audio stream.
@@ -1650,23 +1699,44 @@ def create_ui(args=None, app=None, container=None):
     phys_stream = None
     phys_player = None
 
+    def selected_audio_device():
+        index = audio_output.currentIndex()
+        return audio_devices[index] if 0 <= index < len(audio_devices) else None
+
+    def audio_error(prefix, message):
+        audio_status.setText("%s: %s" % (prefix, message))
+        if sys.stderr is not None:
+            sys.stderr.write("%s: %s\n" % (prefix.lower(), message))
+
+    def update_audio_output_enabled():
+        audio_output.setEnabled(
+            bool(audio_devices)
+            and not audio_check.isChecked()
+            and not motor_audio_check.isChecked()
+        )
+
     def audio_toggled(*a):
         nonlocal tones, tone_synth
         log_action("audio %d" % int(audio_check.isChecked()))
         if audio_check.isChecked() and tone_synth is None:
             tones = ToneStream(args.host, args.state_port)
             tone_synth = sitl_tones.ToneSynth(
-                tones, volume=audio_slider.value() / 100.0
+                tones,
+                volume=audio_slider.value() / 100.0,
+                device=selected_audio_device(),
             )
             if not tone_synth.active:
-                sys.stderr.write("audio: %s\n" % tone_synth.error)
+                audio_error("Audio", tone_synth.error)
                 audio_check.setToolTip("Not available: %s" % tone_synth.error)
                 tones.close()
                 tones, tone_synth = None, None
                 audio_check.setChecked(False)
                 return
-        if tones is not None:
-            tones.enabled = audio_check.isChecked()
+        elif not audio_check.isChecked() and tone_synth is not None:
+            tone_synth.stop()
+            tones.close()
+            tones, tone_synth = None, None
+        update_audio_output_enabled()
 
     def motor_audio_toggled(*a):
         nonlocal phys_stream, phys_player
@@ -1674,17 +1744,22 @@ def create_ui(args=None, app=None, container=None):
         if motor_audio_check.isChecked() and phys_player is None:
             phys_stream = AudioStream(args.host, args.state_port)
             phys_player = sitl_tones.PhysicsAudio(
-                phys_stream, volume=audio_slider.value() / 100.0
+                phys_stream,
+                volume=audio_slider.value() / 100.0,
+                device=selected_audio_device(),
             )
             if not phys_player.active:
-                sys.stderr.write("motor audio: %s\n" % phys_player.error)
+                audio_error("Motor audio", phys_player.error)
                 motor_audio_check.setToolTip("Not available: %s" % phys_player.error)
                 phys_stream.close()
                 phys_stream, phys_player = None, None
                 motor_audio_check.setChecked(False)
                 return
-        if phys_stream is not None:
-            phys_stream.enabled = motor_audio_check.isChecked()
+        elif not motor_audio_check.isChecked() and phys_player is not None:
+            phys_player.stop()
+            phys_stream.close()
+            phys_stream, phys_player = None, None
+        update_audio_output_enabled()
 
     def audio_volume_changed(*a):
         log_action("audio_volume %d" % audio_slider.value())
@@ -2964,6 +3039,22 @@ def create_ui(args=None, app=None, container=None):
                 can_dna_label.setText("")
                 can_dna_label.setStyleSheet("")
         model_status.setText(sim.model_status)
+        if phys_player is not None and phys_stream is not None:
+            rate = phys_stream.rate.hz()
+            state = (
+                "waiting for motor samples"
+                if phys_stream.stale()
+                else "%.1fk motor samples/s" % (rate / 1000.0)
+            )
+            audio_status.setText(
+                "Motor audio -> %s: %s" % (phys_player.device_name, state)
+            )
+        elif tone_synth is not None:
+            audio_status.setText("ESC audio -> %s" % tone_synth.device_name)
+        elif audio_devices:
+            audio_status.setText("Audio output: %s" % audio_output.currentText())
+        else:
+            audio_status.setText("Audio unavailable: no output device")
         # against a backend far below real time the sample rate alone is
         # not the interesting number - how fast simulated time is moving
         # is what explains why arming takes half a minute

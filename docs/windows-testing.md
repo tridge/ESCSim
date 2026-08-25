@@ -31,8 +31,9 @@ Windows-specific validation also covers:
 - usbip-win2 0.9.7.7 attach, exact serial identity, COM-port enumeration,
   28-byte serial echo, and exact owned-port detach;
 - PyInstaller application build, packaged CLI and offscreen GUI startup;
-- a 52 MiB per-user Inno Setup installer, silent installation, artifact and
-  Renode discovery, and target generation from the installed application.
+- a per-user Inno Setup installer with the verified usbip-win2 prerequisite,
+  silent non-driver installation, artifact and Renode discovery, and target
+  generation from the installed application.
 
 Run the comprehensive matrix and USB/IP check with the Makefile commands in
 [packaging.md](packaging.md). The scheduled Windows workflow fails if any

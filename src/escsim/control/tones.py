@@ -171,11 +171,12 @@ class ToneSynth(object):
     inactive when there is no audio output device (headless CI). The
     sink runs on its own thread so graph repaints cannot stall it."""
 
-    def __init__(self, stream, volume=0.5):
+    def __init__(self, stream, volume=0.5, device=None):
         self.stream = stream
         self.volume = volume
         self.active = False
         self.error = ""
+        self.device_name = ""
         try:
             from PySide6.QtCore import QIODevice
             from PySide6.QtMultimedia import QAudioFormat, QAudioSink, QMediaDevices
@@ -241,10 +242,11 @@ class ToneSynth(object):
                 return -1
 
         def build():
-            dev = QMediaDevices.defaultAudioOutput()
+            dev = device if device is not None else QMediaDevices.defaultAudioOutput()
             if dev.isNull():
                 synth.error = "no audio output device"
                 return None
+            synth.device_name = dev.description()
             fmt = QAudioFormat()
             fmt.setSampleRate(SAMPLE_RATE)
             fmt.setChannelCount(1)
@@ -289,11 +291,12 @@ class PhysicsAudio(object):
     plays lower pitched, as physics should). A slow AGC keeps quiet
     beeps and full throttle motor noise both audible."""
 
-    def __init__(self, stream, volume=0.5):
+    def __init__(self, stream, volume=0.5, device=None):
         self.stream = stream
         self.volume = volume
         self.active = False
         self.error = ""
+        self.device_name = ""
         try:
             from PySide6.QtCore import QIODevice
             from PySide6.QtMultimedia import QAudioFormat, QAudioSink, QMediaDevices
@@ -401,10 +404,11 @@ class PhysicsAudio(object):
                 return -1
 
         def build():
-            dev = QMediaDevices.defaultAudioOutput()
+            dev = device if device is not None else QMediaDevices.defaultAudioOutput()
             if dev.isNull():
                 player.error = "no audio output device"
                 return None
+            player.device_name = dev.description()
             fmt = QAudioFormat()
             fmt.setSampleRate(SAMPLE_RATE)
             fmt.setChannelCount(1)

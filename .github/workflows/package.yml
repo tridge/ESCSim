@@ -45,7 +45,7 @@ jobs:
         shell: pwsh
         run: |
           choco install innosetup --no-progress -y
-          & 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' packaging\ESCSim.iss
+          python scripts\build-windows-installer.py --iscc 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
       - uses: actions/upload-artifact@v4
         with:
           name: ESCSim-${{ runner.os }}-${{ runner.arch }}

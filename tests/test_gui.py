@@ -89,6 +89,11 @@ def test_control_gui_embeds_and_cleans_up(tmp_path, monkeypatch):
     assert callable(container._sitl_gui_abort_cleanup)
     assert container.layout() is not None
     assert container.layout().count() >= 4
+    runtime = container._sitl_gui_runtime
+    assert runtime["sim"].desired_speedup == pytest.approx(1.0)
+    assert runtime["speed_slider"].value() == 150
+    assert runtime["audio_output"].count() >= 1
+    assert runtime["audio_status"] is not None
     assert signal.getsignal(signal.SIGINT) == old_sigint
     models = Path(default_config_dir() / "models")
     assert (models / "default_7inch.json").is_file()

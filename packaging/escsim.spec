@@ -3,7 +3,7 @@ from pathlib import Path
 import sys
 
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
-from PyInstaller.compat import is_darwin
+from PyInstaller.compat import is_darwin, is_win
 
 
 root = Path(SPECPATH).parent
@@ -84,6 +84,7 @@ exe = EXE(
     upx=False,
     console=False,
     disable_windowed_traceback=False,
+    icon=str(root / "packaging" / "escsim.ico") if is_win else None,
 )
 collection = COLLECT(
     exe,

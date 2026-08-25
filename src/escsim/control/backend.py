@@ -521,6 +521,13 @@ class SimStream(object):
         self.lock = threading.Lock()  # guards samples against the reader
         self.rate = RateCounter()
         self.model_status = ""
+        # The GUI is constructed before Renode starts. Remember pacing so
+        # its initial 1x command can be applied when the state stream first
+        # appears, and reapply it after a firmware/emulator restart.
+        self.desired_speedup = None
+        self.speedup_pending = False
+        self.last_data_rx = 0.0
+        self.last_sim_time = None
         # what the emulator says about the firmware it is running: only
         # the Renode backend answers, so this stays None against the SITL
         self.info = None
@@ -534,6 +541,11 @@ class SimStream(object):
 
     def _subscriber(self):
         while self.running:
+            if (
+                self.desired_speedup is not None
+                and time.time() - self.last_data_rx > 1.0
+            ):
+                self.speedup_pending = True
             if self.enabled:
                 # averaged sampling at coarse periods, so a slow scope
                 # shows the mean over each period instead of aliased
@@ -597,6 +609,20 @@ class SimStream(object):
                     break
                 smp = self.SAMPLE.unpack_from(d, off)
                 batch.append((smp[0] * 1e-9,) + smp[1:])
+            now = time.time()
+            restarted = bool(
+                batch
+                and self.last_sim_time is not None
+                and batch[0][0] < self.last_sim_time
+            )
+            if self.last_data_rx == 0.0 or now - self.last_data_rx > 1.0 or restarted:
+                self.speedup_pending = True
+            self.last_data_rx = now
+            if batch:
+                self.last_sim_time = batch[-1][0]
+            if self.speedup_pending and self.desired_speedup is not None:
+                self._send_speedup(self.desired_speedup)
+                self.speedup_pending = False
             with self.lock:
                 self.samples.extend(batch)
             self.rate.tick(len(batch))
@@ -627,6 +653,11 @@ class SimStream(object):
         return out
 
     def set_speedup(self, speedup):
+        self.desired_speedup = float(speedup)
+        self.speedup_pending = True
+        self._send_speedup(self.desired_speedup)
+
+    def _send_speedup(self, speedup):
         pkt = struct.pack("<HBBf", self.MAGIC_CMD, 2, 0, speedup)
         try:
             self.sock.sendto(pkt, self.addr)

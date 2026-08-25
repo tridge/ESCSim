@@ -30,9 +30,11 @@ exactly one platform library under
 - macOS: the onedir output and `dist/ESCSim.app`; signing/notarization is a
   release-operator step.
 
-The Windows installer is per-user and deliberately contains no USB/IP driver.
-Release signing secrets are not stored in this repository. Public releases
-must sign the executable/installer and notarize the macOS app before upload.
+The Windows application is installed per-user. Its installer contains the
+SHA-256-verified upstream usbip-win2 prerequisite and offers its separate,
+elevated driver setup only when needed. Release signing secrets are not stored
+in this repository. Public releases must sign the executable/installer and
+notarize the macOS app before upload.
 
 ## Continuous integration
 
@@ -106,23 +108,34 @@ CC=x86_64-w64-mingw32-gcc \
     make parity-all-mcus PYTHON=.venv-win/Scripts/python.exe
 ```
 
-With usbip-win2 0.9.7.7 or a later safe release already installed, the real
-attach/enumerate/serial-echo/detach integration check is:
+The interactive ESCSim installer bundles the verified usbip-win2 0.9.7.7
+installer. When the driver is absent it offers to run that installer with an
+explicit warning that USB hubs are temporarily restarted and Windows may need
+a reboot. ESCSim itself remains a per-user install; only the optional driver
+step asks for administrator approval. Version 0.9.7.8 is explicitly rejected
+because it is unsafe.
+
+With usbip-win2 installed, the real attach/enumerate/serial-echo/detach
+integration check is:
 
 ```sh
 make windows-usbip-test PYTHON=.venv-win/Scripts/python.exe
 ```
 
-Version 0.9.7.8 is explicitly rejected because it is unsafe. The integration
-test detaches only the UDE port returned by its own attach operation.
+The integration test detaches only the UDE port returned by its own attach
+operation.
 
-Compile and silently smoke-install the per-user installer with:
+Build the application, fetch and SHA-256 verify the pinned usbip-win2 release,
+and compile the installer with:
 
 ```sh
-"/cygdrive/c/Users/$USER/AppData/Local/Programs/Inno Setup 6/ISCC.exe" \
-    packaging/ESCSim.iss
+make windows-installer PYTHON=.venv-win/Scripts/python.exe
 ./dist/installer/ESCSim-installer.exe /VERYSILENT /NORESTART /TASKS=""
 ```
+
+Silent installs intentionally skip the optional driver prompt, making package
+smoke tests non-disruptive. A normal interactive install offers the bundled
+driver when `usbip.exe` is not present.
 
 The release gate specifically prevents regressions in non-CAN
 VIMDRONES_L431 DShot600 and TEKKO32_F415 PWM/DShot/BDShot. A representative

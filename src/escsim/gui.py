@@ -34,6 +34,7 @@ replies are prefixed OK/ERR/STATUS.
 
 import argparse
 from dataclasses import replace
+from importlib import resources
 import glob
 import json
 import os
@@ -679,6 +680,7 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     from PySide6.QtCore import Qt, QTimer
+    from PySide6.QtGui import QIcon, QPixmap
     from PySide6.QtWidgets import (
         QApplication,
         QComboBox,
@@ -702,6 +704,10 @@ def main(argv=None):
     )
 
     app = QApplication([sys.argv[0]])
+    icon_data = resources.files("escsim").joinpath("resources", "escsim.png")
+    icon_pixmap = QPixmap()
+    icon_pixmap.loadFromData(icon_data.read_bytes(), "PNG")
+    app.setWindowIcon(QIcon(icon_pixmap))
     lab = Lab(args)
     settings_store = SettingsStore()
     preferences = settings_store.load().launcher
@@ -718,7 +724,8 @@ def main(argv=None):
             app.quit()
 
     win = LauncherWindow()
-    win.setWindowTitle("AM32 Renode ESC lab")
+    win.setWindowIcon(app.windowIcon())
+    win.setWindowTitle("ESCSim - AM32 ESC simulator")
     outer = QVBoxLayout(win)
     tabs = QTabWidget()
     outer.addWidget(tabs)
