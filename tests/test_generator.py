@@ -51,6 +51,17 @@ def test_a153_generation_uses_packaged_rom_without_compiler(tmp_path, monkeypatc
     assert "0x03004001" in text
 
 
+def test_e230_batches_dshot_with_exact_capture_timestamps(tmp_path, monkeypatch):
+    configure_real_header(tmp_path, monkeypatch)
+    _resc, repl = generator.generate("GD32DEV_A_E230", str(tmp_path / "e230"))
+    assert "batchDshotFrames: true" in Path(repl).read_text()
+
+
+def test_a153_timer_model_is_loaded_before_gpio_model():
+    script = Path(generator.HERE, "scripts", "am32_a153.resc").read_text()
+    assert script.index("MCXA_Ctimer.cs") < script.index("MCXA_Gpio.cs")
+
+
 def test_all_targets_uses_active_header_not_make(tmp_path, monkeypatch):
     configure_real_header(tmp_path, monkeypatch)
     monkeypatch.setenv("PATH", "")

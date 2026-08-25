@@ -9,15 +9,18 @@ using Antmicro.Renode.Core;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals;
 using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.Peripherals.Timers;
 using System.Collections.Generic;
+using System.Linq;
 
 namespace Antmicro.Renode.Peripherals.Miscellaneous
 {
     public class MCXA_Gpio : IDoubleWordPeripheral, IBytePeripheral,
                              IKnownSize, IGPIOReceiver, INumberedGPIOOutput
     {
-        public MCXA_Gpio()
+        public MCXA_Gpio(IMachine machine)
         {
+            this.machine = machine;
             var conns = new Dictionary<int, IGPIO>();
             for(var i = 0; i < pins.Length; i++)
             {
@@ -39,7 +42,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             for(var i = 0; i < pins.Length; i++)
             {
                 pins[i] = false;
+                lowSamplePending[i] = false;
             }
+            captureTimerInverted = false;
             SetOutputs(0);
         }
 
@@ -49,14 +54,29 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 return;
             }
+            var was = pins[number];
             pins[number] = value;
+            if(was && !value)
+            {
+                // A153's pre-inversion capture DMA completes on this
+                // falling edge.  The CPU must observe that level even if
+                // Renode dispatches the following rising edge before the
+                // DMA ISR; real hardware samples the pin before that edge.
+                lowSamplePending[number] = true;
+            }
+            else if(!was && value && CaptureTimerIsInverted())
+            {
+                // Once firmware swaps the capture polarity, DMA completes
+                // on the rising edge and the ISR correctly observes high.
+                lowSamplePending[number] = false;
+            }
         }
 
         public uint ReadDoubleWord(long offset)
         {
             if(offset >= Pdr && offset < Pdr + 32)
             {
-                return pins[offset - Pdr] ? 1u : 0u;
+                return SamplePin((int)(offset - Pdr)) ? 1u : 0u;
             }
             if(offset == Pdir)
             {
@@ -65,7 +85,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 var v32 = 0u;
                 for(var i = 0; i < pins.Length; i++)
                 {
-                    if(pins[i])
+                    if(SamplePin(i))
                     {
                         v32 |= 1u << i;
                     }
@@ -114,7 +134,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         {
             if(offset >= Pdr && offset < Pdr + 32)
             {
-                return pins[offset - Pdr] ? (byte)1 : (byte)0;
+                return SamplePin((int)(offset - Pdr)) ? (byte)1 : (byte)0;
             }
             return 0;
         }
@@ -134,9 +154,36 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private const long Pcor = 0x48;
         private const long Ptor = 0x4C;
 
+        private bool SamplePin(int pin)
+        {
+            if(lowSamplePending[pin])
+            {
+                lowSamplePending[pin] = false;
+                return false;
+            }
+            return pins[pin];
+        }
+
+        private bool CaptureTimerIsInverted()
+        {
+            if(!captureTimerInverted)
+            {
+                // Polarity detection is monotonic until a machine reset.
+                // Cache that fact, not a heuristically selected timer: this
+                // remains correct if a future A153 platform adds another
+                // CTIMER that configures capture before CTIMER0.
+                captureTimerInverted = machine.GetPeripheralsOfType<MCXA_Ctimer>()
+                    .Any(timer => timer.InvertedDshotCapture);
+            }
+            return captureTimerInverted;
+        }
+
         private uint pdor;
 
+        private readonly IMachine machine;
         private readonly Dictionary<long, uint> regs = new Dictionary<long, uint>();
         private readonly bool[] pins = new bool[32];
+        private readonly bool[] lowSamplePending = new bool[32];
+        private bool captureTimerInverted;
     }
 }

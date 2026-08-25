@@ -121,20 +121,48 @@ def run_one(repository, renode, target, protocol, release, image_format) -> dict
             ds.value = 0
             ds.bidir = protocol == "bdshot"
         ds.enabled = True
-        time.sleep(5)
+        arm_deadline = time.monotonic() + 45
+        while time.monotonic() < arm_deadline:
+            sim.request_info()
+            time.sleep(0.25)
+            if (sim.info or {}).get("armed"):
+                break
+        if not (sim.info or {}).get("armed"):
+            runtime = sim.info or {}
+            raise RuntimeError(
+                f"{target} {protocol} did not arm "
+                f"(pc=0x{runtime.get('pc', 0):08X}, "
+                f"armed_count={runtime.get('armed_count', 'unknown')})"
+            )
         ds.value = 1500 if protocol == "pwm" else 800
         deadline = time.monotonic() + 15
+        next_info = 0.0
         omega = 0.0
         while time.monotonic() < deadline:
+            now = time.monotonic()
+            if now >= next_info:
+                sim.request_info()
+                next_info = now + 1.0
             sample = sim.latest()
             omega = 0.0 if sample is None else abs(sample[1])
             if omega > 10 and (protocol != "bdshot" or ds.replies.count > 5):
                 break
             time.sleep(0.2)
+        runtime = sim.info or {}
+        runtime_status = "pc=0x%08X armed=%s armed_count=%s" % (
+            runtime.get("pc", 0),
+            runtime.get("armed", "unknown"),
+            runtime.get("armed_count", "unknown"),
+        )
         if omega <= 10:
-            raise RuntimeError(f"{target} {protocol} did not spin (omega={omega:.2f})")
+            raise RuntimeError(
+                f"{target} {protocol} did not spin "
+                f"(omega={omega:.2f}, {runtime_status})"
+            )
         if protocol == "bdshot" and ds.replies.count <= 5:
-            raise RuntimeError(f"{target} BDShot spun but returned no telemetry")
+            raise RuntimeError(
+                f"{target} BDShot spun but returned no telemetry ({runtime_status})"
+            )
         return {
             "target": target,
             "protocol": protocol,

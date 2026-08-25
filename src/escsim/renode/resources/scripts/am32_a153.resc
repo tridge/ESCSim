@@ -25,9 +25,9 @@ $platform?=@none
 # exist before anything implements them or looks them up
 include $resources/peripherals/common/IAM32Comparator.cs
 include $resources/peripherals/common/AM32_RegisterFile.cs
-include $resources/peripherals/nxp/MCXA_Gpio.cs
 include $resources/peripherals/nxp/MCXA_Edma.cs
 include $resources/peripherals/nxp/MCXA_Ctimer.cs
+include $resources/peripherals/nxp/MCXA_Gpio.cs
 include $resources/peripherals/nxp/MCXA_Lptmr.cs
 include $resources/peripherals/nxp/MCXA_FlexPwm.cs
 include $resources/peripherals/nxp/MCXA_Lpcmp.cs

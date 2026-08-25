@@ -59,6 +59,12 @@ namespace Antmicro.Renode.Peripherals.Timers
         public long Size => 0x1000;
         public IReadOnlyDictionary<int, IGPIO> Connections { get; private set; }
 
+        // GPIO uses these to preserve the hardware ordering at the end of
+        // an inverted-DShot frame.  Before polarity detection DMA completes
+        // on the falling capture; afterwards it completes on the rising one.
+        public bool InvertedDshotCapture =>
+            (ccr & (Cap1Re | Cap1Fe | Cap2Re | Cap2Fe)) == (Cap1Fe | Cap2Re);
+
         public void Reset()
         {
             ir = 0;

@@ -1864,11 +1864,12 @@ def platform(cfg, sigrok=False):
         ]
         + (
             [
-                # TIM15 can consume a complete DShot frame and reply DMA at once,
-                # avoiding tens of thousands of host clock callbacks per second.
+                # These slower cores need exact capture timestamps independent
+                # of Renode's host callback quantum.  The timer still generates
+                # every CCR value and DMA request for the guest firmware.
                 "    batchDshotFrames: true",
             ]
-            if fam == "l431"
+            if fam in ("l431", "e230")
             else []
         )
         + [
