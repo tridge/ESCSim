@@ -540,9 +540,7 @@ class Lab(object):
                 unix_path=endpoint.unix_path, host=endpoint.host, port=endpoint.port
             )
             if not attached:
-                raise RuntimeError(
-                    "USB/IP virtual-host-controller attach " "was refused"
-                )
+                raise RuntimeError("USB/IP virtual-host-controller attach was refused")
             self.usb_attached = True
             self.usb_port = None if attached is True else attached
             tty = sitl_usbip.find_tty(
@@ -625,14 +623,14 @@ def main(argv=None):
         "--gui-port",
         type=int,
         default=57833,
-        help="emulator input port (default off the SITL's " "57733, so both can run)",
+        help="emulator input port (default off the SITL's 57733, so both can run)",
     )
     ap.add_argument("--state-port", type=int, default=57834)
     ap.add_argument(
         "--monitor-port",
         type=int,
         default=57835,
-        help="Renode telnet monitor port, polled for the live " "PC / speedup display",
+        help="Renode telnet monitor port, polled for the live PC / speedup display",
     )
     ap.add_argument(
         "--bootloader-dir",

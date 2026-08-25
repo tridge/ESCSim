@@ -13,12 +13,9 @@ from platformdirs import user_cache_path, user_config_path
 
 
 DEFAULT_TARGETS_URL = (
-    "https://raw.githubusercontent.com/am32-firmware/AM32/"
-    "refs/heads/main/Inc/targets.h"
+    "https://raw.githubusercontent.com/am32-firmware/AM32/refs/heads/main/Inc/targets.h"
 )
-DEFAULT_ARTIFACT_BASE_URL = (
-    "https://firmware.ardupilot.org/Tools/AM32-tools/ESCSim/v1/"
-)
+DEFAULT_ARTIFACT_BASE_URL = "https://firmware.ardupilot.org/Tools/AM32-tools/ESCSim/v1/"
 _LEGACY_ARTIFACT_BASE_URLS = {"https://am32.tridgell.net/ESCSim/v1/"}
 SETTINGS_SCHEMA = 1
 

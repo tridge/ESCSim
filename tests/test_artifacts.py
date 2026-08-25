@@ -59,9 +59,7 @@ def make_repository(tmp_path: Path) -> Path:
     (firmware / "AM32_VIMDRONES_L431_2.21.elf").write_bytes(b"firmware-elf")
     (firmware / "AM32_VIMDRONES_L431_2.21.hex").write_bytes(b"firmware-hex")
     (firmware / "AM32_VIMDRONES_L431_CAN_2.21.elf").write_bytes(b"can-firmware-elf")
-    (firmware / "AM32_VIMDRONES_L431_CAN_2.21.hex").write_bytes(
-        b"can-firmware-hex"
-    )
+    (firmware / "AM32_VIMDRONES_L431_CAN_2.21.hex").write_bytes(b"can-firmware-hex")
     (bootloaders / "AM32_L431_BOOTLOADER_PA2_V19.elf").write_bytes(b"bootloader-elf")
     (bootloaders / "AM32_L431_BOOTLOADER_PA2_V19.hex").write_bytes(b"bootloader-hex")
     (bootloaders / "AM32_L431_BOOTLOADER_PA2_CAN_V19.elf").write_bytes(
@@ -97,9 +95,10 @@ def test_publish_fetch_install_and_offline_cache(tmp_path):
             "firmware": "2.21",
             "bootloader": "19",
         }
-        assert "AM32_SITL_BOOTLOADER_PB4_CAN" not in catalog["releases"][
-            "bootloader"
-        ][0]["targets"]
+        assert (
+            "AM32_SITL_BOOTLOADER_PB4_CAN"
+            not in catalog["releases"]["bootloader"][0]["targets"]
+        )
         firmware = repository.install("firmware", "2.21", "VIMDRONES_L431")
         assert firmware.image.read_bytes() == b"firmware-elf"
         assert firmware.targets_header is not None
@@ -213,9 +212,7 @@ def test_publish_requires_matching_hex(tmp_path):
     firmware.mkdir()
     (firmware / "AM32_VIMDRONES_L431_2.21.elf").write_bytes(b"firmware-elf")
     with pytest.raises(ValueError, match="missing matching Intel HEX"):
-        add_firmware(
-            tmp_path / "site", "2.21", "abc1234", targets, firmware, "stable"
-        )
+        add_firmware(tmp_path / "site", "2.21", "abc1234", targets, firmware, "stable")
 
 
 def test_invalid_catalog_refresh_preserves_last_known_good(tmp_path):

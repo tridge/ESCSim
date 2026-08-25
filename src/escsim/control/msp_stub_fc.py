@@ -67,8 +67,7 @@ class PtyEndpoint(object):
     def __init__(self):
         if pty is None:
             raise RuntimeError(
-                "pseudo terminals are not available on Windows; "
-                "use a USB/IP endpoint"
+                "pseudo terminals are not available on Windows; use a USB/IP endpoint"
             )
         self.master, self.slave = pty.openpty()
         # raw mode now: the default line discipline would echo the
@@ -539,8 +538,7 @@ def main():
         "--state-port",
         type=int,
         default=57734,
-        help="SITL state port, used to reset an ESC into the "
-        "bootloader (0 disables)",
+        help="SITL state port, used to reset an ESC into the bootloader (0 disables)",
     )
     parser.add_argument(
         "--no-esc-reset",
@@ -575,7 +573,7 @@ def main():
         "--usbip-port",
         type=int,
         default=None,
-        help="export the virtual device on this tcp port " "instead of a unix socket",
+        help="export the virtual device on this tcp port instead of a unix socket",
     )
     parser.add_argument(
         "--usbip-serial",

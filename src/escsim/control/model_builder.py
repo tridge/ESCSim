@@ -43,8 +43,7 @@ def parse_size_code(code):
         return float(m.group(1)), float(m.group(2))
     if not s.isdigit() or len(s) < 4:
         raise ValueError(
-            "motor size %r is not a 4-digit code like 2216 "
-            "or a DxH like 22x16" % code
+            "motor size %r is not a 4-digit code like 2216 or a DxH like 22x16" % code
         )
     half = len(s) // 2
     return float(s[:half]), float(s[half:])
@@ -67,7 +66,7 @@ def parse_prop(text):
         s = s.rstrip('in"')
     m = re.match(r"^([\d.]+)\s*x\s*([\d.]+)$", s)
     if not m:
-        raise ValueError("propeller %r is not a DxP like 9x4.5 or " "240x120mm" % text)
+        raise ValueError("propeller %r is not a DxP like 9x4.5 or 240x120mm" % text)
     return float(m.group(1)), float(m.group(2)), units
 
 

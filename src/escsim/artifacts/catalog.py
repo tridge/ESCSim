@@ -204,7 +204,9 @@ def validate_manifest(raw: object, project: str, release: str) -> dict:
                 or hex_path.suffix.lower() != ".hex"
                 or elf_path.with_suffix("") != hex_path.with_suffix("")
             ):
-                raise CatalogError("manifest ELF and HEX images must be a matching pair")
+                raise CatalogError(
+                    "manifest ELF and HEX images must be a matching pair"
+                )
             if images["elf"] != item["artifact"]:
                 raise CatalogError("manifest default artifact must be the ELF image")
             item["images"] = images

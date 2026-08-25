@@ -990,9 +990,7 @@ def config(target, nm="arm-none-eabi-gcc", targets_text=None):
 
     if family == "e230":
         if "USE_ADC_INPUT" in m:
-            raise Unsupported(
-                "%s: USE_ADC_INPUT is not modelled on the " "e230" % target
-            )
+            raise Unsupported("%s: USE_ADC_INPUT is not modelled on the e230" % target)
     if family == "f415":
         # PA6_VOLTAGE would swap the hardwired ADC rank meanings in
         # Mcu/f415/Src/ADC.c; no current F415 target sets either
@@ -1007,7 +1005,7 @@ def config(target, nm="arm-none-eabi-gcc", targets_text=None):
         # refuses the flag rather than model it untested, so refuse at
         # generation with the reason instead of at machine load
         raise Unsupported(
-            "%s: USE_INVERTED_HIGH is not modelled by the " "bridge" % target
+            "%s: USE_INVERTED_HIGH is not modelled by the bridge" % target
         )
 
     # a PWM_ENABLE_BRIDGE target names its pins PWM and ENABLE rather
@@ -1173,7 +1171,7 @@ def a153_config(target, m, dronecan):
         unit = m.get("PHASE_%s_COMP_UNIT" % ph, "")
         if unit not in ("CMP0", "CMP1"):
             raise Unsupported(
-                "phase %s comparator unit %r is not CMP0 or " "CMP1" % (ph, unit)
+                "phase %s comparator unit %r is not CMP0 or CMP1" % (ph, unit)
             )
         comps[ph] = (int(unit[3:]), number("PHASE_%s_COMP_INP" % ph))
 
@@ -2245,7 +2243,7 @@ def default_eeprom(path, model, extra=None):
     try:
         from escsim.control import params as sitl_params
     except ImportError:
-        raise Unsupported("ESCSim parameter support is not available; " "pass --eeprom")
+        raise Unsupported("ESCSim parameter support is not available; pass --eeprom")
     overrides = {"INPUT_SIGNAL_TYPE": 0}
     overrides.update(extra or {})
     try:
@@ -2480,9 +2478,7 @@ def write_image_elf(path, chunks, entry, machine):
         0,
         0,
     )
-    for index, ((address, payload), payload_offset) in enumerate(
-        zip(chunks, offsets)
-    ):
+    for index, ((address, payload), payload_offset) in enumerate(zip(chunks, offsets)):
         struct.pack_into(
             "<IIIIIIII",
             image,
@@ -3053,7 +3049,7 @@ def main(argv=None):
     ap.add_argument(
         "--sigrok",
         action="store_true",
-        help="serve a live renode-la logic analyser on TCP " "(implies --run)",
+        help="serve a live renode-la logic analyser on TCP (implies --run)",
     )
     ap.add_argument(
         "--sigrok-port",
@@ -3495,8 +3491,7 @@ def main(argv=None):
         if dbg is False:
             print(
                 "%s has no .debug_info; gdb would only show addresses.\n"
-                "The AM32 makefile builds with -g3, so rebuild the target."
-                % symbol_elf
+                "The AM32 makefile builds with -g3, so rebuild the target." % symbol_elf
             )
             return 1
         if dbg is None:

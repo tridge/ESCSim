@@ -216,7 +216,7 @@ class SimRunner(object):
         self.stop()
         if not binary or not os.path.isfile(binary):
             raise RuntimeError(
-                "no simulator binary - build the SITL or pick " "one with Browse"
+                "no simulator binary - build the SITL or pick one with Browse"
             )
         if not eeprom or not os.path.isfile(eeprom):
             raise RuntimeError("no eeprom file for the simulator")

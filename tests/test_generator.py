@@ -70,9 +70,9 @@ def test_native_library_does_not_trust_working_directory(tmp_path, monkeypatch):
 
 
 def ihex_record(address, record_type, payload):
-    body = bytes(
-        [len(payload), address >> 8, address & 0xFF, record_type]
-    ) + bytes(payload)
+    body = bytes([len(payload), address >> 8, address & 0xFF, record_type]) + bytes(
+        payload
+    )
     checksum = (-sum(body)) & 0xFF
     return ":" + (body + bytes([checksum])).hex().upper()
 

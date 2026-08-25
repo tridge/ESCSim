@@ -575,7 +575,7 @@ def main():
     p.add_argument(
         "--physics",
         action="store_true",
-        help="record the physics audio stream instead of " "synthesized tones",
+        help="record the physics audio stream instead of synthesized tones",
     )
     p = sub.add_parser("assert", help="assert on a played note sequence")
     p.add_argument(

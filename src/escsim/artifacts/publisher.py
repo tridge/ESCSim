@@ -270,14 +270,20 @@ def release_has_formats(root: Path, project: str, release: str) -> bool:
     manifest = validate_manifest(
         json.loads((root / entry["manifest"]).read_text("utf-8")), project, release
     )
-    return all(set(target.get("images", {})) >= {"elf", "hex"} for target in manifest["targets"])
+    return all(
+        set(target.get("images", {})) >= {"elf", "hex"}
+        for target in manifest["targets"]
+    )
 
 
 def _verify_source(source: Path, spec: dict) -> None:
     if not source.is_file():
         raise ValueError(f"missing build image needed to augment release: {source}")
     content = source.read_bytes()
-    if len(content) != spec["size"] or hashlib.sha256(content).hexdigest() != spec["sha256"]:
+    if (
+        len(content) != spec["size"]
+        or hashlib.sha256(content).hexdigest() != spec["sha256"]
+    ):
         raise ValueError(f"build image does not match published release: {source}")
 
 

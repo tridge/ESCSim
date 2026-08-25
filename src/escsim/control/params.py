@@ -107,14 +107,16 @@ CALC = {
     "MIN_DUTY_CYCLE": lambda v: "%.1f%%" % (v * 0.5),
     "STARTUP_POWER": lambda v: "%d%%" % v,
     "PWM_FREQUENCY": lambda v: "%d kHz" % v,
-    "ADVANCE_LEVEL": lambda v: "%.1f deg" % ((v - 10) * 0.9375)
-    if 10 <= v <= 42
-    else "%.1f deg (old fmt)" % (v * 7.5),
+    "ADVANCE_LEVEL": lambda v: (
+        "%.1f deg" % ((v - 10) * 0.9375)
+        if 10 <= v <= 42
+        else "%.1f deg (old fmt)" % (v * 7.5)
+    ),
     "ABSOLUTE_VOLTAGE_CUTOFF": lambda v: "%.1f V" % (v * 0.5),
     "LOW_CELL_VOLTAGE": lambda v: "%.2f V/cell" % ((v + 250) / 100.0),
-    "LOW_VOLTAGE_CUTOFF": lambda v: ("off", "per cell", "absolute")[v]
-    if v < 3
-    else "?",
+    "LOW_VOLTAGE_CUTOFF": lambda v: (
+        ("off", "per cell", "absolute")[v] if v < 3 else "?"
+    ),
     "CURRENT_LIMIT": lambda v: "%d A" % (v * 2) if v <= 100 else "off",
     "TEMPERATURE_LIMIT": lambda v: "%d C" % v if 70 <= v <= 140 else "off",
     "TELEM_RATE": lambda v: "%d Hz" % v,

@@ -128,7 +128,7 @@ class WaveDialog(QDialog):
             (
                 "Close",
                 self.accept,
-                "Close this dialog (leaves the " "waveform running if started).",
+                "Close this dialog (leaves the waveform running if started).",
             ),
         ):
             b = QPushButton(text)

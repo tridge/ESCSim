@@ -538,8 +538,7 @@ class EditModelDialog(QDialog):
         "battery.capacitance": "Bus capacitance, farads. ~0.002.",
         "battery.sink_resistance": "Regen sink resistance: low for a battery "
         "(~0.35), high for a bench supply (~10).",
-        "battery.sink_current_max": "Max regenerated current the source "
-        "absorbs, amps.",
+        "battery.sink_current_max": "Max regenerated current the source absorbs, amps.",
         "esc.rds_on": "MOSFET on-resistance, ohms. ~0.004-0.01.",
         "esc.diode_vf": "Body-diode forward voltage, volts. ~0.7.",
         "esc.temperature_c": "ESC temperature, Celsius.",

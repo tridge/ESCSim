@@ -244,7 +244,7 @@ def extract(archive, destination, package):
                 _safe_member_name(member.name)
                 if not (member.isfile() or member.isdir()):
                     raise RuntimeError(
-                        "links and special files are not allowed " "in Renode packages"
+                        "links and special files are not allowed in Renode packages"
                     )
             bundle.extractall(destination, members=members)
         executable_name = "renode"

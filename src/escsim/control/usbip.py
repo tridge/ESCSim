@@ -155,7 +155,7 @@ def find_tty(serial=DEFAULT_SERIAL, timeout=10.0, vid=VENDOR_ID, pid=PRODUCT_ID)
                 from serial.tools import list_ports
             except ImportError as ex:
                 raise RuntimeError(
-                    "pyserial is required to discover the " "Windows COM port"
+                    "pyserial is required to discover the Windows COM port"
                 ) from ex
             ports = [p for p in list_ports.comports() if p.vid == vid and p.pid == pid]
             hits = sorted(
@@ -830,7 +830,7 @@ def _windows_attach(host, port, busid):
 def _windows_detach(port):
     if port is None or isinstance(port, bool):
         raise RuntimeError(
-            "refusing to detach without the owned Windows " "USB/IP port number"
+            "refusing to detach without the owned Windows USB/IP port number"
         )
     executable, _version = _windows_usbip_checked()
     try:
@@ -865,7 +865,7 @@ def attach(unix_path=None, host="127.0.0.1", port=3240, busid=BUSID):
     if IS_WINDOWS:
         if unix_path is not None:
             raise RuntimeError(
-                "Windows USB/IP attachment requires a TCP " "export, not a Unix socket"
+                "Windows USB/IP attachment requires a TCP export, not a Unix socket"
             )
         return _windows_attach(host, port, busid)
     if os.geteuid() != 0 and not os.access(os.path.join(VHCI, "attach"), os.W_OK):
