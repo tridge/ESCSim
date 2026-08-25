@@ -55,8 +55,7 @@ jobs:
       - name: Build Windows native motor library
         shell: msys2 {0}
         run: python scripts/build-package.py --skip-pyinstaller
-      - name: Windows all-MCU ELF/HEX protocol report
-        continue-on-error: true
+      - name: Windows all-MCU ELF/HEX protocol validation
         shell: msys2 {0}
         env:
           BASE_URL: ${{ inputs.base_url || 'https://firmware.ardupilot.org/Tools/AM32-tools/ESCSim/v1/' }}

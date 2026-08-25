@@ -1,32 +1,31 @@
 # Windows test status
 
-The first native Windows 11 lab sweep used firmware release 2.21, the verified
+The native Windows 11 lab sweep uses firmware release 2.21, the verified
 Renode 1.16.1 build from firmware.ardupilot.org, native Python 3.12, and a
 64-bit MinGW-built `am32sim.dll`. Each cell was run with both the published ELF
 and Intel HEX image; the two formats produced the same result.
 
 | MCU family | Representative target | PWM | DShot600 | BDShot |
 |---|---|---:|---:|---:|
-| A153 | FRDM_A153 | pass | pass | fail |
-| E230 | RHINO40A_E230 | fail | fail | fail |
+| A153 | FRDM_A153 | pass | pass | pass |
+| E230 | GD32DEV_A_E230 | pass | pass | pass |
 | F031 | CRAWLMASTER_F031 | pass | pass | pass |
 | F051 | AGFRC_V2_F051 | pass | pass | pass |
 | F415 | AT32DEV_F415 | pass | pass | pass |
 | F421 | AIKON_55A_F421 | pass | pass | pass |
 | G031 | GEN_G031 | pass | pass | pass |
 | G071 | AIKON_04_G071 | pass | pass | pass |
-| G431 | AS_G431 | pass | pass | fail |
+| G431 | AS_G431 | pass | pass | pass |
 | L431 | NEUTRON_L431 | pass | pass | pass |
 | V203 | AIRBOT_V203 | pass | pass | pass |
 
-This is 56 passing cells out of 66. E230 PWM also fails on Linux with the same
-firmware and target, so that row is an existing family-model issue rather than
-a Windows port failure. A153 and G431 BDShot remain explicit gaps; they are not
-excluded from the comprehensive report.
+This is 66 passing cells out of 66. Every cell starts a fresh Renode process,
+waits for the firmware's reported armed state, advances the throttle, and for
+BDShot also requires decoded telemetry replies.
 
 Windows-specific validation also covers:
 
-- 89 native Python/Qt tests passing, with only the POSIX-mode and external-GCC
+- 91 native Python/Qt tests passing, with only the POSIX-mode and external-GCC
   comparison tests skipped;
 - native DLL build and smoke executable;
 - usbip-win2 0.9.7.7 attach, exact serial identity, COM-port enumeration,
@@ -36,5 +35,5 @@ Windows-specific validation also covers:
   Renode discovery, and target generation from the installed application.
 
 Run the comprehensive matrix and USB/IP check with the Makefile commands in
-[packaging.md](packaging.md). The scheduled Windows workflow uploads the full
-JSON report even while known model gaps make its parity step non-blocking.
+[packaging.md](packaging.md). The scheduled Windows workflow fails if any
+matrix cell fails and still uploads the full JSON report for diagnosis.
