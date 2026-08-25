@@ -5,7 +5,7 @@ on:
     inputs:
       base_url:
         description: Artifact repository v1 URL
-        default: https://am32.tridgell.net/ESCSim/v1/
+        default: https://firmware.ardupilot.org/Tools/AM32-tools/ESCSim/v1/
   schedule:
     - cron: "17 14 * * *"
 
@@ -22,9 +22,9 @@ jobs:
       - run: python -m pip install -U pip
       - run: python -m pip install -e '.[gui]'
       - run: python scripts/build-package.py --skip-pyinstaller
-      - name: PWM, DShot600 and BDShot parity
+      - name: ELF/HEX PWM, DShot600 and BDShot parity
         env:
-          BASE_URL: ${{ inputs.base_url || 'https://am32.tridgell.net/ESCSim/v1/' }}
+          BASE_URL: ${{ inputs.base_url || 'https://firmware.ardupilot.org/Tools/AM32-tools/ESCSim/v1/' }}
         run: >-
           python scripts/run-parity-tests.py
           --base-url "$BASE_URL"

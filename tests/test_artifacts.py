@@ -20,7 +20,9 @@ from escsim.artifacts.catalog import (
 from escsim.artifacts.publisher import (
     add_bootloaders,
     add_firmware,
+    augment_release,
     finish,
+    release_has_formats,
     validate_repository,
 )
 
@@ -55,11 +57,21 @@ def make_repository(tmp_path: Path) -> Path:
     firmware.mkdir()
     bootloaders.mkdir()
     (firmware / "AM32_VIMDRONES_L431_2.21.elf").write_bytes(b"firmware-elf")
+    (firmware / "AM32_VIMDRONES_L431_2.21.hex").write_bytes(b"firmware-hex")
     (firmware / "AM32_VIMDRONES_L431_CAN_2.21.elf").write_bytes(b"can-firmware-elf")
+    (firmware / "AM32_VIMDRONES_L431_CAN_2.21.hex").write_bytes(
+        b"can-firmware-hex"
+    )
     (bootloaders / "AM32_L431_BOOTLOADER_PA2_V19.elf").write_bytes(b"bootloader-elf")
+    (bootloaders / "AM32_L431_BOOTLOADER_PA2_V19.hex").write_bytes(b"bootloader-hex")
     (bootloaders / "AM32_L431_BOOTLOADER_PA2_CAN_V19.elf").write_bytes(
         b"can-bootloader-elf"
     )
+    (bootloaders / "AM32_L431_BOOTLOADER_PA2_CAN_V19.hex").write_bytes(
+        b"can-bootloader-hex"
+    )
+    (bootloaders / "AM32_SITL_BOOTLOADER_PB4_CAN_V19.elf").write_bytes(b"host-elf")
+    (bootloaders / "AM32_SITL_BOOTLOADER_PB4_CAN_V19.hex").write_bytes(b"host-hex")
     root = tmp_path / "site" / "v1"
     catalog = add_firmware(root, "2.21", "abc1234", targets, firmware, "stable")
     catalog = add_bootloaders(root, "19", "def5678", bootloaders, "stable", catalog)
@@ -85,13 +97,24 @@ def test_publish_fetch_install_and_offline_cache(tmp_path):
             "firmware": "2.21",
             "bootloader": "19",
         }
+        assert "AM32_SITL_BOOTLOADER_PB4_CAN" not in catalog["releases"][
+            "bootloader"
+        ][0]["targets"]
         firmware = repository.install("firmware", "2.21", "VIMDRONES_L431")
         assert firmware.image.read_bytes() == b"firmware-elf"
         assert firmware.targets_header is not None
+        firmware_hex = repository.install(
+            "firmware", "2.21", "VIMDRONES_L431", image_format="hex"
+        )
+        assert firmware_hex.image.read_bytes() == b"firmware-hex"
+        assert firmware_hex.companion_elf == firmware.image
         variant = repository.compatible_bootloader("19", firmware.metadata)
         assert variant["name"] == "AM32_L431_BOOTLOADER_PA2"
-        bootloader = repository.install("bootloader", "19", variant["name"])
-        assert bootloader.image.read_bytes() == b"bootloader-elf"
+        bootloader = repository.install(
+            "bootloader", "19", variant["name"], image_format="hex"
+        )
+        assert bootloader.image.read_bytes() == b"bootloader-hex"
+        assert bootloader.companion_elf.read_bytes() == b"bootloader-elf"
 
     offline = ArtifactRepository(url, cache)
     assert offline.catalog()["channels"]["stable"]["firmware"] == "2.21"
@@ -155,6 +178,44 @@ def test_corrupt_download_never_becomes_cached(tmp_path):
         with pytest.raises(CatalogError, match="size or SHA-256"):
             repository.install("firmware", "2.21", manifest["targets"][0]["name"])
     assert not list((tmp_path / "cache" / "objects").rglob("*.elf"))
+
+
+def test_manifest_rejects_nonmatching_image_pair(tmp_path):
+    root = make_repository(tmp_path)
+    manifest_path = root / "firmware" / "2.21" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["targets"][0]["images"]["hex"]["path"] = "firmware/wrong.hex"
+    with pytest.raises(CatalogError, match="matching pair"):
+        validate_manifest(manifest, "firmware", "2.21")
+
+
+def test_legacy_release_can_be_safely_augmented(tmp_path):
+    root = make_repository(tmp_path)
+    manifest_path = root / "firmware" / "2.21" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    for target in manifest["targets"]:
+        target.pop("images")
+        (root / target["artifact"]["path"]).with_suffix(".hex").unlink()
+    manifest_path.write_text(json.dumps(manifest))
+    assert not release_has_formats(root, "firmware", "2.21")
+
+    augment_release(root, "firmware", "2.21", tmp_path / "firmware-build")
+    assert release_has_formats(root, "firmware", "2.21")
+    validate_repository(root)
+
+
+def test_publish_requires_matching_hex(tmp_path):
+    source = Path(__file__).parents[2] / "AM32.renode"
+    targets = source / "Inc" / "targets.h"
+    if not targets.exists():
+        pytest.skip("sibling AM32 checkout unavailable")
+    firmware = tmp_path / "firmware-build"
+    firmware.mkdir()
+    (firmware / "AM32_VIMDRONES_L431_2.21.elf").write_bytes(b"firmware-elf")
+    with pytest.raises(ValueError, match="missing matching Intel HEX"):
+        add_firmware(
+            tmp_path / "site", "2.21", "abc1234", targets, firmware, "stable"
+        )
 
 
 def test_invalid_catalog_refresh_preserves_last_known_good(tmp_path):

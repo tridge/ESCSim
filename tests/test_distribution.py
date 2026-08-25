@@ -45,6 +45,7 @@ def test_native_build_uses_make_without_cmake():
     root = Path(__file__).parents[1]
     top_makefile = (root / "Makefile").read_text()
     installer = (root / "scripts" / "install-package.py").read_text()
+    wheel_builder = (root / "scripts" / "build-wheel.py").read_text()
     makefile = root / "native" / "am32sim" / "Makefile"
     build_script = (root / "scripts" / "build-package.py").read_text()
     assert makefile.is_file()
@@ -52,7 +53,10 @@ def test_native_build_uses_make_without_cmake():
     assert "cmake" not in build_script.lower()
     assert 'os.environ.get("MAKE", "make")' in build_script
     assert "all: native wheel" in top_makefile
+    assert "wheel: native" in top_makefile
+    assert "scripts/build-wheel.py" in top_makefile
     assert "install: native" in top_makefile
     assert "scripts/install-package.py" in top_makefile
     assert '"pip",' in installer
     assert "staged.unlink(missing_ok=True)" in installer
+    assert "staged.unlink(missing_ok=True)" in wheel_builder

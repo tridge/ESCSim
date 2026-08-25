@@ -37,6 +37,7 @@ class InstalledArtifact:
     image: Path
     targets_header: Path | None = None
     metadata: dict | None = None
+    companion_elf: Path | None = None
 
 
 def _atomic_write(path: Path, content: bytes) -> None:
@@ -188,6 +189,25 @@ def validate_manifest(raw: object, project: str, release: str) -> dict:
         seen.add(name)
         item = dict(target)
         item["artifact"] = _artifact(target.get("artifact"))
+        raw_images = target.get("images")
+        if raw_images is not None:
+            if not isinstance(raw_images, dict) or set(raw_images) != {"elf", "hex"}:
+                raise CatalogError("manifest images must contain exactly ELF and HEX")
+            images = {
+                image_format: _artifact(spec, f"{image_format} image")
+                for image_format, spec in raw_images.items()
+            }
+            elf_path = PurePosixPath(images["elf"]["path"])
+            hex_path = PurePosixPath(images["hex"]["path"])
+            if (
+                elf_path.suffix.lower() != ".elf"
+                or hex_path.suffix.lower() != ".hex"
+                or elf_path.with_suffix("") != hex_path.with_suffix("")
+            ):
+                raise CatalogError("manifest ELF and HEX images must be a matching pair")
+            if images["elf"] != item["artifact"]:
+                raise CatalogError("manifest default artifact must be the ELF image")
+            item["images"] = images
         for field in ("family", "pin"):
             if not isinstance(item.get(field), str) or not item[field]:
                 raise CatalogError(f"manifest target has invalid {field}")
@@ -343,21 +363,48 @@ class ArtifactRepository:
             temporary.unlink(missing_ok=True)
             raise
 
-    def install(self, project: str, release: str, target: str) -> InstalledArtifact:
+    def install(
+        self,
+        project: str,
+        release: str,
+        target: str,
+        image_format: str = "elf",
+    ) -> InstalledArtifact:
         manifest = self.manifest(project, release)
         item = next((t for t in manifest["targets"] if t["name"] == target), None)
         if item is None:
             raise CatalogError(f"{project} {release} has no target {target}")
+        images = item.get("images", {"elf": item["artifact"]})
+        if image_format not in {"elf", "hex"}:
+            raise CatalogError("image format must be elf or hex")
+        if image_format not in images:
+            raise CatalogError(
+                f"{project} {release} target {target} has no {image_format.upper()} image"
+            )
         root = self.cache_dir / "objects" / project / release / target
-        image_name = PurePosixPath(item["artifact"]["path"]).name
-        image = self._download(item["artifact"], root / image_name)
+        selected = images[image_format]
+        image_name = PurePosixPath(selected["path"]).name
+        image = self._download(selected, root / image_name)
+        companion_elf = None
+        if image_format != "elf" and "elf" in images:
+            elf_spec = images["elf"]
+            elf_name = PurePosixPath(elf_spec["path"]).name
+            companion_elf = self._download(elf_spec, root / elf_name)
         targets_header = None
         if project == "firmware":
             targets_header = self._download(
                 manifest["targets_header"],
                 self.cache_dir / "objects" / project / release / "targets.h",
             )
-        return InstalledArtifact(project, release, target, image, targets_header, item)
+        return InstalledArtifact(
+            project=project,
+            release=release,
+            target=target,
+            image=image,
+            targets_header=targets_header,
+            metadata=item,
+            companion_elf=companion_elf,
+        )
 
     def compatible_bootloader(self, release: str, firmware_target: dict) -> dict:
         manifest = self.manifest("bootloader", release)

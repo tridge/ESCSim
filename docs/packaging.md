@@ -2,7 +2,8 @@
 
 ## Local builds
 
-The top-level Makefile builds the native library and Python wheel. It can also
+The top-level Makefile builds the native library and a platform-specific
+Python wheel containing that library. It can also
 run the complete test suite or install the Python GUI and native library
 together:
 
@@ -41,8 +42,8 @@ must sign the executable/installer and notarize the macOS app before upload.
 - `package.yml`: three-platform PyInstaller builds, packaged CLI smoke, and
   the Windows Inno Setup installer.
 - `publisher.yml`: catalog/publisher fixture and schema tests.
-- `renode.yml`: nightly/manual published-firmware PWM, DShot600, and BDShot
-  spin checks for VIMDRONES_L431 and TEKKO32_F415.
+- `renode.yml`: nightly/manual published-firmware ELF and HEX PWM, DShot600,
+  and BDShot spin checks for VIMDRONES_L431 and TEKKO32_F415.
 
 ## Functional parity matrix
 
@@ -54,7 +55,7 @@ local-catalog, or real Renode checks:
 |---|---|
 | Target search/info, CAN enablement | GUI and all-target preprocessing tests |
 | Custom URL/local `targets.h`, persistence | cache/server/settings tests |
-| Firmware/bootloader local and historical versions | publisher/client tests and real catalog launch |
+| Firmware/bootloader local and historical ELF/HEX versions | publisher/client tests and real catalog launch |
 | Renode current download/cache | manifest, archive hardening, and live runtime check |
 | Start/stop/restart, monitor metrics | process tests and real VIMDRONES boot |
 | PWM, DShot600, BDShot | nightly parity runner; local DShot600 spin check |

@@ -72,42 +72,64 @@ if [ -d "$ESCSIM_DOCUMENT_ROOT/v1" ]; then
     cp -a "$ESCSIM_DOCUMENT_ROOT/v1/." "$work/site/v1/"
 fi
 
-need_firmware=yes
-need_bootloader=yes
+firmware_action=add
+bootloader_action=add
 if PYTHONPATH="$ESCSIM_SOURCE/src" python3 -m escsim.artifacts.publisher contains \
         "$work/site/v1" firmware "$major.$minor"; then
-    need_firmware=no
+    firmware_action=augment
+    if PYTHONPATH="$ESCSIM_SOURCE/src" python3 -m escsim.artifacts.publisher complete \
+            "$work/site/v1" firmware "$major.$minor"; then
+        firmware_action=none
+    fi
 fi
 if PYTHONPATH="$ESCSIM_SOURCE/src" python3 -m escsim.artifacts.publisher contains \
         "$work/site/v1" bootloader "$bootloader_version"; then
-    need_bootloader=no
+    bootloader_action=augment
+    if PYTHONPATH="$ESCSIM_SOURCE/src" python3 -m escsim.artifacts.publisher complete \
+            "$work/site/v1" bootloader "$bootloader_version"; then
+        bootloader_action=none
+    fi
 fi
 
-if [ "$need_firmware" = yes ]; then
+if [ "$firmware_action" != none ]; then
     make -C "$work/AM32" -j "$ESCSIM_JOBS" \
         ARM_SDK_PREFIX="$ESCSIM_ARM_SDK_PREFIX" \
         RISCV_SDK_PREFIX="$ESCSIM_RISCV_SDK_PREFIX"
+fi
+if [ "$firmware_action" = add ]; then
     PYTHONPATH="$ESCSIM_SOURCE/src" python3 -m escsim.artifacts.publisher build \
         --root "$work/site/v1" --channel "$ESCSIM_CHANNEL" \
         --firmware-release "$major.$minor" --firmware-revision "$am32_revision" \
         --firmware-dir "$work/AM32/obj" --targets "$work/AM32/Inc/targets.h"
+elif [ "$firmware_action" = augment ]; then
+    PYTHONPATH="$ESCSIM_SOURCE/src" python3 -m escsim.artifacts.publisher augment \
+        --root "$work/site/v1" --project firmware --release "$major.$minor" \
+        --images "$work/AM32/obj"
 fi
-if [ "$need_bootloader" = yes ]; then
+if [ "$bootloader_action" != none ]; then
     make -C "$work/AM32-bootloader" -j "$ESCSIM_JOBS" \
         ARM_SDK_PREFIX="$ESCSIM_ARM_SDK_PREFIX" \
         RISCV_SDK_PREFIX="$ESCSIM_RISCV_SDK_PREFIX"
+fi
+if [ "$bootloader_action" = add ]; then
     PYTHONPATH="$ESCSIM_SOURCE/src" python3 -m escsim.artifacts.publisher build \
         --root "$work/site/v1" --channel "$ESCSIM_CHANNEL" \
         --bootloader-release "$bootloader_version" \
         --bootloader-revision "$bootloader_revision" \
         --bootloader-dir "$work/AM32-bootloader/obj"
+elif [ "$bootloader_action" = augment ]; then
+    PYTHONPATH="$ESCSIM_SOURCE/src" python3 -m escsim.artifacts.publisher augment \
+        --root "$work/site/v1" --project bootloader --release "$bootloader_version" \
+        --images "$work/AM32-bootloader/obj"
 fi
 PYTHONPATH="$ESCSIM_SOURCE/src" python3 -m escsim.artifacts.publisher validate "$work/site/v1"
 
 mkdir -p "$ESCSIM_DOCUMENT_ROOT/v1"
 mkdir -p "$ESCSIM_DOCUMENT_ROOT/v1/firmware" "$ESCSIM_DOCUMENT_ROOT/v1/bootloader"
-cp -an "$work/site/v1/firmware/." "$ESCSIM_DOCUMENT_ROOT/v1/firmware/"
-cp -an "$work/site/v1/bootloader/." "$ESCSIM_DOCUMENT_ROOT/v1/bootloader/"
+# Existing release payloads came from the document root and remain unchanged;
+# augmentation adds images and deliberately replaces that release's manifest.
+cp -a "$work/site/v1/firmware/." "$ESCSIM_DOCUMENT_ROOT/v1/firmware/"
+cp -a "$work/site/v1/bootloader/." "$ESCSIM_DOCUMENT_ROOT/v1/bootloader/"
 cp "$work/site/v1/catalog.json" "$ESCSIM_DOCUMENT_ROOT/v1/.catalog.json.new"
 mv "$ESCSIM_DOCUMENT_ROOT/v1/.catalog.json.new" "$ESCSIM_DOCUMENT_ROOT/v1/catalog.json"
 cp "$work/site/v1/index.html" "$ESCSIM_DOCUMENT_ROOT/v1/.index.html.new"

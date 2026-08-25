@@ -24,7 +24,16 @@
           "family": {"type": "string"},
           "pin": {"type": "string"},
           "dronecan": {"type": "boolean"},
-          "artifact": {"$ref": "#/$defs/artifact"}
+          "artifact": {"$ref": "#/$defs/artifact"},
+          "images": {
+            "type": "object",
+            "required": ["elf", "hex"],
+            "properties": {
+              "elf": {"$ref": "#/$defs/artifact"},
+              "hex": {"$ref": "#/$defs/artifact"}
+            },
+            "additionalProperties": false
+          }
         }
       }
     }

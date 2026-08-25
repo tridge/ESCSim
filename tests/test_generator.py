@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+import struct
+
+from elftools.elf.elffile import ELFFile
+import pytest
 
 from escsim.renode import generator
 from escsim.settings import TargetSourceSpec
@@ -63,3 +67,86 @@ def test_native_library_does_not_trust_working_directory(tmp_path, monkeypatch):
     monkeypatch.delenv("ESCSIM_AM32SIM_LIBRARY", raising=False)
     selected = generator.native_library_path()
     assert selected is None or Path(selected) != attacker_library
+
+
+def ihex_record(address, record_type, payload):
+    body = bytes(
+        [len(payload), address >> 8, address & 0xFF, record_type]
+    ) + bytes(payload)
+    checksum = (-sum(body)) & 0xFF
+    return ":" + (body + bytes([checksum])).hex().upper()
+
+
+def write_ihex(path, data_address, data, entry, segment_entry=False):
+    lines = [
+        ihex_record(0, 4, struct.pack(">H", data_address >> 16)),
+        ihex_record(data_address & 0xFFFF, 0, data),
+    ]
+    if segment_entry:
+        lines.append(ihex_record(0, 3, struct.pack(">HH", 0, entry)))
+    else:
+        lines.append(ihex_record(0, 5, struct.pack(">I", entry)))
+    lines.append(ihex_record(0, 1, b""))
+    path.write_text("\n".join(lines) + "\n")
+
+
+def test_standalone_arm_hex_gets_minimal_elf_wrapper(tmp_path):
+    firmware = tmp_path / "local-build.hex"
+    reset = 0x08001009
+    write_ihex(
+        firmware,
+        0x08001000,
+        struct.pack("<II", 0x20008000, reset) + b"application",
+        reset,
+    )
+    elf, load, symbols = generator.application_image(
+        str(firmware), 0x08001000, family="l431", outdir=str(tmp_path)
+    )
+    assert load is None
+    assert symbols == elf
+    with Path(elf).open("rb") as stream:
+        image = ELFFile(stream)
+        assert image.header.e_machine == "EM_ARM"
+        assert image.header.e_entry == reset
+        segments = list(image.iter_segments())
+        assert segments[0].header.p_vaddr == 0x08001000
+        assert segments[0].data().endswith(b"application")
+
+
+def test_standalone_v203_hex_uses_zero_based_flash_alias(tmp_path):
+    firmware = tmp_path / "v203.hex"
+    write_ihex(
+        firmware,
+        0x08001000,
+        b"riscv-application",
+        0x1000,
+        segment_entry=True,
+    )
+    elf, load, symbols = generator.application_image(
+        str(firmware), 0x1000, family="v203", outdir=str(tmp_path)
+    )
+    assert load is None
+    assert symbols == elf
+    with Path(elf).open("rb") as stream:
+        image = ELFFile(stream)
+        assert image.header.e_machine == "EM_RISCV"
+        assert image.header.e_entry == 0x1000
+        assert list(image.iter_segments())[0].header.p_vaddr == 0x1000
+
+
+def test_v203_hex_without_start_record_is_rejected(tmp_path):
+    firmware = tmp_path / "v203-no-entry.hex"
+    firmware.write_text(
+        "\n".join(
+            (
+                ihex_record(0, 4, struct.pack(">H", 0x0800)),
+                ihex_record(0x1000, 0, b"riscv-application"),
+                ihex_record(0, 1, b""),
+            )
+        )
+        + "\n"
+    )
+    with pytest.raises(generator.Unsupported, match="no start-address record"):
+        generator.application_image(
+            str(firmware), 0x1000, family="v203", outdir=str(tmp_path)
+        )

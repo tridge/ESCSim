@@ -51,8 +51,10 @@ def wait_ready(lines: list[str], tree: ProcessTree, timeout=120) -> None:
     raise RuntimeError("Renode did not become ready:\n" + "\n".join(lines[-30:]))
 
 
-def run_one(repository, renode, target, protocol, release) -> dict:
-    installed = repository.install("firmware", release, target)
+def run_one(repository, renode, target, protocol, release, image_format) -> dict:
+    installed = repository.install(
+        "firmware", release, target, image_format=image_format
+    )
     input_port, state_port = free_port(), free_port()
     monitor_port = free_port(tcp=True)
     command = generator_command() + [
@@ -124,6 +126,7 @@ def run_one(repository, renode, target, protocol, release) -> dict:
         return {
             "target": target,
             "protocol": protocol,
+            "format": image_format,
             "status": "passed",
             "omega_rad_s": omega,
             "rpm_reported": ds.rpm,
@@ -148,6 +151,9 @@ def main(argv=None) -> int:
         choices=("pwm", "dshot600", "bdshot"),
         default=("pwm", "dshot600", "bdshot"),
     )
+    parser.add_argument(
+        "--formats", nargs="+", choices=("elf", "hex"), default=("elf", "hex")
+    )
     parser.add_argument("--firmware-release")
     parser.add_argument("--base-url")
     parser.add_argument("--renode")
@@ -160,19 +166,28 @@ def main(argv=None) -> int:
     results = []
     failed = False
     for target in args.targets:
-        for protocol in args.protocols:
-            try:
-                result = run_one(repository, renode, target, protocol, release)
-            except Exception as error:
-                failed = True
-                result = {
-                    "target": target,
-                    "protocol": protocol,
-                    "status": "failed",
-                    "error": str(error),
-                }
-            results.append(result)
-            print(json.dumps(result, sort_keys=True), flush=True)
+        for image_format in args.formats:
+            for protocol in args.protocols:
+                try:
+                    result = run_one(
+                        repository,
+                        renode,
+                        target,
+                        protocol,
+                        release,
+                        image_format,
+                    )
+                except Exception as error:
+                    failed = True
+                    result = {
+                        "target": target,
+                        "protocol": protocol,
+                        "format": image_format,
+                        "status": "failed",
+                        "error": str(error),
+                    }
+                results.append(result)
+                print(json.dumps(result, sort_keys=True), flush=True)
     report = json.dumps({"firmware": release, "results": results}, indent=2) + "\n"
     if args.output:
         args.output.write_text(report, encoding="utf-8")

@@ -27,11 +27,16 @@ def test_parity_sweep_records_all_results_before_failing(tmp_path, monkeypatch):
 
     calls = []
 
-    def run_one(_repository, _renode, target, protocol, release):
-        calls.append((target, protocol, release))
-        if target == "FIRST" and protocol == "pwm":
+    def run_one(_repository, _renode, target, protocol, release, image_format):
+        calls.append((target, protocol, release, image_format))
+        if target == "FIRST" and protocol == "pwm" and image_format == "elf":
             raise RuntimeError("deliberate first-case failure")
-        return {"target": target, "protocol": protocol, "status": "passed"}
+        return {
+            "target": target,
+            "protocol": protocol,
+            "format": image_format,
+            "status": "passed",
+        }
 
     monkeypatch.setattr(runner, "ArtifactRepository", lambda _url: Repository())
     monkeypatch.setattr(runner, "run_one", run_one)
@@ -55,16 +60,21 @@ def test_parity_sweep_records_all_results_before_failing(tmp_path, monkeypatch):
 
     assert status == 1
     assert calls == [
-        ("FIRST", "pwm", "2.21"),
-        ("FIRST", "dshot600", "2.21"),
-        ("SECOND", "pwm", "2.21"),
-        ("SECOND", "dshot600", "2.21"),
+        ("FIRST", "pwm", "2.21", "elf"),
+        ("FIRST", "dshot600", "2.21", "elf"),
+        ("FIRST", "pwm", "2.21", "hex"),
+        ("FIRST", "dshot600", "2.21", "hex"),
+        ("SECOND", "pwm", "2.21", "elf"),
+        ("SECOND", "dshot600", "2.21", "elf"),
+        ("SECOND", "pwm", "2.21", "hex"),
+        ("SECOND", "dshot600", "2.21", "hex"),
     ]
     report = json.loads(output.read_text())
-    assert len(report["results"]) == 4
+    assert len(report["results"]) == 8
     assert report["results"][0] == {
         "target": "FIRST",
         "protocol": "pwm",
+        "format": "elf",
         "status": "failed",
         "error": "deliberate first-case failure",
     }

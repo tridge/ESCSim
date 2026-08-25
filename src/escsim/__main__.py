@@ -100,8 +100,12 @@ def _artifacts_command(args: argparse.Namespace) -> int:
                     f"({len(release['targets'])} targets)"
                 )
         return 0
-    installed = repository.install(args.project, args.release, args.target)
+    installed = repository.install(
+        args.project, args.release, args.target, image_format=args.format
+    )
     print(installed.image)
+    if installed.companion_elf:
+        print(installed.companion_elf)
     if installed.targets_header:
         print(installed.targets_header)
     return 0
@@ -153,6 +157,7 @@ def build_parser() -> argparse.ArgumentParser:
     install.add_argument("target")
     install.add_argument("--base-url")
     install.add_argument("--cache", type=Path)
+    install.add_argument("--format", choices=("elf", "hex"), default="elf")
     artifacts.set_defaults(handler=_artifacts_command)
     return parser
 

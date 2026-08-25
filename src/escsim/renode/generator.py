@@ -2389,10 +2389,10 @@ def symbol_addresses(elf, names, nm="arm-none-eabi-nm"):
     return found
 
 
-def parse_ihex(data):
-    """Intel HEX to a list of (address, bytes) chunks, adjacent records
-    merged"""
+def parse_ihex_image(data):
+    """Intel HEX as merged address chunks and its optional entry point."""
     upper = 0
+    entry = None
     records = []
     for line in data.decode("ascii", errors="replace").splitlines():
         line = line.strip()
@@ -2405,14 +2405,30 @@ def parse_ihex(data):
         if len(rec) < 5 or (sum(rec) & 0xFF) != 0:
             raise Unsupported("bad Intel HEX checksum: %s" % line[:30])
         count, rtype = rec[0], rec[3]
+        if len(rec) != count + 5:
+            raise Unsupported("bad Intel HEX record length: %s" % line[:30])
         addr = rec[1] << 8 | rec[2]
         payload = rec[4 : 4 + count]
         if rtype == 0:
             records.append((upper + addr, payload))
         elif rtype == 4:
+            if count != 2:
+                raise Unsupported("bad Intel HEX linear address record")
             upper = (payload[0] << 8 | payload[1]) << 16
         elif rtype == 2:
+            if count != 2:
+                raise Unsupported("bad Intel HEX segment address record")
             upper = (payload[0] << 8 | payload[1]) << 4
+        elif rtype == 3:
+            if count != 4:
+                raise Unsupported("bad Intel HEX start segment record")
+            entry = ((payload[0] << 8 | payload[1]) << 4) + (
+                payload[2] << 8 | payload[3]
+            )
+        elif rtype == 5:
+            if count != 4:
+                raise Unsupported("bad Intel HEX start linear record")
+            entry = struct.unpack(">I", payload)[0]
         elif rtype == 1:
             break
     records.sort(key=lambda r: r[0])
@@ -2422,7 +2438,67 @@ def parse_ihex(data):
             chunks[-1] = (chunks[-1][0], chunks[-1][1] + payload)
         else:
             chunks.append((addr, payload))
-    return [(a, bytes(b)) for a, b in chunks]
+    return [(a, bytes(b)) for a, b in chunks], entry
+
+
+def parse_ihex(data):
+    """Intel HEX to merged ``(address, bytes)`` chunks."""
+    return parse_ihex_image(data)[0]
+
+
+def write_image_elf(path, chunks, entry, machine):
+    """Write a minimal little-endian ELF32 containing image load segments."""
+    if not chunks:
+        raise Unsupported("Intel HEX contains no data records")
+    header_size = 52
+    program_header_size = 32
+    offset = header_size + program_header_size * len(chunks)
+    offsets = []
+    for _address, payload in chunks:
+        offset = (offset + 3) & ~3
+        offsets.append(offset)
+        offset += len(payload)
+    image = bytearray(offset)
+    ident = b"\x7fELF\x01\x01\x01" + b"\0" * 9
+    flags = 0x05000000 if machine == 40 else 0
+    struct.pack_into(
+        "<16sHHIIIIIHHHHHH",
+        image,
+        0,
+        ident,
+        2,
+        machine,
+        1,
+        entry,
+        header_size,
+        0,
+        flags,
+        header_size,
+        program_header_size,
+        len(chunks),
+        40,
+        0,
+        0,
+    )
+    for index, ((address, payload), payload_offset) in enumerate(
+        zip(chunks, offsets)
+    ):
+        struct.pack_into(
+            "<IIIIIIII",
+            image,
+            header_size + index * program_header_size,
+            1,
+            payload_offset,
+            address,
+            address,
+            len(payload),
+            len(payload),
+            7,
+            4,
+        )
+        image[payload_offset : payload_offset + len(payload)] = payload
+    with open(path, "wb") as stream:
+        stream.write(image)
 
 
 def elf_chunks(data):
@@ -2767,29 +2843,59 @@ def find_elf(target):
     return max(found)[1] if found else None
 
 
-def application_image(path, app_base):
-    """Return the ELF used for symbols and an optional image load command.
+def application_image(path, app_base, family=None, outdir=None):
+    """Return load ELF, optional post-load command, and symbol ELF.
 
     Renode's family scripts need an ELF for symbols and reset metadata, but
     release/build directories also offer equivalent Intel HEX and raw BIN
     application images. Use the matching sibling ELF as that template, then
     overlay the selected image with the loader appropriate to its content.
-    Requiring an exact sibling avoids applying symbol hooks from a different
-    firmware build.
+    An exact sibling preserves symbols without ever borrowing them from a
+    different build. A standalone Intel HEX without that sibling gets a
+    minimal ELF wrapper containing only its own load records and entry point.
     """
     kind = image_kind(path)
     if kind == "elf":
-        return path, None
+        return path, None, path
     sibling = os.path.splitext(path)[0] + ".elf"
-    if not os.path.isfile(sibling) or image_kind(sibling) != "elf":
+    has_sibling = os.path.isfile(sibling) and image_kind(sibling) == "elf"
+    if kind == "bin" and has_sibling:
+        load = "sysbus LoadBinary @%s 0x%08X" % (renode_path(path), app_base)
+        return sibling, load, sibling
+    if kind != "hex" or outdir is None or family is None:
         raise Unsupported(
             "%s firmware %s needs its matching ELF %s" % (kind.upper(), path, sibling)
         )
-    if kind == "hex":
-        load = "sysbus LoadHEX @%s" % renode_path(path)
-    else:
-        load = "sysbus LoadBinary @%s 0x%08X" % (renode_path(path), app_base)
-    return sibling, load
+    with open(path, "rb") as stream:
+        chunks, entry = parse_ihex_image(stream.read())
+    if family == "v203":
+        chunks = [
+            (address - 0x08000000 if address >= 0x08000000 else address, payload)
+            for address, payload in chunks
+        ]
+        if entry is not None and entry >= 0x08000000:
+            entry -= 0x08000000
+    if entry is None:
+        if family == "v203":
+            raise Unsupported("V203 Intel HEX has no start-address record")
+        vector = next(
+            (
+                payload[app_base - address + 4 : app_base - address + 8]
+                for address, payload in chunks
+                if address <= app_base + 4 and app_base + 8 <= address + len(payload)
+            ),
+            None,
+        )
+        if vector is None or len(vector) != 4:
+            raise Unsupported("Intel HEX has no start address or reset vector")
+        entry = struct.unpack("<I", vector)[0]
+    generated = os.path.join(
+        outdir, "%s_image.elf" % os.path.splitext(os.path.basename(path))[0]
+    )
+    write_image_elf(generated, chunks, entry, 243 if family == "v203" else 40)
+    if has_sibling:
+        return generated, "sysbus LoadSymbolsFrom @%s" % renode_path(sibling), sibling
+    return generated, None, generated
 
 
 def find_renode(explicit=None):
@@ -3047,7 +3153,8 @@ def main(argv=None):
         "--elf",
         default=None,
         help="application image (ELF, Intel HEX or raw BIN; "
-        "HEX/BIN needs its matching sibling ELF); default: "
+        "a sibling ELF preserves symbols for HEX; BIN needs "
+        "its matching sibling ELF); default: "
         "the newest matching cached catalog artifact",
     )
     ap.add_argument(
@@ -3193,6 +3300,7 @@ def main(argv=None):
                     % image_kind(args.bootloader_elf)
                 )
                 return 1
+        symbol_elf = elf
     else:
         firmware = args.elf
         if firmware is None:
@@ -3206,14 +3314,20 @@ def main(argv=None):
             print("no firmware at %s" % firmware)
             return 1
         try:
-            elf, firmware_load = application_image(
-                os.path.abspath(firmware), cfg["app_base"]
+            elf, firmware_load, symbol_elf = application_image(
+                os.path.abspath(firmware),
+                cfg["app_base"],
+                family=cfg["family"],
+                outdir=outdir,
             )
         except Unsupported as e:
             print(e)
             return 1
         if firmware_load is not None:
-            print("using %s for symbols; loading selected image %s" % (elf, firmware))
+            print(
+                "loading selected image %s; using symbols from %s"
+                % (firmware, symbol_elf)
+            )
 
     # the mcast scheme is 239.65.82.<bus>, one octet only for 0..9, and
     # a DroneCAN node id is 7 bits with 0 meaning dynamic allocation
@@ -3270,13 +3384,17 @@ def main(argv=None):
     if firmware_load is not None:
         setup += "; %s" % firmware_load
     if not args.no_skip_delays:
-        if not args.no_firmware:
+        if not args.no_firmware and "delayMillis" in symbol_addresses(
+            symbol_elf, ("delayMillis",), args.nm_bin
+        ):
             # the application's startup-tune delays; no application, no
             # symbol to hook
             setup += (
                 '; cpu AddSymbolHook "delayMillis" "execfile(\'%s\')"'
                 % os.path.join(HERE, "scripts", "skip_delays.py")
             )
+        elif not args.no_firmware:
+            print("delayMillis symbol unavailable; startup delays are not skipped")
         if args.bootloader_elf is not None:
             # The bootloader's delayMicroseconds busy-polls the utility
             # timer, and its native-to-managed transition per read is
@@ -3366,18 +3484,19 @@ def main(argv=None):
     # status()/watch() at the monitor prompt, since there is no GUI
     status_py = os.path.join(outdir, "%s_status.py" % args.target)
     try:
-        write_status(status_py, elf, args.nm_bin)
+        write_status(status_py, symbol_elf, args.nm_bin)
         setup += "; python \"execfile('%s')\"" % status_py
     except Unsupported as e:
         print("no status() helpers: %s" % e)
 
     gdb_proc = None
     if args.gdb:
-        dbg = has_debug_info(elf, args.readelf)
+        dbg = has_debug_info(symbol_elf, args.readelf)
         if dbg is False:
             print(
                 "%s has no .debug_info; gdb would only show addresses.\n"
-                "The AM32 makefile builds with -g3, so rebuild the target." % elf
+                "The AM32 makefile builds with -g3, so rebuild the target."
+                % symbol_elf
             )
             return 1
         if dbg is None:
@@ -3387,7 +3506,7 @@ def main(argv=None):
             )
         gdb = find_gdb(args.gdb_bin)
         launcher = os.path.join(outdir, "%s_gdb.sh" % args.target)
-        write_gdb_launcher(launcher, gdb, elf, args.gdb_port)
+        write_gdb_launcher(launcher, gdb, symbol_elf, args.gdb_port)
         # halted at reset, so gdb gets control before any code runs
         setup += "; machine StartGdbServer %d" % args.gdb_port
 
@@ -3411,7 +3530,7 @@ def main(argv=None):
         # so a client can say what firmware is running and how far
         # through arming it is, neither of which is on the wire
         addrs = symbol_addresses(
-            elf,
+            symbol_elf,
             ("filename", "armed_timeout_count", "armed", "eepromBuffer"),
             args.nm_bin,
         )

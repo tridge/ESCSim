@@ -4,7 +4,7 @@ Renode ESC lab: pick a hardware target, a bootloader and a firmware,
 press Start, and get an emulated ESC a configurator can talk to.
 
 The emulator runs gen_target.py TARGET --link, serving the SITL wire
-protocols. The configurator port is served by Mcu/SITL on those ports,
+protocols. The configurator port is served by ESCSim on those ports,
 on a pty or - so a browser can reach it - on a virtual USB serial
 device attached through vhci_hcd. The protocol choice picks what sits
 on that port: the fake flight controller (MSP with BLHeli 4-way
@@ -14,10 +14,10 @@ adapter's self-echo, as a USB linker soldered to the signal pad
 provides). This is the rig for developing am32.tridgell.net against
 emulated CAN and non-CAN ESCs with no hardware.
 
-Bootloaders are matched to the target automatically: the ELF must be
+Bootloaders are matched to the target automatically: the image must be
 built for the target's signal pin (a PA2 bootloader on a PB4 target
 answers nothing), so the list only offers AM32_<MCU>_BOOTLOADER_<PIN>*
-builds from the bootloader repo's obj directory.
+builds from configured search paths and the artifact catalog.
 
 The Renode monitor is served on a telnet port and polled once a
 second, so the status panel shows the live PC (labelled when it is

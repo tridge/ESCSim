@@ -36,10 +36,10 @@ native:
 	$(MAKE) -C native/am32sim BUILD_DIR=$(NATIVE_BUILD_DIR) \
 		CONFIGURATION=$(CONFIGURATION) all
 
-wheel:
+wheel: native
 	@mkdir -p $(WHEEL_DIR)
-	$(PYTHON) -m pip wheel . --no-deps --no-build-isolation \
-		--wheel-dir $(WHEEL_DIR)
+	$(PYTHON) scripts/build-wheel.py --native "$(NATIVE_LIBRARY)" \
+		--wheel-dir "$(WHEEL_DIR)"
 
 test: native-test python-test
 

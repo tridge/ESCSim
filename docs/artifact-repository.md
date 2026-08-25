@@ -3,7 +3,10 @@
 ESCSim does not bundle AM32 firmware. The Target tab reads the versioned
 catalog at
 `https://firmware.ardupilot.org/Tools/AM32-tools/ESCSim/v1/catalog.json`, offers every
-release containing the selected target, and downloads only the selected ELF.
+release containing the selected target, and downloads only the selected image.
+Each target has matching ELF and Intel HEX files. ELF remains the GUI/default
+image; selecting HEX also caches its exact companion ELF so symbols and reset
+metadata can never come from a different build.
 The byte count and SHA-256 in its manifest must match before a cache entry is
 made visible. A firmware release also supplies its exact historical
 `targets.h`; the generator uses that snapshot without changing the user's
@@ -21,6 +24,7 @@ Useful commands:
 escsim artifacts refresh
 escsim artifacts list
 escsim artifacts install firmware 2.21 VIMDRONES_L431
+escsim artifacts install firmware 2.21 VIMDRONES_L431 --format hex
 python -m escsim.artifacts.publisher validate /staging/ESCSim/v1
 ```
 
@@ -40,7 +44,8 @@ each upstream default branch, validates the complete repository, then uploads
 immutable release directories before replacing `catalog.json` and
 `index.html`. The resulting tree keeps JSON schemas under `schemas/` and
 versioned data under `v1/firmware/<version>` and
-`v1/bootloader/<version>`, with a target subdirectory for every ELF.
+`v1/bootloader/<version>`, with a target subdirectory for every matching
+ELF/HEX pair.
 
 The publisher prefers the toolchains installed under the AM32 source tree and
 falls back to `arm-none-eabi-` and `riscv64-unknown-elf-` from `PATH`. Common
@@ -66,13 +71,21 @@ v1/
   firmware/2.21/manifest.json
   firmware/2.21/targets.h
   firmware/2.21/targets/VIMDRONES_L431/AM32_VIMDRONES_L431_2.21.elf
+  firmware/2.21/targets/VIMDRONES_L431/AM32_VIMDRONES_L431_2.21.hex
   bootloader/19/manifest.json
   bootloader/19/targets/AM32_L431_BOOTLOADER_PA2/...elf
+  bootloader/19/targets/AM32_L431_BOOTLOADER_PA2/...hex
 ```
 
 The schemas are in `schemas/`. The client additionally applies bounded JSON,
 same-origin relative-path, identifier, size, and digest validation rather than
 trusting a schema library alone.
+
+Users may browse to a local ELF, HEX, or BIN. A local HEX works by itself:
+ESCSim derives a minimal loadable ELF from its records and declared start
+address (or Cortex-M reset vector). A same-stem ELF is optional and preserves
+debug symbols; raw BIN still requires a same-stem ELF because it carries no
+address or entry-point metadata.
 
 ## Scheduled publishing
 
