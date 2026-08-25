@@ -22,16 +22,28 @@ from escsim.renode.session import generator_command, generator_environment
 
 
 ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_TARGETS = ("VIMDRONES_L431", "TEKKO32_F415")
+
+
+def representative_targets(manifest: dict) -> list[str]:
+    """Return one deterministic non-CAN target for every published family."""
+
+    representatives = {}
+    for item in manifest["targets"]:
+        if not item["dronecan"]:
+            representatives.setdefault(item["family"].lower(), item["name"])
+    return [representatives[family] for family in sorted(representatives)]
 
 
 def built_native_library() -> Path | None:
-    if os.name == "nt":
+    system = platform.system()
+    if system == "Windows":
         name = "am32sim.dll"
-    elif platform.system() == "Darwin":
+    elif system == "Darwin":
         name = "libam32sim.dylib"
     else:
         name = "libam32sim.so"
-    candidate = ROOT / "build" / f"package-native-{platform.system().lower()}" / name
+    candidate = ROOT / "build" / f"package-native-{system.lower()}" / name
     return candidate if candidate.is_file() else None
 
 
@@ -142,8 +154,12 @@ def run_one(repository, renode, target, protocol, release, image_format) -> dict
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--targets", nargs="+", default=("VIMDRONES_L431", "TEKKO32_F415")
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--targets", nargs="+")
+    selection.add_argument(
+        "--all-mcus",
+        action="store_true",
+        help="select one non-CAN target for every family in the release",
     )
     parser.add_argument(
         "--protocols",
@@ -162,10 +178,15 @@ def main(argv=None) -> int:
     repository = ArtifactRepository(args.base_url)
     catalog = repository.catalog(refresh=True)
     release = args.firmware_release or catalog["channels"]["stable"]["firmware"]
+    targets = (
+        representative_targets(repository.manifest("firmware", release))
+        if args.all_mcus
+        else args.targets or DEFAULT_TARGETS
+    )
     renode = Path(args.renode) if args.renode else renode_download.install_current()[0]
     results = []
     failed = False
-    for target in args.targets:
+    for target in targets:
         for image_format in args.formats:
             for protocol in args.protocols:
                 try:
@@ -188,7 +209,24 @@ def main(argv=None) -> int:
                     }
                 results.append(result)
                 print(json.dumps(result, sort_keys=True), flush=True)
-    report = json.dumps({"firmware": release, "results": results}, indent=2) + "\n"
+    passed = sum(item["status"] == "passed" for item in results)
+    report = (
+        json.dumps(
+            {
+                "platform": platform.system(),
+                "firmware": release,
+                "targets": targets,
+                "summary": {
+                    "passed": passed,
+                    "failed": len(results) - passed,
+                    "total": len(results),
+                },
+                "results": results,
+            },
+            indent=2,
+        )
+        + "\n"
+    )
     if args.output:
         args.output.write_text(report, encoding="utf-8")
     return 1 if failed else 0

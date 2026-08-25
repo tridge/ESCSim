@@ -5,8 +5,9 @@ It contains the combined Target and Control application, downloads verified
 Renode/firmware/bootloader releases, and does not require an AM32 checkout or
 embedded compiler toolchain at runtime.
 
-See the [five-minute quick start](docs/quickstart.md). Release packaging and
-the current parity matrix are in [docs/packaging.md](docs/packaging.md).
+See the [five-minute quick start](docs/quickstart.md), the
+[packaging guide](docs/packaging.md), and the current
+[Windows test matrix](docs/windows-testing.md).
 
 ## Target definitions
 

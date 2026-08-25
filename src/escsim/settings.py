@@ -56,10 +56,16 @@ class Settings:
 
 
 def default_config_dir() -> Path:
+    override = os.environ.get("ESCSIM_CONFIG_DIR")
+    if override:
+        return Path(override).expanduser()
     return Path(user_config_path("ESCSim", appauthor="AM32"))
 
 
 def default_cache_dir() -> Path:
+    override = os.environ.get("ESCSIM_CACHE_DIR")
+    if override:
+        return Path(override).expanduser()
     return Path(user_cache_path("ESCSim", appauthor="AM32"))
 
 

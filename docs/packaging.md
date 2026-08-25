@@ -72,6 +72,58 @@ python3 scripts/build-package.py --skip-pyinstaller
 python3 scripts/run-parity-tests.py --output parity-report.json
 ```
 
+Use one published non-CAN target from every supported MCU family with:
+
+```sh
+make parity-all-mcus
+```
+
+The command tests ELF and HEX images with PWM, DShot600, and BDShot and writes
+the platform, selected targets, pass/fail totals, and every result to
+`build/parity-all-mcus.json` by default.
+
+## Windows lab build
+
+Run the build from a Cygwin shell, but use native 64-bit Windows Python. Cygwin
+Python cannot install the PySide6 Windows wheels. Install Cygwin's
+`mingw64-x86_64-gcc-core` toolchain, then create an isolated environment:
+
+```sh
+py -3.12 -m venv .venv-win
+.venv-win/Scripts/python.exe -m pip install -e '.[test,gui]' pyinstaller
+CC=x86_64-w64-mingw32-gcc \
+    .venv-win/Scripts/python.exe scripts/build-package.py
+```
+
+Microsoft Store Python virtualizes writes below `LocalAppData`, while Renode is
+a separate process and cannot see the virtualized files. Give source-tree runs
+a shared, ordinary cache directory:
+
+```sh
+export ESCSIM_CACHE_DIR="$(cygpath -w "$PWD/build/windows-cache")"
+QT_QPA_PLATFORM=offscreen .venv-win/Scripts/python.exe -m pytest
+CC=x86_64-w64-mingw32-gcc \
+    make parity-all-mcus PYTHON=.venv-win/Scripts/python.exe
+```
+
+With usbip-win2 0.9.7.7 or a later safe release already installed, the real
+attach/enumerate/serial-echo/detach integration check is:
+
+```sh
+make windows-usbip-test PYTHON=.venv-win/Scripts/python.exe
+```
+
+Version 0.9.7.8 is explicitly rejected because it is unsafe. The integration
+test detaches only the UDE port returned by its own attach operation.
+
+Compile and silently smoke-install the per-user installer with:
+
+```sh
+"/cygdrive/c/Users/$USER/AppData/Local/Programs/Inno Setup 6/ISCC.exe" \
+    packaging/ESCSim.iss
+./dist/installer/ESCSim-installer.exe /VERYSILENT /NORESTART /TASKS=""
+```
+
 The release gate specifically prevents regressions in non-CAN
 VIMDRONES_L431 DShot600 and TEKKO32_F415 PWM/DShot/BDShot. A representative
 DroneCAN runtime case will be added to the parity runner once the first public

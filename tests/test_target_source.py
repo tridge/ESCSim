@@ -16,6 +16,7 @@ from escsim.target.source import (
     extract_target_names,
     validate_targets_header,
 )
+from conftest import DEFAULT_TARGETS
 
 
 def targets_header(count: int = 12, suffix: str = "") -> bytes:
@@ -85,11 +86,8 @@ def test_extracts_target_blocks():
     assert len(names) == 12
 
 
-def test_validates_real_am32_header_when_checkout_is_available():
-    header = Path(__file__).parents[2] / "AM32.renode" / "Inc" / "targets.h"
-    if not header.exists():
-        pytest.skip("sibling AM32 checkout is not available")
-    digest, targets = validate_targets_header(header.read_bytes())
+def test_validates_bundled_am32_header():
+    digest, targets = validate_targets_header(DEFAULT_TARGETS.read_bytes())
     assert len(digest) == 64
     assert "VIMDRONES_L431" in targets
     assert "TEKKO32_F415" in targets

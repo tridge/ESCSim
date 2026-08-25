@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import json
 import io
+import os
 from pathlib import Path
 import stat
 import threading
@@ -25,6 +26,7 @@ from escsim.artifacts.publisher import (
     release_has_formats,
     validate_repository,
 )
+from conftest import DEFAULT_TARGETS
 
 
 @contextmanager
@@ -48,10 +50,7 @@ def static_server(directory: Path):
 
 
 def make_repository(tmp_path: Path) -> Path:
-    source = Path(__file__).parents[2] / "AM32.renode"
-    targets = source / "Inc" / "targets.h"
-    if not targets.exists():
-        pytest.skip("sibling AM32 checkout unavailable")
+    targets = DEFAULT_TARGETS
     firmware = tmp_path / "firmware-build"
     bootloaders = tmp_path / "bootloader-build"
     firmware.mkdir()
@@ -78,6 +77,7 @@ def make_repository(tmp_path: Path) -> Path:
     return root
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes are unavailable")
 def test_published_files_are_publicly_readable(tmp_path):
     root = make_repository(tmp_path)
     for path in root.rglob("*"):
@@ -204,10 +204,7 @@ def test_legacy_release_can_be_safely_augmented(tmp_path):
 
 
 def test_publish_requires_matching_hex(tmp_path):
-    source = Path(__file__).parents[2] / "AM32.renode"
-    targets = source / "Inc" / "targets.h"
-    if not targets.exists():
-        pytest.skip("sibling AM32 checkout unavailable")
+    targets = DEFAULT_TARGETS
     firmware = tmp_path / "firmware-build"
     firmware.mkdir()
     (firmware / "AM32_VIMDRONES_L431_2.21.elf").write_bytes(b"firmware-elf")

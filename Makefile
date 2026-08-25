@@ -16,6 +16,7 @@ PUBLISH_SITE_DIR ?= $(BUILD_DIR)/publish-site
 PUBLISH_CHANNEL ?= stable
 PUBLISH_JOBS ?= 8
 PUBLISH_RSYNC_FLAGS ?= -a --chmod=Du=rwx,Dgo=rx,Fu=rw,Fgo=r
+PARITY_OUTPUT ?= $(BUILD_DIR)/parity-all-mcus.json
 
 ifeq ($(OS),Windows_NT)
 NATIVE_NAME := am32sim.dll
@@ -28,7 +29,8 @@ endif
 NATIVE_LIBRARY := $(NATIVE_BUILD_DIR)/$(NATIVE_NAME)
 
 .DEFAULT_GOAL := all
-.PHONY: all native wheel test native-test python-test package install publish clean
+.PHONY: all native wheel test native-test python-test package install \
+	parity-all-mcus windows-usbip-test publish clean
 
 all: native wheel
 
@@ -52,6 +54,15 @@ python-test:
 
 package:
 	$(PYTHON) scripts/build-package.py --configuration $(CONFIGURATION)
+
+parity-all-mcus:
+	$(PYTHON) scripts/build-package.py --skip-pyinstaller \
+		--configuration $(CONFIGURATION)
+	$(PYTHON) scripts/run-parity-tests.py --all-mcus \
+		--output "$(PARITY_OUTPUT)"
+
+windows-usbip-test:
+	$(PYTHON) scripts/run-windows-usbip-test.py
 
 install: native
 	$(PYTHON) scripts/install-package.py --native "$(NATIVE_LIBRARY)" \

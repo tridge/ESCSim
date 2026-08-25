@@ -35,3 +35,40 @@ jobs:
           name: renode-parity-report
           path: parity-report.json
           if-no-files-found: warn
+
+  spin-windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          install: make mingw-w64-ucrt-x86_64-gcc
+          path-type: inherit
+      - run: python -m pip install -U pip
+      - run: python -m pip install -e '.[gui]'
+      - name: Build Windows native motor library
+        shell: msys2 {0}
+        run: python scripts/build-package.py --skip-pyinstaller
+      - name: Windows all-MCU ELF/HEX protocol report
+        continue-on-error: true
+        shell: msys2 {0}
+        env:
+          BASE_URL: ${{ inputs.base_url || 'https://firmware.ardupilot.org/Tools/AM32-tools/ESCSim/v1/' }}
+          ESCSIM_CACHE_DIR: ${{ runner.temp }}\escsim-cache
+        run: >-
+          python scripts/run-parity-tests.py
+          --base-url "$BASE_URL"
+          --all-mcus
+          --output windows-parity-report.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-renode-parity-report
+          path: windows-parity-report.json
+          if-no-files-found: warn

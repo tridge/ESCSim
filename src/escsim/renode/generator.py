@@ -62,6 +62,11 @@ def renode_path(path):
     return os.path.abspath(path).replace("\\", "/")
 
 
+def renode_execfile(path):
+    """A Renode Python expression for a host path without backslash escapes."""
+    return "execfile('%s')" % renode_path(path)
+
+
 # every macro the platform description needs. Read from the preprocessor
 # rather than assumed, including the PHASE_*_COMP fallbacks targets.h
 # applies at the bottom of the file.
@@ -2944,6 +2949,19 @@ def renode_env(library=None):
     return env
 
 
+def renode_command(explicit, monitor_port, setup):
+    """Build the Renode command with startup commands before the monitor.
+
+    The Windows .NET launcher begins serving ``--port`` as soon as it sees
+    that option and does not process later ``-e`` arguments until a monitor
+    client connects.  Keeping the startup command first is harmless on the
+    other hosts and lets a headless Windows session boot independently.
+    """
+
+    console = ["--port", str(monitor_port)] if monitor_port else ["--console"]
+    return [find_renode(explicit), "--disable-xwt", "-e", setup] + console
+
+
 def launch_gui(port, state_port, can_bus=-1):
     """Start the packaged ESCSim GUI against the link ports."""
     cmd = [
@@ -3385,9 +3403,8 @@ def main(argv=None):
         ):
             # the application's startup-tune delays; no application, no
             # symbol to hook
-            setup += (
-                '; cpu AddSymbolHook "delayMillis" "execfile(\'%s\')"'
-                % os.path.join(HERE, "scripts", "skip_delays.py")
+            setup += '; cpu AddSymbolHook "delayMillis" "%s"' % renode_execfile(
+                os.path.join(HERE, "scripts", "skip_delays.py")
             )
         elif not args.no_firmware:
             print("delayMillis symbol unavailable; startup delays are not skipped")
@@ -3481,7 +3498,7 @@ def main(argv=None):
     status_py = os.path.join(outdir, "%s_status.py" % args.target)
     try:
         write_status(status_py, symbol_elf, args.nm_bin)
-        setup += "; python \"execfile('%s')\"" % status_py
+        setup += '; python "%s"' % renode_execfile(status_py)
     except Unsupported as e:
         print("no status() helpers: %s" % e)
 
@@ -3573,8 +3590,7 @@ def main(argv=None):
 
     for c in args.commands:
         setup += "; %s" % c
-    console = ["--port", str(args.monitor_port)] if args.monitor_port else ["--console"]
-    cmd = [find_renode(args.renode), "--disable-xwt"] + console + ["-e", setup]
+    cmd = renode_command(args.renode, args.monitor_port, setup)
     call_args = {"env": renode_env()}
     if args.cpusel is not None:
         # Apply affinity in the forked child immediately before exec. The

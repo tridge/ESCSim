@@ -9,10 +9,11 @@ import pytest
 from escsim.renode import generator
 from escsim.settings import TargetSourceSpec
 from escsim.target.source import TargetSourceManager
+from conftest import DEFAULT_TARGETS
 
 
 def configure_real_header(tmp_path, monkeypatch):
-    header = Path(__file__).parents[2] / "AM32.renode" / "Inc" / "targets.h"
+    header = DEFAULT_TARGETS
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config-root"))
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache-root"))
     manager = TargetSourceManager()
@@ -38,7 +39,7 @@ def test_generate_uses_packaged_resources(tmp_path, monkeypatch):
     assert "$resources/scripts/am32_l431.resc" in resc_text
     assert "$repo" not in resc_text
     assert "stm32l431_base.repl" in repl_text
-    assert str(Path(generator.HERE).resolve()) in repl_text
+    assert generator.renode_path(generator.HERE) in repl_text
 
 
 def test_a153_generation_uses_packaged_rom_without_compiler(tmp_path, monkeypatch):
@@ -67,6 +68,24 @@ def test_native_library_does_not_trust_working_directory(tmp_path, monkeypatch):
     monkeypatch.delenv("ESCSIM_AM32SIM_LIBRARY", raising=False)
     selected = generator.native_library_path()
     assert selected is None or Path(selected) != attacker_library
+
+
+def test_renode_setup_precedes_monitor_listener():
+    command = generator.renode_command("renode.exe", 57735, "include @target.resc")
+    assert command == [
+        "renode.exe",
+        "--disable-xwt",
+        "-e",
+        "include @target.resc",
+        "--port",
+        "57735",
+    ]
+
+
+def test_renode_execfile_uses_unescaped_path():
+    expression = generator.renode_execfile(r"C:\Users\test user\ESCSim\work\status.py")
+    assert "\\" not in expression
+    assert "C:/Users/test user/ESCSim/work/status.py" in expression
 
 
 def ihex_record(address, record_type, payload):

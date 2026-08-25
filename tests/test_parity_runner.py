@@ -71,6 +71,7 @@ def test_parity_sweep_records_all_results_before_failing(tmp_path, monkeypatch):
     ]
     report = json.loads(output.read_text())
     assert len(report["results"]) == 8
+    assert report["summary"] == {"passed": 7, "failed": 1, "total": 8}
     assert report["results"][0] == {
         "target": "FIRST",
         "protocol": "pwm",
@@ -89,3 +90,19 @@ def test_parity_runner_finds_makefile_native_output(tmp_path, monkeypatch):
     library.parent.mkdir(parents=True)
     library.write_bytes(b"native")
     assert runner.built_native_library() == library
+
+
+def test_all_mcus_selects_one_non_can_target_per_family():
+    runner = load_runner()
+    manifest = {
+        "targets": [
+            {"name": "FAMILY_B_CAN", "family": "b", "dronecan": True},
+            {"name": "FAMILY_B", "family": "b", "dronecan": False},
+            {"name": "FAMILY_A_FIRST", "family": "A", "dronecan": False},
+            {"name": "FAMILY_A_SECOND", "family": "a", "dronecan": False},
+        ]
+    }
+    assert runner.representative_targets(manifest) == [
+        "FAMILY_A_FIRST",
+        "FAMILY_B",
+    ]

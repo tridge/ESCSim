@@ -10,6 +10,8 @@ from escsim.settings import (
     Settings,
     SettingsStore,
     TargetSourceSpec,
+    default_cache_dir,
+    default_config_dir,
 )
 
 
@@ -18,6 +20,16 @@ def test_defaults_without_file(tmp_path):
     settings = store.load()
     assert settings.targets_source == TargetSourceSpec("url", DEFAULT_TARGETS_URL)
     assert settings.artifact_base_url == DEFAULT_ARTIFACT_BASE_URL
+
+
+def test_environment_overrides_shared_cache_and_config_paths(tmp_path, monkeypatch):
+    cache = tmp_path / "cache"
+    config = tmp_path / "config"
+    monkeypatch.setenv("ESCSIM_CACHE_DIR", str(cache))
+    monkeypatch.setenv("ESCSIM_CONFIG_DIR", str(config))
+    assert default_cache_dir() == cache
+    assert default_config_dir() == config
+    assert SettingsStore().path == config / "settings.json"
 
 
 def test_round_trip_is_versioned_and_atomic(tmp_path):
