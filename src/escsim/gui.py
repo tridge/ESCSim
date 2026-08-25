@@ -285,6 +285,28 @@ class Lab(object):
             finally:
                 s.close()
 
+    def emulator_ports_bound(self):
+        """Return true once Renode owns both GUI UDP ports."""
+        return all(
+            not self.wait_port_free(port, timeout=0)
+            for port in (self.args.gui_port, self.args.state_port)
+        )
+
+    def packaged_ports_ready(self):
+        """Fallback readiness signal for a windowed packaged launcher.
+
+        The ordinary source-tree launcher learns readiness from Renode's
+        ``input port on udp`` log line.  A PyInstaller windowed child has no
+        console, however, so Renode's inherited console output does not reach
+        the parent pipe.  Restrict the port signal to that exact condition so
+        source-tree launches retain the established log-based ordering.
+        """
+        return bool(
+            getattr(sys, "frozen", False)
+            and sys.stdout is None
+            and self.emulator_ports_bound()
+        )
+
     def start(self):
         if self.runner.running():
             return "already running"
@@ -373,7 +395,10 @@ class Lab(object):
                 self.runner.stop()
                 return
         while time.time() < deadline and self.runner.running():
-            if self.emulator_ready or self.start_failed:
+            if self.emulator_ready or self.packaged_ports_ready():
+                self.emulator_ready = True
+                break
+            if self.start_failed:
                 break
             time.sleep(0.3)
         if not self.emulator_ready:
