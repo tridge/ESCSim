@@ -201,6 +201,10 @@ class Lab(object):
         self.stub = None
         self.usb_attached = False
         self.usb_port = None
+        self.usb_ports = set()
+        self.lifecycle_lock = threading.RLock()
+        self.usb_cleanup_lock = threading.Lock()
+        self.usb_starting = set()
         self.target = None
         self.info = None  # {'family','pin','dronecan'}
         self.bootloader = "auto"  # auto | none | path
@@ -311,6 +315,14 @@ class Lab(object):
     def start(self):
         if self.runner.running():
             return "already running"
+        with self.lifecycle_lock:
+            if self.usb_starting:
+                return "previous USB startup is still being cancelled"
+        # A failed detach remains owned so a later Start can retry it instead
+        # of silently adding another virtual USB device.
+        cleanup_error = self._stop_stub()
+        if cleanup_error is not None:
+            return "previous USB cleanup failed: %s" % cleanup_error
         if self.target is None or self.info is None:
             return "pick a target first"
         for port in (self.args.gui_port, self.args.state_port):
@@ -364,10 +376,19 @@ class Lab(object):
         self.status = "starting emulator..."
         self.log("$ " + " ".join(cmd))
         self.runner.start(cmd, env=generator_environment())
-        threading.Thread(target=self._wait_ready, args=(bl,), daemon=True).start()
+        with self.lifecycle_lock:
+            self.generation += 1
+            generation = self.generation
+        threading.Thread(
+            target=self._wait_ready, args=(generation, bl), daemon=True
+        ).start()
         return None
 
-    def _wait_ready(self, bl):
+    def _generation_current(self, generation):
+        with self.lifecycle_lock:
+            return generation == self.generation
+
+    def _wait_ready(self, generation, bl):
         """watch for the emulator's input port, then bring up the
         configurator side"""
         deadline = time.time() + 120
@@ -377,7 +398,11 @@ class Lab(object):
         # wait at the last ordinary log line.
         monitor = renode_monitor.MonitorClient("127.0.0.1", self.args.monitor_port)
         text = None
-        while time.time() < deadline and self.runner.running():
+        while (
+            time.time() < deadline
+            and self.runner.running()
+            and self._generation_current(generation)
+        ):
             try:
                 text = monitor.connect(timeout=max(1, deadline - time.time()))
                 break
@@ -386,6 +411,9 @@ class Lab(object):
                 time.sleep(0.2)
             except TimeoutError:
                 break
+        if not self._generation_current(generation):
+            monitor.close()
+            return
         if text is not None:
             error = renode_monitor.startup_error(text)
             if error is not None:
@@ -393,9 +421,14 @@ class Lab(object):
                 self.status = "emulator setup failed: " + error
                 self.start_failed = True
                 self.log("[monitor] " + error)
-                self.runner.stop()
+                if self._generation_current(generation):
+                    self.runner.stop()
                 return
-        while time.time() < deadline and self.runner.running():
+        while (
+            time.time() < deadline
+            and self.runner.running()
+            and self._generation_current(generation)
+        ):
             if self.emulator_ready or self.packaged_ports_ready():
                 self.emulator_ready = True
                 break
@@ -404,29 +437,33 @@ class Lab(object):
             time.sleep(0.3)
         if not self.emulator_ready:
             monitor.close()
+            if not self._generation_current(generation):
+                return
             # a half-started emulator (a failed port bind still leaves
             # the machine running) must not linger and block the retry
             self.runner.stop()
             if not self.status.startswith("emulator exited"):
                 self.status = "emulator did not come up"
             return
-        self.generation += 1
         threading.Thread(
             target=self._metrics_loop,
-            args=(self.generation, monitor),
+            args=(generation, monitor),
             daemon=True,
         ).start()
         if bl is not None:
             self._enter_bootloader()
+        if not self._generation_current(generation):
+            return
         if self.conf == "off":
             self.status = "running (no configurator port)"
             return
         try:
-            self._start_stub()
+            self._start_stub(generation)
         except Exception as ex:
-            self._stop_stub()
-            self.status = "configurator port failed: %s" % ex
-            self.log(self.status)
+            if self._generation_current(generation):
+                self._stop_stub()
+                self.status = "configurator port failed: %s" % ex
+                self.log(self.status)
 
     def _enter_bootloader(self):
         """hold the signal wire high and reset, so the ESC is parked in
@@ -527,79 +564,147 @@ class Lab(object):
         parts.append("vt %.1fs" % m["virtual_seconds"])
         return " | ".join(parts)
 
-    def _start_stub(self):
+    def _start_stub(self, generation):
+        if self.conf == "usb":
+            with self.lifecycle_lock:
+                self.usb_starting.add(generation)
         endpoint = None
-        if self.conf == "usb":
-            # in direct mode the USB ids make the web configurator
-            # treat the port as a single-wire adapter, not an FC
-            ids = (
-                {
-                    "vid": msp_stub_fc.DIRECT_VENDOR_ID,
-                    "pid": msp_stub_fc.DIRECT_PRODUCT_ID,
-                }
-                if self.protocol == "direct"
-                else {}
-            )
-            endpoint = sitl_usbip.UsbipServer(
-                unix_path=(
-                    None
-                    if os.name == "nt"
-                    else "@am32-renode-usbip.%u.%u" % (os.getuid(), os.getpid())
-                ),
-                serial="RENODE",
-                **ids,
-            )
-        if self.protocol == "direct":
-            self.stub = msp_stub_fc.DirectBridge(
-                sitl_port=self.args.gui_port, endpoint=endpoint, verbose=False
-            )
-        else:
-            self.stub = msp_stub_fc.MspStubFC(
-                sitl_port=self.args.gui_port,
-                state_port=self.args.state_port,
-                motor=False,
-                endpoint=endpoint,
-                verbose=False,
-            )
-        if self.conf == "usb":
-            attached = sitl_usbip.attach(
-                unix_path=endpoint.unix_path, host=endpoint.host, port=endpoint.port
-            )
-            if not attached:
-                raise RuntimeError("USB/IP virtual-host-controller attach was refused")
+        stub = None
+        attached = False
+        usb_port = None
+        published = False
+        try:
+            if self.conf == "usb":
+                # in direct mode the USB ids make the web configurator
+                # treat the port as a single-wire adapter, not an FC
+                ids = (
+                    {
+                        "vid": msp_stub_fc.DIRECT_VENDOR_ID,
+                        "pid": msp_stub_fc.DIRECT_PRODUCT_ID,
+                    }
+                    if self.protocol == "direct"
+                    else {}
+                )
+                endpoint = sitl_usbip.UsbipServer(
+                    unix_path=(
+                        None
+                        if os.name == "nt"
+                        else "@am32-renode-usbip.%u.%u" % (os.getuid(), os.getpid())
+                    ),
+                    serial="RENODE",
+                    **ids,
+                )
+            if self.protocol == "direct":
+                stub = msp_stub_fc.DirectBridge(
+                    sitl_port=self.args.gui_port, endpoint=endpoint, verbose=False
+                )
+            else:
+                stub = msp_stub_fc.MspStubFC(
+                    sitl_port=self.args.gui_port,
+                    state_port=self.args.state_port,
+                    motor=False,
+                    endpoint=endpoint,
+                    verbose=False,
+                )
+            if self.conf == "usb":
+                attached = sitl_usbip.attach(
+                    unix_path=endpoint.unix_path,
+                    host=endpoint.host,
+                    port=endpoint.port,
+                )
+                if attached is None or attached is False:
+                    raise RuntimeError(
+                        "USB/IP virtual-host-controller attach was refused"
+                    )
+                usb_port = attached
+                self._remember_usb(usb_port)
+                tty = sitl_usbip.find_tty(
+                    "RENODE", timeout=10, vid=endpoint.vid, pid=endpoint.pid
+                )
+                if tty is None:
+                    raise RuntimeError("attached but no tty appeared")
+                conf_port = tty
+            else:
+                conf_port = stub.slave_path
+            with self.lifecycle_lock:
+                if generation != self.generation or not self.runner.running():
+                    return
+                self.stub = stub
+                self.conf_port = conf_port
+                self.status = "running - configurator port: %s" % self.conf_port
+                published = True
+            self.log(self.status)
+        finally:
+            try:
+                if not published:
+                    if attached:
+                        error = self._detach_owned_usb(usb_port)
+                        if error is not None:
+                            self.log(
+                                "USB/IP detach failed after cancelled start: %s" % error
+                            )
+                    if stub is not None:
+                        stub.close()
+                    elif endpoint is not None:
+                        endpoint.close()
+            finally:
+                if self.conf == "usb":
+                    with self.lifecycle_lock:
+                        self.usb_starting.discard(generation)
+
+    def _remember_usb(self, port):
+        with self.lifecycle_lock:
+            self.usb_ports.add(port)
             self.usb_attached = True
-            self.usb_port = None if attached is True else attached
-            tty = sitl_usbip.find_tty(
-                "RENODE", timeout=10, vid=endpoint.vid, pid=endpoint.pid
-            )
-            if tty is None:
-                raise RuntimeError("attached but no tty appeared")
-            self.conf_port = tty
-        else:
-            self.conf_port = self.stub.slave_path
-        self.status = "running - configurator port: %s" % self.conf_port
-        self.log(self.status)
+            self.usb_port = port
+
+    def _forget_usb(self, port):
+        with self.lifecycle_lock:
+            self.usb_ports.discard(port)
+            self.usb_attached = bool(self.usb_ports)
+            self.usb_port = next(iter(self.usb_ports), None)
+
+    def _detach_owned_usb(self, port):
+        with self.usb_cleanup_lock:
+            with self.lifecycle_lock:
+                if port not in self.usb_ports:
+                    return None
+            try:
+                if not sitl_usbip.detach(port):
+                    raise RuntimeError("detach was refused")
+            except Exception as error:
+                return error
+            self._forget_usb(port)
+            return None
 
     def _stop_stub(self):
-        if self.usb_attached:
-            try:
-                sitl_usbip.detach(self.usb_port)
-            except Exception as error:
-                self.log("USB/IP detach failed: %s" % error)
-            self.usb_attached = False
-            self.usb_port = None
-        if self.stub is not None:
-            self.stub.close()
+        with self.lifecycle_lock:
+            stub = self.stub
             self.stub = None
+            usb_ports = list(self.usb_ports)
+        cleanup_error = None
+        for usb_port in usb_ports:
+            error = self._detach_owned_usb(usb_port)
+            if error is not None:
+                self.log("USB/IP detach failed: %s" % error)
+                cleanup_error = error
+        if stub is not None:
+            stub.close()
+        return cleanup_error
 
     def stop(self):
-        self.generation += 1
+        with self.lifecycle_lock:
+            self.generation += 1
         self.metrics = None
-        self._stop_stub()
+        cleanup_error = self._stop_stub()
         self.runner.stop()
         self.emulator_ready = False
         self.conf_port = ""
-        self.status = "stopped"
+        self.status = (
+            "stopped; USB cleanup failed: %s" % cleanup_error
+            if cleanup_error is not None
+            else "stopped"
+        )
 
     def saw_log_line(self, line):
         if "input port on udp" in line:
@@ -610,6 +715,16 @@ class Lab(object):
             self.status = "emulator exited: " + line.strip()
             self.start_failed = True
         if line.startswith("[emulator exited"):
+            # Renode may exit without a Stop click. Detach immediately rather
+            # than leaving the virtual serial device present until app exit.
+            if not self.runner.running():
+                with self.lifecycle_lock:
+                    self.generation += 1
+                cleanup_error = self._stop_stub()
+                if cleanup_error is not None:
+                    self.status = (
+                        "emulator exited; USB cleanup failed: %s" % cleanup_error
+                    )
             self.emulator_ready = False
             if self.status.startswith("running"):
                 self.status = line[1:-1]
@@ -781,6 +896,13 @@ def main(argv=None):
         t = target_combo.currentText()
         if not t:
             return
+        if t != lab.target and (
+            lab.runner.running() or lab.stub is not None or lab.usb_attached
+        ):
+            # A target selection replaces the emulated ESC. Tear down its
+            # configurator endpoint immediately, before resolving the new
+            # target, so the host never sees both USB devices at once.
+            do_stop()
         info_label.setText("resolving %s..." % t)
 
         def resolve():

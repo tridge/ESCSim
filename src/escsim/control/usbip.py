@@ -45,6 +45,7 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 USBIP_VERSION = 0x0111
 
@@ -875,25 +876,65 @@ def attach(unix_path=None, host="127.0.0.1", port=3240, busid=BUSID):
             "--attach-to",
             unix_path if unix_path is not None else "%s:%u" % (host, port),
         ]
-        return subprocess.run(cmd, check=False).returncode == 0
+        result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+        if result.returncode != 0:
+            diagnostic = "\n".join((result.stdout, result.stderr)).strip()
+            raise RuntimeError(
+                "privileged USB/IP attach failed: %s"
+                % (diagnostic or "no diagnostic output")
+            )
+        match = re.fullmatch(r"\s*(\d+)\s*", result.stdout)
+        if match is None:
+            raise RuntimeError(
+                "privileged USB/IP attach did not report its VHCI port: %s"
+                % (result.stdout.strip() or "no output")
+            )
+        return int(match.group(1))
     sock, devid, speed = import_device(unix_path, host, port, busid)
     try:
-        attach_socket(sock, devid, speed)
+        vhci_port = attach_socket(sock, devid, speed)
     except OSError:
         sock.close()
         raise
-    # True, not the port number: vhci port 0 is a perfectly good
-    # attachment, and callers test the return for truth
-    return True
+    # Return the exact port, including valid port zero, so the caller can
+    # detach synchronously instead of waiting for a closed exporter socket to
+    # disappear from vhci_hcd eventually.
+    return vhci_port
+
+
+def _usb_identity(local_busid):
+    device = Path("/sys/bus/usb/devices", local_busid)
+
+    def attribute(name):
+        try:
+            return Path(device, name).read_text().strip()
+        except OSError:
+            return ""
+
+    return attribute("manufacturer"), attribute("product")
+
+
+def _our_vhci_ports():
+    """VHCI ports whose enumerated USB identity belongs to ESCSim."""
+    ports = []
+    for line in open(os.path.join(VHCI, "status")).read().splitlines()[1:]:
+        fields = line.split()
+        if len(fields) < 7 or fields[2] == VDEV_ST_NULL:
+            continue
+        if _usb_identity(fields[6]) == (MANUFACTURER, PRODUCT):
+            ports.append(int(fields[1]))
+    return ports
 
 
 def detach(port=None):
-    """detach one vhci port, or every port carrying OUR busid.
+    """detach one owned vhci port, or every enumerated ESCSim device.
 
     The vhci is shared machine-wide: an ArduPilot Renode CubeOrange (or
     anything else) may be attached alongside, so a blanket detach-all
-    would unplug someone else's device. Only ports whose local_busid is
-    ours are swept; an explicit port number is trusted as given.
+    would unplug someone else's device. The status table's ``local_busid``
+    is assigned by the host (for example ``7-2``), not our exported ``1-1``
+    bus ID, so fallback cleanup identifies devices by the AM32 USB strings.
+    An explicit port number is trusted as given.
     """
     if IS_WINDOWS:
         return _windows_detach(port)
@@ -910,10 +951,7 @@ def detach(port=None):
     if port is not None:
         ports = [port]
     else:
-        for line in open(os.path.join(VHCI, "status")).read().splitlines()[1:]:
-            f = line.split()
-            if len(f) >= 7 and f[2] != VDEV_ST_NULL and f[6] == BUSID:
-                ports.append(int(f[1]))
+        ports = _our_vhci_ports()
     for p in ports:
         with open(os.path.join(VHCI, "detach"), "w") as f:
             f.write("%u" % p)
@@ -960,7 +998,7 @@ def main():
         const=-1,
         default=None,
         help="detach one vhci port, or every port carrying "
-        "this tool's busid (other USB/IP devices on the "
+        "this tool's USB identity (other USB/IP devices on the "
         "machine are left alone)",
     )
     ap.add_argument(
@@ -989,11 +1027,16 @@ def main():
         spec = args.attach_to
         if ":" in spec and not spec.startswith("@") and "/" not in spec:
             host, _, port = spec.rpartition(":")
-            ok = attach(host=host, port=int(port))
+            attached_port = attach(host=host, port=int(port))
         else:
-            ok = attach(unix_path=spec)
-        print("attached" if ok else "attach failed", file=sys.stderr)
-        return 0 if ok else 1
+            attached_port = attach(unix_path=spec)
+        if attached_port is None or attached_port is False:
+            print("attach failed", file=sys.stderr)
+            return 1
+        # Machine-readable stdout is consumed by the unprivileged parent.
+        print(attached_port, flush=True)
+        print("attached on VHCI port %u" % attached_port, file=sys.stderr)
+        return 0
 
     server = UsbipServer(
         unix_path=args.socket,
@@ -1004,7 +1047,10 @@ def main():
     )
     print("exporting %s on %s" % (BUSID, server.endpoint), file=sys.stderr, flush=True)
     if args.attach:
-        if not attach(unix_path=server.unix_path, host=args.host, port=server.port):
+        attached_port = attach(
+            unix_path=server.unix_path, host=args.host, port=server.port
+        )
+        if attached_port is None or attached_port is False:
             print("attach failed", file=sys.stderr)
             server.close()
             return 1

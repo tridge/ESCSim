@@ -647,7 +647,7 @@ def main():
             attached_port = sitl_usbip.attach(
                 unix_path=endpoint.unix_path, host=endpoint.host, port=endpoint.port
             )
-            if not attached_port:
+            if attached_port is None or attached_port is False:
                 print("attach failed", file=sys.stderr)
                 stub.close()
                 return 1

@@ -2516,9 +2516,9 @@ def create_ui(args=None, app=None, container=None):
         )
         usb["stub"] = stub
         vhci_port = sitl_usbip.attach(unix_path=stub.ep.unix_path)
-        if not vhci_port:
+        if vhci_port is None or vhci_port is False:
             raise RuntimeError("attach refused (is vhci_hcd loaded?)")
-        usb["port"] = None if vhci_port is True else vhci_port
+        usb["port"] = vhci_port
         tty = sitl_usbip.find_tty(usb_serial, timeout=10)
         if tty is None:
             raise RuntimeError("attached but no tty appeared")
