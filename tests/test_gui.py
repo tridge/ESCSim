@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import signal
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -101,3 +102,44 @@ def test_control_gui_embeds_and_cleans_up(tmp_path, monkeypatch):
     cleanup()
     container._sitl_gui_abort_cleanup()
     container.close()
+
+
+def test_control_gui_eeprom_poll_does_not_block_qt(tmp_path, monkeypatch):
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    pytest.importorskip("PySide6")
+    from PySide6.QtWidgets import QApplication, QWidget
+
+    from escsim.control import backend, ui
+
+    def slow_fetch(_self):
+        time.sleep(0.6)
+        return None, None
+
+    monkeypatch.setattr(backend.EepromClient, "fetch", slow_fetch)
+    app = QApplication.instance() or QApplication([])
+    container = QWidget()
+    args = SimpleNamespace(
+        host="127.0.0.1",
+        port=39933,
+        state_port=39934,
+        can_uri="mcast:8",
+        backend="renode",
+        renode_can=False,
+        poles=14,
+        control_port=0,
+        log=None,
+        replay=None,
+    )
+    cleanup = ui.create_ui(args, app=app, container=container)
+    try:
+        # Let the 100 ms update timer become due, then measure one event-loop
+        # dispatch. Before the fix it ran slow_fetch() synchronously here.
+        time.sleep(0.12)
+        started = time.monotonic()
+        app.processEvents()
+        assert time.monotonic() - started < 0.3
+        assert container._sitl_gui_runtime["param_state"]["fetching"]
+    finally:
+        cleanup()
+        container.close()

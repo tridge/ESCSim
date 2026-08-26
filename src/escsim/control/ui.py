@@ -2238,6 +2238,8 @@ def create_ui(args=None, app=None, container=None):
         "mismatch": None,
         "next_check": 0.0,
         "input_hint": None,
+        "fetching": False,
+        "fetch_q": queue.Queue(),
     }
 
     def open_params():
@@ -2260,6 +2262,67 @@ def create_ui(args=None, app=None, container=None):
         d = param_state.get("dialog")
         if d is not None and d.isVisible():
             QTimer.singleShot(400, d.refresh)
+
+    def start_param_fetch():
+        """Fetch EEPROM without blocking Qt's event loop.
+
+        A missing or rebooting simulator makes EepromClient retry for up to
+        1.5 seconds.  This periodic status poll used to run directly from the
+        100 ms UI timer, freezing every widget and native file dialog while it
+        waited for UDP replies.
+        """
+        if param_state["fetching"]:
+            return
+        param_state["fetching"] = True
+
+        def worker():
+            try:
+                result = eeprom_client.fetch()
+            except Exception:
+                result = (None, None)
+            param_state["fetch_q"].put(result)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def apply_param_status(image, model):
+        if image is None:
+            return
+        from . import params as sitl_params
+
+        bad = sitl_params.mismatches(image, model)
+        if bad != param_state["mismatch"]:
+            param_state["mismatch"] = bad
+            if bad:
+                param_btn.setStyleSheet("background-color: #ffd6d6; font-weight: bold")
+                param_btn.setText("Parameters (%s)..." % ", ".join(bad))
+            else:
+                param_btn.setStyleSheet("")
+                param_btn.setText("Parameters...")
+        # the freshly seeded eeprom default is 5 (dronecan only),
+        # which disables the PWM/DShot input at boot: an enabled
+        # DShot stream then gets zero replies, never arms, and
+        # with no CAN commander the ESC reboot-loops on its
+        # signal timeout. Say so instead of leaving replies=0/s
+        # as the only clue
+        if len(image) > 46 and image[46] == 5 and ds.enabled:
+            param_state["input_hint"] = (
+                "eeprom INPUT_SIGNAL_TYPE=5 (dronecan): the "
+                "PWM/DShot input is disabled at boot - set 1 "
+                "(dshot) or 2 (servo) in Parameters"
+            )
+        else:
+            param_state["input_hint"] = None
+        # the INPUT_SIGNAL_TYPE editor tracks the stored byte so
+        # it shows what the ESC actually has, not a stale entry
+        # (it used to sit at its initial value forever); leave it
+        # alone while the user is editing
+        if (
+            can is not None
+            and len(image) > 46
+            and not ptype_var.hasFocus()
+            and ptype_var.value() != image[46]
+        ):
+            ptype_var.setValue(image[46])
 
     # ---- telemetry panel
     f3 = QGroupBox("telemetry (as the firmware reports it)")
@@ -2925,48 +2988,16 @@ def create_ui(args=None, app=None, container=None):
         # with the simulated motor: silent mismatches (a stale MOTOR_KV
         # especially) look like physics faults, not configuration
         now = time.time()
+        try:
+            image, model = param_state["fetch_q"].get_nowait()
+        except queue.Empty:
+            pass
+        else:
+            param_state["fetching"] = False
+            apply_param_status(image, model)
         if now >= param_state["next_check"]:
             param_state["next_check"] = now + 3.0
-            image, model = eeprom_client.fetch()
-            if image is not None:
-                from . import params as sitl_params
-
-                bad = sitl_params.mismatches(image, model)
-                if bad != param_state["mismatch"]:
-                    param_state["mismatch"] = bad
-                    if bad:
-                        param_btn.setStyleSheet(
-                            "background-color: #ffd6d6; font-weight: bold"
-                        )
-                        param_btn.setText("Parameters (%s)..." % ", ".join(bad))
-                    else:
-                        param_btn.setStyleSheet("")
-                        param_btn.setText("Parameters...")
-                # the freshly seeded eeprom default is 5 (dronecan only),
-                # which disables the PWM/DShot input at boot: an enabled
-                # DShot stream then gets zero replies, never arms, and
-                # with no CAN commander the ESC reboot-loops on its
-                # signal timeout. Say so instead of leaving replies=0/s
-                # as the only clue
-                if len(image) > 46 and image[46] == 5 and ds.enabled:
-                    param_state["input_hint"] = (
-                        "eeprom INPUT_SIGNAL_TYPE=5 (dronecan): the "
-                        "PWM/DShot input is disabled at boot - set 1 "
-                        "(dshot) or 2 (servo) in Parameters"
-                    )
-                else:
-                    param_state["input_hint"] = None
-                # the INPUT_SIGNAL_TYPE editor tracks the stored byte so
-                # it shows what the ESC actually has, not a stale entry
-                # (it used to sit at its initial value forever); leave it
-                # alone while the user is editing
-                if (
-                    can is not None
-                    and len(image) > 46
-                    and not ptype_var.hasFocus()
-                    and ptype_var.value() != image[46]
-                ):
-                    ptype_var.setValue(image[46])
+            start_param_fetch()
 
     def update():
         update_sim_status()
