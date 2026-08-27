@@ -360,6 +360,26 @@ class UsbipServer(object):
 
     def close(self):
         self.running = False
+        # close() from another thread does not reliably wake a blocking
+        # accept() on Linux. Connect once to make accept return, then join the
+        # server thread so an abstract Unix address is reusable when Stop
+        # returns and the user immediately starts another ESC.
+        wake = None
+        try:
+            if self.unix_path is not None:
+                wake = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                wake.settimeout(0.2)
+                wake.connect(socket_address(self.unix_path))
+            else:
+                wake = socket.create_connection((self.host, self.port), timeout=0.2)
+        except OSError:
+            pass
+        finally:
+            if wake is not None:
+                try:
+                    wake.close()
+                except OSError:
+                    pass
         try:
             self.sock.close()
         except OSError:
@@ -372,9 +392,15 @@ class UsbipServer(object):
         with self.send_lock:
             if self.conn is not None:
                 try:
+                    self.conn.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                try:
                     self.conn.close()
                 except OSError:
                     pass
+        if threading.current_thread() is not self.thread:
+            self.thread.join(2)
 
     # -- USB/IP --------------------------------------------------------
 
@@ -383,6 +409,9 @@ class UsbipServer(object):
             try:
                 conn, addr = self.sock.accept()
             except OSError:
+                return
+            if not self.running:
+                conn.close()
                 return
             self.log("connection from %s" % (addr or self.endpoint,))
             self.conn = conn

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+import os
+
+import pytest
 
 from escsim.control import usbip
 
@@ -11,6 +14,17 @@ class FakeSocket:
 
     def close(self):
         self.closed = True
+
+
+@pytest.mark.skipif(os.name == "nt", reason="abstract Unix socket test")
+def test_server_close_releases_abstract_address_before_returning():
+    address = "@escsim-usbip-close-%u" % os.getpid()
+    server = usbip.UsbipServer(unix_path=address, serial="RESTART-TEST")
+    server.close()
+
+    assert not server.thread.is_alive()
+    replacement = usbip.UsbipServer(unix_path=address, serial="RESTART-TEST")
+    replacement.close()
 
 
 def test_linux_attach_returns_exact_vhci_port_zero(monkeypatch):

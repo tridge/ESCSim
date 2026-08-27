@@ -24,6 +24,16 @@ def test_windows_server_uses_automatic_loopback_port(monkeypatch):
         server.close()
 
 
+def test_server_close_releases_listener_before_returning():
+    server = usbip.UsbipServer(port=0, serial="RESTART-TEST")
+    port = server.port
+    server.close()
+
+    assert not server.thread.is_alive()
+    replacement = usbip.UsbipServer(port=port, serial="RESTART-TEST")
+    replacement.close()
+
+
 def test_windows_attach_returns_owned_port(monkeypatch):
     calls = []
     monkeypatch.setattr(
