@@ -60,6 +60,33 @@ def test_privileged_linux_attach_reports_exact_port_zero(monkeypatch):
     assert commands[0][-2:] == ["--busid", "1-0"]
 
 
+def test_udev_rule_names_the_selected_serial_group():
+    assert usbip.serial_group() in ("dialout", "uucp")
+    rule = usbip.udev_rule("uucp")
+    assert "chgrp uucp /sys%p/attach /sys%p/detach" in rule
+    assert "KERNEL==\"vhci_hcd.0\"" in rule
+    assert "%%" not in rule
+
+
+def test_ensure_vhci_loads_missing_module(tmp_path, monkeypatch):
+    commands = []
+    monkeypatch.setattr(usbip, "VHCI", str(tmp_path / "vhci_hcd.0"))
+    monkeypatch.setattr(
+        usbip.subprocess,
+        "run",
+        lambda cmd, **kwargs: commands.append(cmd)
+        or SimpleNamespace(returncode=0),
+    )
+
+    usbip._ensure_vhci()
+    assert commands == [["modprobe", "vhci_hcd"]]
+
+    commands.clear()
+    (tmp_path / "vhci_hcd.0").mkdir()
+    usbip._ensure_vhci()
+    assert commands == []
+
+
 def test_fallback_cleanup_uses_local_usb_identity(tmp_path, monkeypatch):
     vhci = tmp_path / "vhci"
     vhci.mkdir()

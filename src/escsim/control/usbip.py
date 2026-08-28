@@ -722,20 +722,44 @@ def import_device(unix_path=None, host="127.0.0.1", port=3240, busid=BUSID):
     return sock, (busnum << 16) | devnum, speed
 
 
-UDEV_RULE = (
-    "# let members of dialout attach/detach USB/IP devices without root\n"
-    'ACTION=="add", SUBSYSTEM=="platform", KERNEL=="vhci_hcd.0", '
-    "RUN+=\"/bin/sh -c 'chgrp dialout /sys%p/attach /sys%p/detach; "
-    "chmod g+w /sys%p/attach /sys%p/detach'\"\n"
-)
+def serial_group():
+    """the group owning serial devices: dialout on Debian-style systems,
+    uucp on Arch; pick the first one which exists on this host"""
+    import grp
+
+    for name in ("dialout", "uucp"):
+        try:
+            grp.getgrnam(name)
+            return name
+        except KeyError:
+            continue
+    return "dialout"
+
+
+def udev_rule(group):
+    return (
+        "# let members of %s attach/detach USB/IP devices without root\n"
+        'ACTION=="add", SUBSYSTEM=="platform", KERNEL=="vhci_hcd.0", '
+        "RUN+=\"/bin/sh -c 'chgrp %s /sys%%p/attach /sys%%p/detach; "
+        "chmod g+w /sys%%p/attach /sys%%p/detach'\"\n" % (group, group)
+    )
+
+
 UDEV_RULE_PATH = "/etc/udev/rules.d/99-vhci-user.rules"
 MODULES_LOAD_PATH = "/etc/modules-load.d/vhci-hcd.conf"
+
+
+def _ensure_vhci():
+    """a fresh boot without --install-rules has vhci_hcd unloaded; the
+    privileged half can load it before touching the sysfs files"""
+    if not os.path.exists(VHCI):
+        subprocess.run(["modprobe", "vhci_hcd"], check=False)
 
 
 def install_rules():
     """one-time root setup after which no attach ever needs root:
     load vhci_hcd at boot and make its attach/detach files writable by
-    the dialout group (the same group the resulting tty needs anyway)"""
+    the serial group (the same group the resulting tty needs anyway)"""
     if os.geteuid() != 0:
         cmd = privilege_prefix() + [
             sys.executable,
@@ -743,8 +767,9 @@ def install_rules():
             "--install-rules",
         ]
         return subprocess.run(cmd, check=False).returncode == 0
+    group = serial_group()
     with open(UDEV_RULE_PATH, "w") as f:
-        f.write(UDEV_RULE)
+        f.write(udev_rule(group))
     with open(MODULES_LOAD_PATH, "w") as f:
         f.write("vhci_hcd\n")
     subprocess.run(["modprobe", "vhci_hcd"], check=False)
@@ -752,7 +777,7 @@ def install_rules():
     for name in ("attach", "detach"):
         path = os.path.join(VHCI, name)
         if os.path.exists(path):
-            subprocess.run(["chgrp", "dialout", path], check=False)
+            subprocess.run(["chgrp", group, path], check=False)
             subprocess.run(["chmod", "g+w", path], check=False)
     subprocess.run(["udevadm", "control", "--reload"], check=False)
     print(
@@ -1132,7 +1157,7 @@ def main():
         "--install-rules",
         action="store_true",
         help="one-time root setup: load vhci_hcd at boot and "
-        "make its attach/detach group-writable (dialout), "
+        "make its attach/detach group-writable (dialout/uucp), "
         "so no later attach or detach needs root",
     )
     ap.add_argument("--verbose", action="store_true")
@@ -1151,6 +1176,7 @@ def main():
     if args.attach_to is not None:
         # the privileged half of attach(): import and hand the socket to
         # the kernel, which keeps it after we exit
+        _ensure_vhci()
         spec = args.attach_to
         if ":" in spec and not spec.startswith("@") and "/" not in spec:
             host, _, port = spec.rpartition(":")
