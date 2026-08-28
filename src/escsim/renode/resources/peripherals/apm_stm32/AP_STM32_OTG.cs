@@ -93,6 +93,7 @@ namespace Antmicro.Renode.Peripherals.USB
                 setupAdditionalOffset = 0;
                 setupConfigurationDescriptor = false;
                 setupExpectedLength = 0;
+                firmwareAddressAssigned = false;
                 connected = false;
                 enumerateAfterReset = false;
                 fifoReadyMask = 0;
@@ -242,45 +243,74 @@ namespace Antmicro.Renode.Peripherals.USB
                         this.Log(LogLevel.Warning,
                             "USB setup packet received while disconnected");
                     }
-                    inEndpoints[0].Control &= ~EndpointStall;
-                    outEndpoints[0].Control &= ~EndpointStall;
-                    if(setupResponse != null)
+                    // A USB/IP import represents a remote device which has
+                    // already been assigned an address, so vhci_hcd does not
+                    // forward the physical bus's SET_ADDRESS request.  The
+                    // STM32 device firmware still needs to see that request
+                    // before it will accept SET_CONFIGURATION.  Inject it
+                    // once, then resume the host's first setup transaction.
+                    if(!firmwareAddressAssigned)
                     {
-                        this.Log(LogLevel.Warning,
-                            "Replacing an unfinished USB setup transaction");
-                        setupResponse(Array.Empty<byte>());
+                        firmwareAddressAssigned = true;
+                        var addressPacket = new SetupPacket
+                        {
+                            Recipient = PacketRecipient.Device,
+                            Type = PacketType.Standard,
+                            Direction = Direction.HostToDevice,
+                            Request = (byte)StandardRequest.SetAddress,
+                            Value = SyntheticUsbAddress,
+                            Index = 0,
+                            Count = 0,
+                        };
+                        QueueSetupPacket(addressPacket, Array.Empty<byte>(),
+                            _ => HandleSetupPacket(packet, additionalData,
+                                response));
+                        return;
                     }
-                    setupResponse = response;
-                    setupConfigurationDescriptor =
-                        packet.Type == PacketType.Standard &&
-                        packet.Request == (byte)StandardRequest.GetDescriptor &&
-                        (packet.Value >> 8) == ConfigurationDescriptorType;
-                    setupExpectedLength = packet.Count;
-                    setupResponseData.Clear();
-                    setupAdditionalData =
-                        additionalData ?? Array.Empty<byte>();
-                    setupAdditionalOffset = 0;
-
-                    var encoded = new byte[]
-                    {
-                        (byte)((byte)packet.Recipient |
-                            ((byte)packet.Type << 5) |
-                            ((byte)packet.Direction << 7)),
-                        packet.Request,
-                        (byte)packet.Value,
-                        (byte)(packet.Value >> 8),
-                        (byte)packet.Index,
-                        (byte)(packet.Index >> 8),
-                        (byte)packet.Count,
-                        (byte)(packet.Count >> 8),
-                    };
-                    rxQueue.Enqueue(new ReceivePacket(
-                        MakeReceiveStatus(0, encoded.Length, SetupDataStatus),
-                        encoded,
-                        () => SetOutInterrupt(0, SetupInterrupt)));
-                    UpdateInterrupts();
+                    QueueSetupPacket(packet, additionalData, response);
                 }
             });
+        }
+
+        private void QueueSetupPacket(SetupPacket packet,
+            byte[] additionalData, Action<byte[]> response)
+        {
+            inEndpoints[0].Control &= ~EndpointStall;
+            outEndpoints[0].Control &= ~EndpointStall;
+            if(setupResponse != null)
+            {
+                this.Log(LogLevel.Warning,
+                    "Replacing an unfinished USB setup transaction");
+                setupResponse(Array.Empty<byte>());
+            }
+            setupResponse = response;
+            setupConfigurationDescriptor =
+                packet.Type == PacketType.Standard &&
+                packet.Request == (byte)StandardRequest.GetDescriptor &&
+                (packet.Value >> 8) == ConfigurationDescriptorType;
+            setupExpectedLength = packet.Count;
+            setupResponseData.Clear();
+            setupAdditionalData = additionalData ?? Array.Empty<byte>();
+            setupAdditionalOffset = 0;
+
+            var encoded = new byte[]
+            {
+                (byte)((byte)packet.Recipient |
+                    ((byte)packet.Type << 5) |
+                    ((byte)packet.Direction << 7)),
+                packet.Request,
+                (byte)packet.Value,
+                (byte)(packet.Value >> 8),
+                (byte)packet.Index,
+                (byte)(packet.Index >> 8),
+                (byte)packet.Count,
+                (byte)(packet.Count >> 8),
+            };
+            rxQueue.Enqueue(new ReceivePacket(
+                MakeReceiveStatus(0, encoded.Length, SetupDataStatus),
+                encoded,
+                () => SetOutInterrupt(0, SetupInterrupt)));
+            UpdateInterrupts();
         }
 
         private void QueueHostData(byte endpoint, byte[] data)
@@ -981,6 +1011,7 @@ namespace Antmicro.Renode.Peripherals.USB
         private int setupAdditionalOffset;
         private bool setupConfigurationDescriptor;
         private int setupExpectedLength;
+        private bool firmwareAddressAssigned;
         private int frameNumber;
         private bool connected;
         private bool enumerateAfterReset;
@@ -989,6 +1020,7 @@ namespace Antmicro.Renode.Peripherals.USB
         private const int EndpointCount = 9;
         private const short InternalPacketSize = 64;
         private const int EndpointZeroPacketSize = 64;
+        private const ushort SyntheticUsbAddress = 1;
         private const int ConfigurationDescriptorType = 2;
         private const int InterfaceDescriptorType = 4;
         private const int EndpointDescriptorType = 5;

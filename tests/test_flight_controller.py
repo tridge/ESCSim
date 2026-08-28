@@ -77,6 +77,23 @@ def test_stm32f4_otg_uses_connected_hardware_reset_state():
     assert "(value & GlobalInterruptEnable) == 0" in otg
 
 
+def test_stm32f4_otg_assigns_firmware_address_before_usbip_setup():
+    otg = (
+        flight_controller_firmware("SPEEDYBEEF405V5").parents[1]
+        / "peripherals"
+        / "apm_stm32"
+        / "AP_STM32_OTG.cs"
+    ).read_text(encoding="utf-8")
+
+    # USB/IP imports an already-addressed remote device, so vhci_hcd does not
+    # forward the physical bus SET_ADDRESS transaction.  Betaflight's USB
+    # state machine must still see it before accepting SET_CONFIGURATION.
+    assert "if(!firmwareAddressAssigned)" in otg
+    assert "Request = (byte)StandardRequest.SetAddress" in otg
+    assert "Value = SyntheticUsbAddress" in otg
+    assert "_ => HandleSetupPacket(packet, additionalData," in otg
+
+
 def test_bundled_betaflight_image_is_valid_and_selectable(tmp_path):
     assert flight_controller_firmwares() == ("SPEEDYBEEF405V5",)
     image = flight_controller_firmware("SPEEDYBEEF405V5")
