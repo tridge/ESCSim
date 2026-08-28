@@ -298,12 +298,20 @@ def write_speedybee_script(
         "sysbus WriteDoubleWord 0x1FFF7A10 0xF96D5489",
         "sysbus WriteDoubleWord 0x1FFF7A14 0xFBD5F38E",
         "sysbus WriteDoubleWord 0x1FFF7A18 0x76181BD3",
+        # Factory ADC calibration words used by Betaflight's internal VREF
+        # and temperature conversion. Keep them nonzero and consistent with
+        # the fixed samples below (approximately 3.3V and 25 degrees C).
+        "sysbus WriteWord 0x1FFF7A2A 1500",
+        "sysbus WriteWord 0x1FFF7A2C 1000",
+        "sysbus WriteWord 0x1FFF7A2E 1300",
         # Fixed bench inputs: 12.0V through the board's 11:1 divider, no
         # current/RSSI, and a mid-scale internal channel used during probes.
         "adc1 FeedSample 1354 10 -1",
         "adc1 FeedSample 0 11 -1",
         "adc1 FeedSample 0 15 -1",
         "adc1 FeedSample 1500 0 -1",
+        "adc1 FeedSample 980 16 -1",
+        "adc1 FeedSample 1500 17 -1",
         f'emulation CreateUSBIPServer {usbip_port} "usb"',
         "host.usb Register sysbus.usbOtg",
         f"cpu VectorTableOffset 0x{FLASH_BASE:08X}",
@@ -327,6 +335,7 @@ def write_speedybee_script(
         # same DMA buffer, so these per-word warnings are expected and would
         # otherwise swamp the launcher and starve real-time emulation.
         "logLevel 3 sysbus.timer1",
+        "logLevel 3 sysbus.timer2",
         "logLevel 3 sysbus.timer3",
         "logLevel 3 sysbus.timer4",
         "start",

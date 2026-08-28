@@ -43,6 +43,9 @@ def test_speedybee_platform_wires_four_escs_and_fixed_sensors(tmp_path):
     assert "AP_DPS310" in platform_text
     assert "AP_PersistentMemory" in platform_text
     assert "adc1 FeedSample 1354 10 -1" in script_text
+    assert "adc1 FeedSample 980 16 -1" in script_text
+    assert "adc1 FeedSample 1500 17 -1" in script_text
+    assert "sysbus WriteWord 0x1FFF7A2A 1500" in script_text
     assert 'emulation CreateUSBIPServer 5200 "usb"' in script_text
     assert "macro reset" in script_text
     assert "cpu VectorTableOffset 0x08000000" in script_text
@@ -59,6 +62,19 @@ def test_stm32f4_rcc_reports_software_reset_cause():
     assert "AddWatchpointHook" in rcc
     assert "SysResetReq" in rcc
     assert "SFTRSTF" in rcc
+
+
+def test_stm32f4_otg_uses_connected_hardware_reset_state():
+    otg = (
+        flight_controller_firmware("SPEEDYBEEF405V5").parents[1]
+        / "peripherals"
+        / "apm_stm32"
+        / "AP_STM32_OTG.cs"
+    ).read_text(encoding="utf-8")
+
+    assert "registers[DeviceControl] = 0;" in otg
+    assert "(GetRegister(DeviceControl) & SoftDisconnect) == 0" in otg
+    assert "(value & GlobalInterruptEnable) == 0" in otg
 
 
 def test_bundled_betaflight_image_is_valid_and_selectable(tmp_path):

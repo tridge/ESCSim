@@ -106,7 +106,10 @@ namespace Antmicro.Renode.Peripherals.USB
                 {
                     endpoint.Reset();
                 }
-                registers[DeviceControl] = SoftDisconnect;
+                // DCTL resets to zero on STM32F4.  In particular, SDIS is
+                // clear: the legacy STM32F405 USB device driver relies on
+                // this and does not explicitly call DCD_DevConnect().
+                registers[DeviceControl] = 0;
                 USBCore.Reset();
                 for(var endpoint = 1; endpoint < EndpointCount; endpoint++)
                 {
@@ -665,15 +668,13 @@ namespace Antmicro.Renode.Peripherals.USB
 
         private void WriteDeviceControl(uint value)
         {
-            var wasDisconnected =
-                (GetRegister(DeviceControl) & SoftDisconnect) != 0;
             registers[DeviceControl] = value;
             if((value & SoftDisconnect) != 0)
             {
                 Disconnect();
                 return;
             }
-            if(wasDisconnected &&
+            if((GetRegister(AhbConfiguration) & GlobalInterruptEnable) != 0 &&
                 (!connectOnVbusSensing || VbusConnectionEnabled()))
             {
                 Connect();
@@ -715,20 +716,18 @@ namespace Antmicro.Renode.Peripherals.USB
             var wasEnabled =
                 (GetRegister(AhbConfiguration) & GlobalInterruptEnable) != 0;
             registers[AhbConfiguration] = value;
-            if(!connectOnVbusSensing)
-            {
-                return;
-            }
             if((value & GlobalInterruptEnable) == 0)
             {
-                if(wasEnabled)
+                if(connectOnVbusSensing && wasEnabled)
                 {
                     Disconnect();
                 }
                 return;
             }
-            if((GetRegister(GlobalCoreConfiguration) &
-                VbusConnectionMask) != 0)
+            if((GetRegister(DeviceControl) & SoftDisconnect) == 0 &&
+                (!connectOnVbusSensing ||
+                 (GetRegister(GlobalCoreConfiguration) &
+                    VbusConnectionMask) != 0))
             {
                 Connect();
             }
