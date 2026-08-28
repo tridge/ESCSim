@@ -9,7 +9,8 @@
 // the stream runs permanently behind the fifo, and RX eventually goes
 // deaf while TX keeps working.
 //
-// This helper hooks the stream's CR register. When EN is written 1 it
+// This helper hooks the stream's transfer count, which firmware programs just
+// before enabling it. Once enabled for this UART's receive data register, it
 // blinks one request per byte already queued in the UART's receive fifo.
 // Reflection is only used to read the private fifo reference once at
 // construction.
@@ -32,7 +33,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
     public class AP_UartRxDmaPump : IDoubleWordPeripheral, IKnownSize
     {
         public AP_UartRxDmaPump(IMachine machine, STM32DMA dma, int stream,
-                               IUART uart)
+                               IUART uart, uint peripheralAddress)
         {
             var stm32Uart = uart as STM32_UART;
             if(uart is AP_STM32F1_UART wrappedUart)
@@ -44,24 +45,38 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 throw new ConstructionException(
                     "AP_UartRxDmaPump needs an STM32 legacy UART");
             }
-            var fifoField = typeof(STM32_UART).GetField("receiveFifo", BindingFlags.NonPublic | BindingFlags.Instance);
+            var fifoField = typeof(STM32_UART).GetField("receiveFifo",
+                BindingFlags.NonPublic | BindingFlags.Instance);
             if(fifoField == null)
             {
-                throw new ConstructionException("STM32_UART no longer has a receiveFifo field - revisit this fix");
+                throw new ConstructionException(
+                    "STM32_UART no longer has a receiveFifo field - revisit this fix");
             }
             var fifo = (Queue<byte>)fifoField.GetValue(stm32Uart);
 
-            dma.RegistersCollection.AddBeforeWriteHook(0x10 + 0x18 * stream, (long offset, uint value) =>
+            // The transfer count is programmed immediately before the stream
+            // is enabled. Hook it instead of SxCR so another peripheral can
+            // observe a resource-conflicting stream's direction and target.
+            // The delayed action still runs after the following SxCR write.
+            dma.RegistersCollection.AddBeforeWriteHook(
+                0x14 + 0x18 * stream, (long offset, uint value) =>
             {
-                if((value & 1) == 0)
+                if(value == 0)
                 {
                     return null;
                 }
-                // Run after this register write has enabled the stream. A
-                // before-write hook can coexist with AP_STM32DMA_Fixup's
-                // after-write hook on the same register.
+                // Run after firmware's following write enables the stream.
                 machine.ScheduleAction(TimeInterval.FromMicroseconds(1), _ =>
                 {
+                    var configuration = dma.ReadDoubleWord(
+                        StreamConfiguration(stream));
+                    if((configuration & StreamEnable) == 0 ||
+                       (configuration & DirectionMask) != PeripheralToMemory ||
+                       dma.ReadDoubleWord(StreamPeripheral(stream)) !=
+                           peripheralAddress)
+                    {
+                        return;
+                    }
                     // Service every request that went missing while the
                     // stream was down.
                     var pending = fifo.Count;
@@ -78,5 +93,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public uint ReadDoubleWord(long offset) => 0;
         public void WriteDoubleWord(long offset, uint value) { }
         public void Reset() { }
+
+        private static long StreamConfiguration(int stream) =>
+            0x10 + 0x18 * stream;
+        private static long StreamPeripheral(int stream) =>
+            StreamConfiguration(stream) + 0x08;
+
+        private const uint StreamEnable = 1;
+        private const uint DirectionMask = 3u << 6;
+        private const uint PeripheralToMemory = 0;
     }
 }

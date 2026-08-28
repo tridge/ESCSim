@@ -1,7 +1,8 @@
-// Bridges the SpeedyBeeF405Mini timer DMA waveform to four independent
-// ESCSim ESC signal sockets.  ArduPilot interleaves all four timer channels in
-// one DMAR buffer; decoding it here preserves the actual packet, including
-// commands and the inverted checksum used by bidirectional DShot.
+// Bridges the SpeedyBeeF405 timer DMA waveform to four independent ESCSim ESC
+// signal sockets.  ArduPilot interleaves all four timer channels in one DMAR
+// buffer, while Betaflight uses one 18-word buffer per timer channel.  Decode
+// both forms so the bridge preserves the actual packet, including commands and
+// the inverted checksum used by bidirectional DShot.
 //
 // Bidirectional replies arrive from the ESC as ESCSim's GCR-decoded 16-bit
 // frame.  They are converted back to timer input-capture edge timestamps and
@@ -28,11 +29,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         IDisposable
     {
         public ESCSim_STM32_DShot(IMachine machine, STM32DMA dma,
-            STM32_Timer timer3, STM32_Timer timer4,
+            STM32_Timer timer2, STM32_Timer timer3, STM32_Timer timer4,
             int esc1Port, int esc2Port, int esc3Port, int esc4Port)
         {
             this.machine = machine;
             this.dma = dma;
+            this.timer2 = timer2;
             this.timer3 = timer3;
             this.timer4 = timer4;
             sockets = new UdpClient[EscCount];
@@ -57,17 +59,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 thread.Start();
             }
 
-            dma.RegistersCollection.AddBeforeWriteHook(
-                StreamConfiguration(OutputTimer3Stream),
-                (offset, value) => ObserveTimer3(value));
-            dma.RegistersCollection.AddBeforeWriteHook(
-                StreamConfiguration(OutputTimer4Stream),
-                (offset, value) => ObserveDma(
-                    OutputTimer4Stream, timer4, Timer4Escs, value));
-            dma.RegistersCollection.AddBeforeWriteHook(
-                StreamConfiguration(CaptureTimer4Stream),
-                (offset, value) => ObserveCapture(timer4,
-                    CaptureTimer4Stream, value));
+            foreach(var stream in ObservedStreams)
+            {
+                var captured = stream;
+                dma.RegistersCollection.AddBeforeWriteHook(
+                    StreamConfiguration(stream),
+                    (offset, value) => ObserveStream(captured, value));
+            }
         }
 
         public void Reset()
@@ -79,6 +77,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             FramesSent = 0;
             RepliesReceived = 0;
             RepliesInjected = 0;
+            LastFrame = 0;
+            BidirectionalFrames = 0;
+            LastDshotType = 0;
         }
 
         public uint ReadDoubleWord(long offset)
@@ -88,6 +89,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             case 0x00: return FramesSent;
             case 0x04: return RepliesReceived;
             case 0x08: return RepliesInjected;
+            case 0x0C: return LastFrame;
+            case 0x10: return BidirectionalFrames;
+            case 0x14: return LastDshotType;
             default: return 0;
             }
         }
@@ -99,6 +103,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public uint FramesSent { get; private set; }
         public uint RepliesReceived { get; private set; }
         public uint RepliesInjected { get; private set; }
+        public uint LastFrame { get; private set; }
+        public uint BidirectionalFrames { get; private set; }
+        public uint LastDshotType { get; private set; }
 
         public void Dispose()
         {
@@ -112,11 +119,85 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
         }
 
-        private uint? ObserveTimer3(uint configuration)
+        private uint? ObserveStream(int stream, uint configuration)
         {
-            ObserveDma(OutputTimer3Stream, timer3, Timer3Escs, configuration);
-            ObserveCapture(timer3, CaptureTimer3Stream, configuration);
+            if((configuration & StreamEnable) == 0)
+            {
+                return null;
+            }
+
+            var peripheral = dma.ReadDoubleWord(StreamPeripheral(stream));
+            if(TryDirectRoute(peripheral, out var timer, out var esc))
+            {
+                if((configuration & DirectionMask) == MemoryToPeripheral)
+                {
+                    ObserveDirectDma(stream, timer, esc);
+                }
+                else if((configuration & DirectionMask) == PeripheralToMemory)
+                {
+                    return Schedule(() => Inject(stream, esc));
+                }
+                return null;
+            }
+
+            if(peripheral == TimerDmarAddress(timer3))
+            {
+                ObserveDma(stream, timer3, Timer3Escs, configuration);
+                ObserveCapture(timer3, stream, configuration);
+            }
+            else if(peripheral == TimerDmarAddress(timer4))
+            {
+                ObserveDma(stream, timer4, Timer4Escs, configuration);
+                ObserveCapture(timer4, stream, configuration);
+            }
             return null;
+        }
+
+        private bool TryDirectRoute(uint peripheral, out STM32_Timer timer,
+            out int esc)
+        {
+            switch(peripheral)
+            {
+            // SPEEDYBEEF405V5: PB1/TIM3_CH4 is motor 1, PB0/TIM3_CH3
+            // motor 2, PB10/TIM2_CH3 motor 3, and PB11/TIM2_CH4 motor 4.
+            case Timer3Base + Ccr4:
+                timer = timer3;
+                esc = 0;
+                return true;
+            case Timer3Base + Ccr3:
+                timer = timer3;
+                esc = 1;
+                return true;
+            case Timer2Base + Ccr3:
+                timer = timer2;
+                esc = 2;
+                return true;
+            case Timer2Base + Ccr4:
+                timer = timer2;
+                esc = 3;
+                return true;
+            default:
+                timer = null;
+                esc = -1;
+                return false;
+            }
+        }
+
+        private void ObserveDirectDma(int stream, STM32_Timer timer, int esc)
+        {
+            var count = (int)dma.ReadDoubleWord(StreamCount(stream));
+            if(count < DirectDshotWords)
+            {
+                return;
+            }
+            var memory = dma.ReadDoubleWord(StreamMemory(stream));
+            if(!TryDecodeDirect(memory, out var frame))
+            {
+                return;
+            }
+            SendFrame(esc, frame, DshotTypeDirect(timer),
+                IsBidirectional(frame));
+            FramesSent++;
         }
 
         private uint? ObserveCapture(STM32_Timer timer, int stream,
@@ -194,12 +275,60 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             return any && (HasNormalChecksum(frame) || IsBidirectional(frame));
         }
 
+        private bool TryDecodeDirect(uint memory, out ushort frame)
+        {
+            frame = 0;
+            var any = false;
+            var minimum = uint.MaxValue;
+            var maximum = 0u;
+            for(var bit = 0; bit < DshotBits; bit++)
+            {
+                var word = machine.SystemBus.ReadDoubleWord(
+                    memory + (uint)(bit * sizeof(uint)));
+                if(word != 0)
+                {
+                    minimum = Math.Min(minimum, word);
+                    maximum = Math.Max(maximum, word);
+                    any = true;
+                }
+            }
+            if(!any)
+            {
+                return false;
+            }
+            // Betaflight programs ARR only after enabling the output DMA. In
+            // bidirectional mode ARR is still 0xffffffff from input capture
+            // when this hook runs, so distinguish zero/one by the two duty
+            // widths in the already-complete buffer. This is also independent
+            // of how the timer model scales its compare values.
+            var threshold = (minimum + maximum) / 2;
+            for(var bit = 0; bit < DshotBits; bit++)
+            {
+                var word = machine.SystemBus.ReadDoubleWord(
+                    memory + (uint)(bit * sizeof(uint)));
+                frame = (ushort)((frame << 1) | (word > threshold ? 1 : 0));
+            }
+            return HasNormalChecksum(frame) || IsBidirectional(frame);
+        }
+
         private void SendFrame(int esc, ushort frame, uint autoReload,
             bool bidirectional)
         {
+            SendFrame(esc, frame, DshotType(autoReload), bidirectional);
+        }
+
+        private void SendFrame(int esc, ushort frame, byte dshotType,
+            bool bidirectional)
+        {
+            LastFrame = frame;
+            LastDshotType = dshotType;
+            if(bidirectional)
+            {
+                BidirectionalFrames++;
+            }
             var packet = new byte[8];
             Put16(packet, 0, Magic);
-            packet[2] = DshotType(autoReload);
+            packet[2] = dshotType;
             packet[3] = 4;
             Put16(packet, 4, bidirectional ? IdleHigh : (ushort)0);
             Put16(packet, 6, frame);
@@ -265,6 +394,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 return;
             }
+            Inject(stream, esc);
+        }
+
+        private void Inject(int stream, int esc)
+        {
             ushort? reply;
             lock(sync)
             {
@@ -367,6 +501,16 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             return Dshot600;
         }
 
+        private byte DshotTypeDirect(STM32_Timer timer)
+        {
+            // TIM2/3/4 run from the 84MHz APB1 timer clock. Betaflight sets
+            // PSC to 27/13/6 for a 20-tick DShot150/300/600 bit period.
+            var prescaler = timer.ReadDoubleWord(Prescaler);
+            if(prescaler > 20) return Dshot150;
+            if(prescaler > 9) return Dshot300;
+            return Dshot600;
+        }
+
         private uint TimerDmarAddress(STM32_Timer timer)
         {
             return ReferenceEquals(timer, timer3) ? Timer3Base + DmaAddress :
@@ -392,6 +536,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private readonly IMachine machine;
         private readonly STM32DMA dma;
+        private readonly STM32_Timer timer2;
         private readonly STM32_Timer timer3;
         private readonly STM32_Timer timer4;
         private readonly UdpClient[] sockets;
@@ -416,14 +561,16 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private const int DshotPreamble = 1;
         private const int DshotBits = 16;
         private const int DshotWords = 19 * ChannelsPerTimer;
+        private const int DirectDshotWords = 18;
         private const int GcrBits = 20;
         private const uint CaptureTick = 16;
         private const int ReceiveTimeoutMs = 100;
 
-        private const int OutputTimer3Stream = 2;
-        private const int OutputTimer4Stream = 6;
-        private const int CaptureTimer3Stream = 2;
-        private const int CaptureTimer4Stream = 3;
+        // The four Betaflight motor channels use streams 2, 7, 1 and 6.
+        // Streams 2/3/6 also retain ArduPilot capture/output observation.
+        // The UART3 RX pump deliberately hooks stream 1's count register so
+        // its hardware resource conflict can coexist with this SxCR hook.
+        private static readonly int[] ObservedStreams = { 1, 2, 3, 6, 7 };
         private const long StreamBase = 0x10;
         private const long StreamStride = 0x18;
         private const uint StreamEnable = 1;
@@ -431,9 +578,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private const uint PeripheralToMemory = 0;
         private const uint MemoryToPeripheral = 1u << 6;
 
+        private const uint Timer2Base = 0x40000000;
         private const uint Timer3Base = 0x40000400;
         private const uint Timer4Base = 0x40000800;
+        private const uint Ccr3 = 0x3C;
+        private const uint Ccr4 = 0x40;
         private const uint DmaAddress = 0x4C;
+        private const long Prescaler = 0x28;
         private const long AutoReload = 0x2C;
         private const long CaptureMode1 = 0x18;
         private const long CaptureMode2 = 0x1C;

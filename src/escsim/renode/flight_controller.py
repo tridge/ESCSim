@@ -13,6 +13,10 @@ from escsim.renode.generator import Unsupported, find_renode, parse_ihex
 
 FLASH_BASE = 0x08000000
 FLASH_SIZE = 1024 * 1024
+# Betaflight's STM32F405 linker reserves flash sector 1 for configuration.
+# Its distributed HEX is dense and contains erased bytes over this sector, so
+# repeat-start image matching must ignore live settings written there.
+BETAFLIGHT_CONFIG_RANGES = ((0x4000, 0x8000),)
 USBIP_PORT_OFFSET = 2
 MONITOR_PORT_OFFSET = 4
 FC_FIRMWARE_BASE_URL = (
@@ -138,7 +142,26 @@ def select_firmware(flash: Path, image: Path) -> bool:
         normalized.append((offset, payload))
     flash = ensure_flash(flash)
     current = flash.read_bytes()
-    if all(current[offset : offset + len(payload)] == payload
+    def matching_image_bytes(offset: int, payload: bytes) -> bool:
+        spans = [(offset, offset + len(payload))]
+        for preserve_start, preserve_end in BETAFLIGHT_CONFIG_RANGES:
+            next_spans = []
+            for start, end in spans:
+                if end <= preserve_start or start >= preserve_end:
+                    next_spans.append((start, end))
+                    continue
+                if start < preserve_start:
+                    next_spans.append((start, preserve_start))
+                if end > preserve_end:
+                    next_spans.append((preserve_end, end))
+            spans = next_spans
+        return all(
+            current[start:end]
+            == payload[start - offset : end - offset]
+            for start, end in spans
+        )
+
+    if all(matching_image_bytes(offset, payload)
            for offset, payload in normalized):
         return False
     replacement = bytearray(b"\xff" * FLASH_SIZE)
@@ -226,18 +249,22 @@ usart1RxPump: Miscellaneous.AP_UartRxDmaPump @ sysbus 0x60000128
     dma: dma2
     stream: 2
     uart: usart1
+    peripheralAddress: 0x40011004
 usart2RxPump: Miscellaneous.AP_UartRxDmaPump @ sysbus 0x6000012C
     dma: dma1
     stream: 5
     uart: usart2
+    peripheralAddress: 0x40004404
 usart3RxPump: Miscellaneous.AP_UartRxDmaPump @ sysbus 0x60000130
     dma: dma1
     stream: 1
     uart: usart3
+    peripheralAddress: 0x40004804
 usart6RxPump: Miscellaneous.AP_UartRxDmaPump @ sysbus 0x60000134
     dma: dma2
     stream: 1
     uart: usart6
+    peripheralAddress: 0x40011404
 
 timer3UpdateDMA: Miscellaneous.AP_STM32_Timer_UpdateDMA @ sysbus 0x6000013C
     timer: timer3
@@ -248,6 +275,7 @@ timer4UpdateDMA: Miscellaneous.AP_STM32_Timer_UpdateDMA @ sysbus 0x60000140
 
 motorBridge: Miscellaneous.ESCSim_STM32_DShot @ sysbus 0x60000200
     dma: dma1
+    timer2: timer2
     timer3: timer3
     timer4: timer4
 {ports}

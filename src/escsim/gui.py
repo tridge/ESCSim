@@ -115,7 +115,10 @@ FC_METRICS_COMMAND = (
     METRICS_COMMAND
     + "; sysbus.motorBridge ReadDoubleWord 0; "
     "sysbus.motorBridge ReadDoubleWord 4; "
-    "sysbus.motorBridge ReadDoubleWord 8"
+    "sysbus.motorBridge ReadDoubleWord 8; "
+    "sysbus.motorBridge ReadDoubleWord 0x0c; "
+    "sysbus.motorBridge ReadDoubleWord 0x10; "
+    "sysbus.motorBridge ReadDoubleWord 0x14"
 )
 
 
@@ -848,6 +851,15 @@ class Lab(object):
                     m["dshot_injected"],
                 )
             )
+            if "dshot_last_frame" in m:
+                parts.append(
+                    "last=0x%04X bidir=%u type=%u"
+                    % (
+                        m["dshot_last_frame"],
+                        m["dshot_bidir_frames"],
+                        m["dshot_type"],
+                    )
+                )
         return " | ".join(parts)
 
     def _start_stub(self, generation):

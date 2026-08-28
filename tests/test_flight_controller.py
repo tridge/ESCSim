@@ -37,6 +37,7 @@ def test_speedybee_platform_wires_four_escs_and_fixed_sensors(tmp_path):
         True,
     ]
     assert "motorBridge: Miscellaneous.ESCSim_STM32_DShot" in platform_text
+    assert "timer2: timer2" in platform_text
     assert "timer3: timer3" in platform_text
     assert "timer4: timer4" in platform_text
     assert "AP_ICM42688" in platform_text
@@ -49,6 +50,32 @@ def test_speedybee_platform_wires_four_escs_and_fixed_sensors(tmp_path):
     assert 'emulation CreateUSBIPServer 5200 "usb"' in script_text
     assert "macro reset" in script_text
     assert "cpu VectorTableOffset 0x08000000" in script_text
+
+
+def test_speedybee_dshot_bridge_supports_betaflight_channel_dma():
+    bridge = (
+        flight_controller_firmware("SPEEDYBEEF405V5").parents[1]
+        / "peripherals"
+        / "apm_stm32"
+        / "ESCSim_STM32_DShot.cs"
+    ).read_text(encoding="utf-8")
+
+    assert "TryDecodeDirect" in bridge
+    assert "case Timer3Base + Ccr4:" in bridge
+    assert "case Timer3Base + Ccr3:" in bridge
+    assert "case Timer2Base + Ccr3:" in bridge
+    assert "case Timer2Base + Ccr4:" in bridge
+    assert "ObservedStreams = { 1, 2, 3, 6, 7 }" in bridge
+
+    uart_pump = (
+        flight_controller_firmware("SPEEDYBEEF405V5").parents[1]
+        / "peripherals"
+        / "apm_stm32"
+        / "AP_UartRxDmaPump.cs"
+    ).read_text(encoding="utf-8")
+    assert "0x14 + 0x18 * stream" in uart_pump
+    assert "peripheralAddress" in uart_pump
+    assert "DirectionMask" in uart_pump
 
 
 def test_stm32f4_rcc_reports_software_reset_cause():
@@ -107,9 +134,12 @@ def test_bundled_betaflight_image_is_valid_and_selectable(tmp_path):
     # Re-selecting an unchanged firmware must preserve configuration bytes
     # outside the HEX image instead of factory-resetting every app start.
     with flash.open("r+b") as stream:
+        stream.seek(0x4000)
+        stream.write(b"configured sector")
         stream.seek(0xF0000)
         stream.write(b"configured")
     assert not select_firmware(flash, image)
+    assert flash.read_bytes()[0x4000 : 0x4011] == b"configured sector"
     assert flash.read_bytes()[0xF0000 : 0xF000A] == b"configured"
 
 
