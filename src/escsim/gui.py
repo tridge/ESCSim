@@ -28,7 +28,7 @@ with --control-port N the UI can be driven over a localhost TCP
 connection (one command per line), for scripted tests:
   target NAME, bootloader auto|none|PATH, firmware auto|none|PATH,
   eeprom defaults|blank, conf off|serial|usb, protocol 4way|direct,
-  canbus N, download-renode, start, stop, status, quit
+  escs 1..8, canbus N, download-renode, start, stop, status, quit
 replies are prefixed OK/ERR/STATUS.
 """
 
@@ -46,6 +46,7 @@ import struct
 import subprocess
 import sys
 import tarfile
+import tempfile
 import threading
 import time
 import zipfile
@@ -88,6 +89,8 @@ FAMILY_MCU = {
 
 SITL_MAGIC = 0x4453
 STATE_MAGIC = 0x5353
+MAX_ESC_COUNT = 8
+INSTANCE_PORT_STRIDE = 10
 
 
 METRICS_COMMAND = (
@@ -151,8 +154,9 @@ class ProcRunner(object):
     """a child process whose output lines land in a queue, killed as a
     group so renode dies with its launcher"""
 
-    def __init__(self, out_q):
+    def __init__(self, out_q, label=""):
         self.out_q = out_q
+        self.label = label
         self.proc = None
         self.tree = None
 
@@ -175,8 +179,9 @@ class ProcRunner(object):
 
     def _pump(self, proc):
         for line in proc.stdout:
-            self.out_q.put(line.rstrip("\n"))
-        self.out_q.put("[emulator exited, status %s]" % proc.wait())
+            line = line.rstrip("\n")
+            self.out_q.put("%s%s" % (self.label, line))
+        self.out_q.put("%s[emulator exited, status %s]" % (self.label, proc.wait()))
 
     def running(self):
         return self.proc is not None and self.proc.poll() is None
@@ -189,6 +194,37 @@ class ProcRunner(object):
         self.proc = None
 
 
+class ProcGroup(object):
+    """One logical launch made up of one or more Renode process trees."""
+
+    def __init__(self, out_q):
+        self.out_q = out_q
+        self.runners = []
+
+    def start(self, commands, cwd=None, env=None):
+        count = len(commands)
+        try:
+            for index, command in enumerate(commands):
+                label = "[ESC %u] " % (index + 1) if count > 1 else ""
+                runner = ProcRunner(self.out_q, label=label)
+                self.runners.append(runner)
+                runner.start(command, cwd=cwd, env=env)
+        except BaseException:
+            self.stop()
+            raise
+
+    def running(self):
+        return any(runner.running() for runner in self.runners)
+
+    def all_running(self):
+        return bool(self.runners) and all(runner.running() for runner in self.runners)
+
+    def stop(self):
+        for runner in self.runners:
+            runner.stop()
+        self.runners = []
+
+
 class Lab(object):
     """the launcher's state and actions, UI-independent so the control
     port drives exactly what the buttons do"""
@@ -196,7 +232,7 @@ class Lab(object):
     def __init__(self, args):
         self.args = args
         self.log_q = queue.Queue()
-        self.runner = ProcRunner(self.log_q)
+        self.runner = ProcGroup(self.log_q)
         self.emulator_ready = False
         self.stub = None
         self.usb_attached = False
@@ -215,9 +251,11 @@ class Lab(object):
         self.generation = 0  # invalidates old pollers
         self.conf = "usb" if os.name == "nt" else "serial"
         self.protocol = "4way"  # 4way | direct
+        self.esc_count = 1
         self.can_bus = 0
         self.status = "stopped"
         self.conf_port = ""  # the pty / tty path once up
+        self.launch_work = None
         self.bl_dirs = bootloader_dirs(args.bootloader_dir)
         cached_bootloaders = default_cache_dir() / "bootloaders"
         if cached_bootloaders.is_dir():
@@ -269,6 +307,24 @@ class Lab(object):
 
     # -- lifecycle -----------------------------------------------------
 
+    def active_esc_count(self):
+        if getattr(self, "protocol", "4way") != "4way":
+            return 1
+        return getattr(self, "esc_count", 1)
+
+    def instance_ports(self, index):
+        """Signal, state and monitor ports for one Renode instance."""
+        offset = index * INSTANCE_PORT_STRIDE
+        return (
+            self.args.gui_port + offset,
+            self.args.state_port + offset,
+            getattr(self.args, "monitor_port", 0) + offset,
+        )
+
+    def _all_emulators_running(self):
+        all_running = getattr(self.runner, "all_running", None)
+        return all_running() if all_running is not None else self.runner.running()
+
     @staticmethod
     def wait_port_free(port, timeout=8.0, tcp=False):
         """wait for a port to be bindable; the previous emulator's
@@ -291,10 +347,11 @@ class Lab(object):
                 s.close()
 
     def emulator_ports_bound(self):
-        """Return true once Renode owns both GUI UDP ports."""
+        """Return true once every Renode instance owns both GUI UDP ports."""
         return all(
             not self.wait_port_free(port, timeout=0)
-            for port in (self.args.gui_port, self.args.state_port)
+            for index in range(self.active_esc_count())
+            for port in self.instance_ports(index)[:2]
         )
 
     def packaged_ports_ready(self):
@@ -325,57 +382,94 @@ class Lab(object):
             return "previous USB cleanup failed: %s" % cleanup_error
         if self.target is None or self.info is None:
             return "pick a target first"
-        for port in (self.args.gui_port, self.args.state_port):
+        if not 1 <= self.esc_count <= MAX_ESC_COUNT:
+            return "ESC count must be 1..%u" % MAX_ESC_COUNT
+        instance_ports = [
+            self.instance_ports(index) for index in range(self.active_esc_count())
+        ]
+        flat_ports = [port for ports in instance_ports for port in ports]
+        if any(not 1 <= port <= 65535 for port in flat_ports):
+            return "instance ports must be 1..65535"
+        if len(flat_ports) != len(set(flat_ports)):
+            return "instance port ranges overlap; choose different base ports"
+        for port in [port for ports in instance_ports for port in ports[:2]]:
             if not self.wait_port_free(port):
                 return (
                     "udp port %u is still in use - a leftover emulator? "
                     "try: pkill -f renode" % port
                 )
-        if not self.wait_port_free(self.args.monitor_port, tcp=True):
-            return (
-                "monitor port %u is still in use - a leftover emulator? "
-                "try: pkill -f renode" % self.args.monitor_port
-            )
+        for port in [ports[2] for ports in instance_ports]:
+            if not self.wait_port_free(port, tcp=True):
+                return (
+                    "monitor port %u is still in use - a leftover emulator? "
+                    "try: pkill -f renode" % port
+                )
         bl = self.pick_bootloader()
         if isinstance(bl, str) and not os.path.isfile(bl):
             return bl
-        cmd = generator_command() + [
-            self.target,
-            "--link",
-            "--gui-port",
-            str(self.args.gui_port),
-            "--gui-state-port",
-            str(self.args.state_port),
-            "--monitor-port",
-            str(self.args.monitor_port),
-        ]
+        command_tail = []
         if bl is not None:
-            cmd += ["--bootloader-elf", bl]
+            command_tail += ["--bootloader-elf", bl]
         if self.firmware == "none":
             if bl is None:
                 return (
                     "a blank ESC still needs its bootloader: pick one, "
                     "or pick a firmware"
                 )
-            cmd += ["--no-firmware"]
+            command_tail += ["--no-firmware"]
         elif self.firmware != "auto":
             if not os.path.isfile(self.firmware):
                 return "no firmware at %s" % self.firmware
-            cmd += ["--elf", self.firmware]
+            command_tail += ["--elf", self.firmware]
         if self.targets_header is not None:
-            cmd += ["--targets-file", self.targets_header]
+            command_tail += ["--targets-file", self.targets_header]
         if self.eeprom == "blank":
-            cmd += ["--blank-eeprom"]
+            command_tail += ["--blank-eeprom"]
         if self.info["dronecan"]:
-            cmd += ["--can-bus", str(self.can_bus)]
+            command_tail += ["--can-bus", str(self.can_bus)]
         if self.args.renode:
-            cmd += ["--renode", self.args.renode]
+            command_tail += ["--renode", self.args.renode]
+        if self.launch_work is not None:
+            self.launch_work.cleanup()
+        self.launch_work = tempfile.TemporaryDirectory(prefix="escsim-launch-")
+        commands = []
+        for index, (gui_port, state_port, monitor_port) in enumerate(instance_ports):
+            outdir = os.path.join(self.launch_work.name, "esc%u" % (index + 1))
+            command = generator_command() + [
+                self.target,
+                "--link",
+                "--outdir",
+                outdir,
+                "--gui-port",
+                str(gui_port),
+                "--gui-state-port",
+                str(state_port),
+                "--monitor-port",
+                str(monitor_port),
+            ]
+            if self.info["dronecan"]:
+                command += [
+                    "--can-node",
+                    str(11 + index),
+                    "--esc-index",
+                    str(index),
+                ]
+            commands.append(command + command_tail)
         self.emulator_ready = False
         self.start_failed = False
         self.conf_port = ""
-        self.status = "starting emulator..."
-        self.log("$ " + " ".join(cmd))
-        self.runner.start(cmd, env=generator_environment())
+        count = self.active_esc_count()
+        self.status = "starting %s..." % (
+            "emulator" if count == 1 else "%u emulators" % count
+        )
+        for command in commands:
+            self.log("$ " + " ".join(command))
+        try:
+            self.runner.start(commands, env=generator_environment())
+        except Exception as error:
+            self.launch_work.cleanup()
+            self.launch_work = None
+            return "could not start emulator: %s" % error
         with self.lifecycle_lock:
             self.generation += 1
             generation = self.generation
@@ -396,37 +490,46 @@ class Lab(object):
         # that socket, not stdout. Consume the initial prompt so a bad image or
         # platform becomes an immediate launcher error instead of a two-minute
         # wait at the last ordinary log line.
-        monitor = renode_monitor.MonitorClient("127.0.0.1", self.args.monitor_port)
-        text = None
-        while (
-            time.time() < deadline
-            and self.runner.running()
-            and self._generation_current(generation)
-        ):
-            try:
-                text = monitor.connect(timeout=max(1, deadline - time.time()))
-                break
-            except OSError:
-                monitor.close()
-                time.sleep(0.2)
-            except TimeoutError:
-                break
+        monitors = []
+        for index in range(self.active_esc_count()):
+            monitor = renode_monitor.MonitorClient(
+                "127.0.0.1", self.instance_ports(index)[2]
+            )
+            text = None
+            while (
+                time.time() < deadline
+                and self._all_emulators_running()
+                and self._generation_current(generation)
+            ):
+                try:
+                    text = monitor.connect(timeout=max(1, deadline - time.time()))
+                    break
+                except OSError:
+                    monitor.close()
+                    time.sleep(0.2)
+                except TimeoutError:
+                    break
+            monitors.append(monitor)
+            if text is not None:
+                error = renode_monitor.startup_error(text)
+                if error is not None:
+                    self.status = "ESC %u setup failed: %s" % (index + 1, error)
+                    self.start_failed = True
+                    self.log("[monitor ESC %u] %s" % (index + 1, error))
+                    break
         if not self._generation_current(generation):
-            monitor.close()
-            return
-        if text is not None:
-            error = renode_monitor.startup_error(text)
-            if error is not None:
+            for monitor in monitors:
                 monitor.close()
-                self.status = "emulator setup failed: " + error
-                self.start_failed = True
-                self.log("[monitor] " + error)
-                if self._generation_current(generation):
-                    self.runner.stop()
-                return
+            return
+        if self.start_failed:
+            for monitor in monitors:
+                monitor.close()
+            if self._generation_current(generation):
+                self.runner.stop()
+            return
         while (
             time.time() < deadline
-            and self.runner.running()
+            and self._all_emulators_running()
             and self._generation_current(generation)
         ):
             if self.emulator_ready or self.packaged_ports_ready():
@@ -436,7 +539,8 @@ class Lab(object):
                 break
             time.sleep(0.3)
         if not self.emulator_ready:
-            monitor.close()
+            for monitor in monitors:
+                monitor.close()
             if not self._generation_current(generation):
                 return
             # a half-started emulator (a failed port bind still leaves
@@ -447,9 +551,11 @@ class Lab(object):
             return
         threading.Thread(
             target=self._metrics_loop,
-            args=(generation, monitor),
+            args=(generation, monitors[0]),
             daemon=True,
         ).start()
+        for monitor in monitors[1:]:
+            monitor.close()
         if bl is not None:
             self._enter_bootloader()
         if not self._generation_current(generation):
@@ -470,16 +576,20 @@ class Lab(object):
         the bootloader before the first configurator connect"""
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            # type 5 line level, idle high
-            s.sendto(
-                struct.pack("<HBBHH", SITL_MAGIC, 5, 4, 1, 0),
-                ("127.0.0.1", self.args.gui_port),
-            )
+            for index in range(self.active_esc_count()):
+                gui_port, _state_port, _monitor_port = self.instance_ports(index)
+                # type 5 line level, idle high
+                s.sendto(
+                    struct.pack("<HBBHH", SITL_MAGIC, 5, 4, 1, 0),
+                    ("127.0.0.1", gui_port),
+                )
             time.sleep(0.3)
-            s.sendto(
-                struct.pack("<HBB", STATE_MAGIC, 9, 0),
-                ("127.0.0.1", self.args.state_port),
-            )
+            for index in range(self.active_esc_count()):
+                _gui_port, state_port, _monitor_port = self.instance_ports(index)
+                s.sendto(
+                    struct.pack("<HBB", STATE_MAGIC, 9, 0),
+                    ("127.0.0.1", state_port),
+                )
         finally:
             s.close()
         self.log("holding the signal wire; ESC reset into the bootloader")
@@ -602,6 +712,14 @@ class Lab(object):
                 stub = msp_stub_fc.MspStubFC(
                     sitl_port=self.args.gui_port,
                     state_port=self.args.state_port,
+                    esc_ports=[
+                        self.instance_ports(index)[0]
+                        for index in range(self.active_esc_count())
+                    ],
+                    state_ports=[
+                        self.instance_ports(index)[1]
+                        for index in range(self.active_esc_count())
+                    ],
                     motor=False,
                     endpoint=endpoint,
                     verbose=False,
@@ -698,6 +816,9 @@ class Lab(object):
         self.metrics = None
         cleanup_error = self._stop_stub()
         self.runner.stop()
+        if self.launch_work is not None:
+            self.launch_work.cleanup()
+            self.launch_work = None
         self.emulator_ready = False
         self.conf_port = ""
         self.status = (
@@ -708,16 +829,16 @@ class Lab(object):
 
     def saw_log_line(self, line):
         if "input port on udp" in line:
-            self.emulator_ready = True
+            self.emulator_ready = self.emulator_ports_bound()
         if "could not bind the input port" in line:
             # the machine keeps running without its ports; fail the
             # start promptly rather than waiting out the ready timeout
             self.status = "emulator exited: " + line.strip()
             self.start_failed = True
-        if line.startswith("[emulator exited"):
+        if "[emulator exited" in line:
             # Renode may exit without a Stop click. Detach immediately rather
             # than leaving the virtual serial device present until app exit.
-            if not self.runner.running():
+            if not self._all_emulators_running():
                 with self.lifecycle_lock:
                     self.generation += 1
                 cleanup_error = self._stop_stub()
@@ -725,9 +846,11 @@ class Lab(object):
                     self.status = (
                         "emulator exited; USB cleanup failed: %s" % cleanup_error
                     )
+                self.runner.stop()
             self.emulator_ready = False
             if self.status.startswith("running"):
-                self.status = line[1:-1]
+                exit_at = line.find("[emulator exited")
+                self.status = line[exit_at + 1 : -1]
 
 
 def run_control_server(lab, port, on_command):
@@ -849,6 +972,7 @@ def main(argv=None):
     grid = QGridLayout(target_page)
 
     control_page = QWidget()
+    control_pages = [control_page]
     control_placeholder = QVBoxLayout(control_page)
     control_placeholder.addWidget(
         QLabel("Select a target to load its Renode controls.")
@@ -1152,15 +1276,33 @@ def main(argv=None):
     )
     grid.addWidget(proto_combo, 8, 1, 1, 2)
 
+    grid.addWidget(QLabel("ESCs"), 9, 0)
+    esc_count_spin = QSpinBox()
+    esc_count_spin.setRange(1, MAX_ESC_COUNT)
+    esc_count_spin.setValue(preferences.esc_count)
+    esc_count_spin.setToolTip(
+        "Number of independent Renode ESCs exposed through the fake FC.\n"
+        "Each ESC uses its own signal, state and monitor ports. This is\n"
+        "available only for FC 4-way passthrough; direct wiring reaches\n"
+        "one signal pad."
+    )
+    grid.addWidget(esc_count_spin, 9, 1)
+
+    def protocol_changed():
+        esc_count_spin.setEnabled(proto_combo.currentData() == "4way")
+
+    proto_combo.currentIndexChanged.connect(lambda _index: protocol_changed())
+    protocol_changed()
+
     # -- start/stop, status, log ---------------------------------------
     start_btn = QPushButton("Start")
     stop_btn = QPushButton("Stop")
     stop_btn.setEnabled(False)
-    grid.addWidget(start_btn, 9, 2)
-    grid.addWidget(stop_btn, 9, 3)
+    grid.addWidget(start_btn, 10, 2)
+    grid.addWidget(stop_btn, 10, 3)
     status_label = QLabel("stopped")
     status_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-    grid.addWidget(status_label, 9, 0, 1, 2)
+    grid.addWidget(status_label, 10, 0, 1, 2)
     metrics_label = QLabel("")
     metrics_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
     metrics_label.setToolTip(
@@ -1169,73 +1311,98 @@ def main(argv=None):
         "instructions actually retired per wall second against the\n"
         "configured PerformanceInMips, and the machine's virtual time."
     )
-    grid.addWidget(metrics_label, 10, 0, 1, 4)
+    grid.addWidget(metrics_label, 11, 0, 1, 4)
     log_view = QPlainTextEdit()
     log_view.setReadOnly(True)
     log_view.setMaximumBlockCount(2000)
     log_view.setMinimumSize(640, 240)
-    grid.addWidget(log_view, 11, 0, 1, 4)
+    grid.addWidget(log_view, 12, 0, 1, 4)
 
-    control_cleanup = None
+    control_cleanups = []
     control_signature = None
 
     def rebuild_control_panel():
-        nonlocal control_page, control_cleanup, control_signature
+        nonlocal control_pages, control_cleanups, control_signature
         if lab.target is None or lab.info is None:
             return
-        signature = (lab.target, bool(lab.info["dronecan"]), can_spin.value())
+        count = esc_count_spin.value() if proto_combo.currentData() == "4way" else 1
+        signature = (
+            lab.target,
+            bool(lab.info["dronecan"]),
+            can_spin.value(),
+            count,
+        )
         if signature == control_signature:
             return
-        if control_cleanup is not None:
-            control_cleanup()
-            control_cleanup = None
+        for cleanup in control_cleanups:
+            if cleanup is not None:
+                cleanup()
+        control_cleanups = []
 
-        index = tabs.indexOf(control_page)
-        selected = tabs.currentWidget() is control_page
-        tabs.removeTab(index)
-        control_page.setParent(None)
-        control_page.deleteLater()
-        control_page = QWidget()
-        tabs.insertTab(index, control_page, "Control")
-        if selected:
-            tabs.setCurrentWidget(control_page)
-
-        control_args = SimpleNamespace(
-            host="127.0.0.1",
-            port=args.gui_port,
-            state_port=args.state_port,
-            can_uri="mcast:%u" % max(0, can_spin.value()),
-            backend="renode",
-            renode_can=(bool(lab.info["dronecan"]) and can_spin.value() >= 0),
-            poles=14,
-            control_port=0,
-            log=None,
-            replay=None,
+        old_selected = tabs.currentWidget()
+        selected_control = next(
+            (index for index, page in enumerate(control_pages) if page is old_selected),
+            None,
         )
-        try:
-            control_cleanup = sitl_gui.create_ui(
-                control_args, app=app, container=control_page
+        tab_index = min(tabs.indexOf(page) for page in control_pages)
+        for page in control_pages:
+            tabs.removeTab(tabs.indexOf(page))
+            page.setParent(None)
+            page.deleteLater()
+        control_pages = []
+
+        for esc_index in range(count):
+            control_page = QWidget()
+            control_pages.append(control_page)
+            tab_name = "Control" if count == 1 else "Control%u" % (esc_index + 1)
+            index = tabs.insertTab(tab_index + esc_index, control_page, tab_name)
+            gui_port, state_port, _monitor_port = lab.instance_ports(esc_index)
+            control_args = SimpleNamespace(
+                host="127.0.0.1",
+                port=gui_port,
+                state_port=state_port,
+                can_uri="mcast:%u" % max(0, can_spin.value()),
+                backend="renode",
+                renode_can=(bool(lab.info["dronecan"]) and can_spin.value() >= 0),
+                esc_number=esc_index + 1 if count > 1 else None,
+                can_esc_index=esc_index,
+                poles=14,
+                control_port=0,
+                log=None,
+                replay=None,
             )
+            try:
+                cleanup = sitl_gui.create_ui(
+                    control_args, app=app, container=control_page
+                )
+                control_cleanups.append(cleanup)
+                tabs.setTabToolTip(
+                    index,
+                    "%s ESC %u controls on UDP %u/%u"
+                    % (lab.target, esc_index + 1, gui_port, state_port),
+                )
+            except Exception as error:
+                # create_ui publishes a partial cleanup hook before constructing
+                # optional backend resources. It may fail before it can return
+                # the normal closure, so use that hook to avoid orphaning its
+                # sockets or worker threads behind this error page.
+                abort = getattr(control_page, "_sitl_gui_abort_cleanup", None)
+                if abort is not None:
+                    abort()
+                layout = control_page.layout() or QVBoxLayout(control_page)
+                layout.addWidget(QLabel("Could not load controls: %s" % error))
+                layout.addStretch(1)
+                control_cleanups.append(None)
+                control_signature = None
+                continue
+        if selected_control is not None:
+            tabs.setCurrentWidget(control_pages[min(selected_control, count - 1)])
+        if all(cleanup is not None for cleanup in control_cleanups):
             control_signature = signature
-            tabs.setTabToolTip(
-                index,
-                "%s controls on UDP %u/%u"
-                % (lab.target, args.gui_port, args.state_port),
-            )
-        except Exception as error:
-            # create_ui publishes a partial cleanup hook before constructing
-            # optional backend resources. It may fail before it can return the
-            # normal closure, so use that hook to avoid orphaning its sockets
-            # or worker threads behind this error page.
-            abort = getattr(control_page, "_sitl_gui_abort_cleanup", None)
-            if abort is not None:
-                abort()
-            layout = control_page.layout() or QVBoxLayout(control_page)
-            layout.addWidget(QLabel("Could not load controls: %s" % error))
-            layout.addStretch(1)
-            control_signature = None
 
     can_spin.valueChanged.connect(lambda _value: rebuild_control_panel())
+    esc_count_spin.valueChanged.connect(lambda _value: rebuild_control_panel())
+    proto_combo.currentIndexChanged.connect(lambda _index: rebuild_control_panel())
 
     download_active = False
 
@@ -1297,6 +1464,7 @@ def main(argv=None):
         lab.eeprom = ee_combo.currentData()
         lab.conf = conf_combo.currentData()
         lab.protocol = proto_combo.currentData()
+        lab.esc_count = esc_count_spin.value()
         lab.can_bus = can_spin.value()
         err = lab.start()
         if err:
@@ -1306,6 +1474,8 @@ def main(argv=None):
             return
         start_btn.setEnabled(False)
         stop_btn.setEnabled(True)
+        proto_combo.setEnabled(False)
+        esc_count_spin.setEnabled(False)
 
     def do_start():
         firmware = fw_combo.currentData() or "auto"
@@ -1375,6 +1545,7 @@ def main(argv=None):
                     eeprom=ee_combo.currentData(),
                     configurator=conf_combo.currentData(),
                     protocol=proto_combo.currentData(),
+                    esc_count=esc_count_spin.value(),
                     can_bus=can_spin.value(),
                 ),
             )
@@ -1384,6 +1555,8 @@ def main(argv=None):
         lab.stop()
         start_btn.setEnabled(True)
         stop_btn.setEnabled(False)
+        proto_combo.setEnabled(True)
+        protocol_changed()
         status_label.setText(lab.status)
 
     start_btn.clicked.connect(do_start)
@@ -1607,10 +1780,23 @@ def main(argv=None):
             conf_combo.setCurrentIndex(i)
             return "OK"
         if cmd == "protocol":
+            if lab.runner.running():
+                return "ERR stop before changing protocol"
             i = proto_combo.findData(rest)
             if i < 0:
                 return "ERR protocol 4way|direct"
             proto_combo.setCurrentIndex(i)
+            return "OK"
+        if cmd == "escs":
+            if lab.runner.running():
+                return "ERR stop before changing ESC count"
+            try:
+                count = int(rest)
+            except ValueError:
+                return "ERR escs 1..%u" % MAX_ESC_COUNT
+            if not 1 <= count <= MAX_ESC_COUNT:
+                return "ERR escs 1..%u" % MAX_ESC_COUNT
+            esc_count_spin.setValue(count)
             return "OK"
         if cmd == "canbus":
             can_spin.setValue(int(rest))
@@ -1666,8 +1852,9 @@ def main(argv=None):
         app.exec()
     finally:
         save_preferences()
-        if control_cleanup is not None:
-            control_cleanup()
+        for cleanup in control_cleanups:
+            if cleanup is not None:
+                cleanup()
         lab.stop()
     return 0
 

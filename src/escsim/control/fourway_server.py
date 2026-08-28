@@ -86,12 +86,16 @@ class FourWayServer(object):
         esc_ports=None,
         host="127.0.0.1",
         state_port=57734,
+        state_ports=None,
         esc_reset=True,
         log=None,
     ):
         self.host = host
         self.esc_ports = list(esc_ports or [57733])
         self.state_port = state_port
+        self.state_ports = list(state_ports or [state_port] * len(self.esc_ports))
+        if len(self.state_ports) != len(self.esc_ports):
+            raise ValueError("state_ports must match esc_ports")
         self.esc_reset = esc_reset
         self.log = log or (lambda s: None)
         self.clients = {}
@@ -137,12 +141,13 @@ class FourWayServer(object):
     def _reset_esc(self, target):
         """ask the SITL to reset, which lands it back in the bootloader
         when it was chained with --bootloader"""
-        if not self.esc_reset or not self.state_port:
+        state_port = self.state_ports[target]
+        if not self.esc_reset or not state_port:
             return
         pkt = struct.pack("<HBB", STATE_MAGIC_CMD, STATE_CMD_RESET, 0)
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            sock.sendto(pkt, (self.host, self.state_port))
+            sock.sendto(pkt, (self.host, state_port))
         except OSError as ex:
             self.log("state port reset failed: %s" % ex)
         finally:

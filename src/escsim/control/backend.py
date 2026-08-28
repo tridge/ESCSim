@@ -13,6 +13,7 @@ import struct
 import sys
 import threading
 import time
+import weakref
 
 from . import dshot as sd
 
@@ -263,7 +264,10 @@ class CanPanel(object):
     """DroneCAN node thread: RawCommand/ArmingStatus stream, telemetry
     handlers and parameter set requests"""
 
-    def __init__(self, uri):
+    _groups = {}
+    _groups_lock = threading.Lock()
+
+    def __init__(self, uri, esc_index=0, node_id=None):
         self.uri = uri
         self.enabled = False
         self.dna_server = False
@@ -271,7 +275,8 @@ class CanPanel(object):
         self.armed = True
         self.throttle = 0.0  # 0..1
         self.rate = 50.0
-        self.esc_index = 0
+        self.esc_index = esc_index
+        self.source_node_id = self.NODE_ID if node_id is None else node_id
         self.status = {}
         self.node_id = None
         self.uptime = 0
@@ -284,10 +289,26 @@ class CanPanel(object):
         # set once make_node has spawned the IO child (or failed), so the
         # caller can sequence signal handler setup around the spawn
         self.started = threading.Event()
+        with self._groups_lock:
+            self._groups.setdefault(uri, weakref.WeakSet()).add(self)
         self.thread = threading.Thread(target=self._can_thread, daemon=True)
         self.thread.start()
 
     NODE_ID = 126
+
+    def _group_raw_commands(self):
+        """One consistent RawCommand vector shared by this bus's panels."""
+        with self._groups_lock:
+            panels = [
+                panel for panel in self._groups.get(self.uri, ()) if panel.running
+            ]
+        if not panels:
+            return [0]
+        commands = [0] * (max(panel.esc_index for panel in panels) + 1)
+        for panel in panels:
+            if panel.enabled and panel.send_rawcommand:
+                commands[panel.esc_index] = int(8191 * panel.throttle)
+        return commands
 
     def _can_thread(self):
         try:
@@ -338,7 +359,7 @@ class CanPanel(object):
             # commanding or serving DNA
             need_id = self.enabled or self.dna_server
             if need_id and node.is_anonymous:
-                node.node_id = self.NODE_ID  # NodeStatus starts here
+                node.node_id = self.source_node_id  # NodeStatus starts here
             elif not need_id and not node.is_anonymous:
                 # no public API to return to passive mode; clearing the
                 # id silences the 1Hz NodeStatus broadcast again
@@ -363,9 +384,11 @@ class CanPanel(object):
                     dronecan.uavcan.equipment.safety.ArmingStatus(status=status)
                 )
                 if self.send_rawcommand:
-                    cmds = [0] * (self.esc_index + 1)
-                    cmds[self.esc_index] = int(8191 * self.throttle)
-                    node.broadcast(dronecan.uavcan.equipment.esc.RawCommand(cmd=cmds))
+                    node.broadcast(
+                        dronecan.uavcan.equipment.esc.RawCommand(
+                            cmd=self._group_raw_commands()
+                        )
+                    )
                     self.sent.tick()
         # orderly shutdown of the mcast IO child process
         try:

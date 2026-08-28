@@ -3131,6 +3131,13 @@ def main(argv=None):
         "eeprom of a CAN target (0 = dynamic allocation, "
         "which needs an allocator on the bus)",
     )
+    ap.add_argument(
+        "--esc-index",
+        type=int,
+        default=0,
+        help="ESC_INDEX written into generated eeprom for selecting an "
+        "entry from DroneCAN esc.RawCommand (default 0)",
+    )
     ap.add_argument("--gdb-port", type=int, default=3333)
     ap.add_argument(
         "--gdb-bin", default=None, help="default: arm-none-eabi-gdb on PATH"
@@ -3350,6 +3357,8 @@ def main(argv=None):
         ap.error("--can-bus must be 0..9, or negative to disconnect")
     if not 0 <= args.can_node <= 127:
         ap.error("--can-node must be 0..127")
+    if not 0 <= args.esc_index <= 31:
+        ap.error("--esc-index must be 0..31")
     if args.sigrok:
         if not 1 <= args.sigrok_port <= 65535:
             ap.error("--sigrok-port must be 1..65535")
@@ -3379,7 +3388,11 @@ def main(argv=None):
         # signal fights set_input() over newinput and the flapping input
         # keeps resetting the arming counter.
         extra = (
-            {"CAN_NODE": args.can_node, "INPUT_SIGNAL_TYPE": 5}
+            {
+                "CAN_NODE": args.can_node,
+                "ESC_INDEX": args.esc_index,
+                "INPUT_SIGNAL_TYPE": 5,
+            }
             if cfg["dronecan"]
             else None
         )

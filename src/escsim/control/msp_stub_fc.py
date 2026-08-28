@@ -248,6 +248,7 @@ class MspStubFC(object):
         rate=500.0,
         esc_ports=None,
         state_port=57734,
+        state_ports=None,
         esc_reset=True,
         motor=True,
         verbose=False,
@@ -264,6 +265,7 @@ class MspStubFC(object):
             esc_ports=esc_ports or [sitl_port],
             host=sitl_host,
             state_port=state_port,
+            state_ports=state_ports,
             esc_reset=esc_reset,
             log=self._log,
         )
@@ -541,6 +543,11 @@ def main():
         help="SITL state port, used to reset an ESC into the bootloader (0 disables)",
     )
     parser.add_argument(
+        "--state-ports",
+        default=None,
+        help="comma separated state/reset ports matching --esc-ports",
+    )
+    parser.add_argument(
         "--no-esc-reset",
         action="store_true",
         help="never reset an ESC that does not answer",
@@ -598,6 +605,9 @@ def main():
     ports = None
     if args.esc_ports:
         ports = [int(p) for p in args.esc_ports.split(",") if p.strip()]
+    state_ports = None
+    if args.state_ports:
+        state_ports = [int(p) for p in args.state_ports.split(",") if p.strip()]
 
     endpoint = None
     if args.usbip:
@@ -630,6 +640,7 @@ def main():
             poles=args.poles,
             esc_ports=ports,
             state_port=args.state_port,
+            state_ports=state_ports,
             esc_reset=not args.no_esc_reset,
             motor=not args.no_motor,
             verbose=args.verbose,

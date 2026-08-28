@@ -6,7 +6,26 @@ import time
 
 import pytest
 
+from escsim.control import backend
 from escsim.control.backend import SimStream
+
+
+def test_can_panels_share_indexed_raw_command_vector(monkeypatch):
+    monkeypatch.setattr(backend.threading.Thread, "start", lambda _self: None)
+    first = backend.CanPanel("test:multi", esc_index=0, node_id=126)
+    third = backend.CanPanel("test:multi", esc_index=2, node_id=124)
+    first.enabled = True
+    first.throttle = 0.25
+    third.enabled = True
+    third.throttle = 0.75
+
+    assert first._group_raw_commands() == [int(8191 * 0.25), 0, int(8191 * 0.75)]
+    assert third._group_raw_commands() == first._group_raw_commands()
+    assert first.source_node_id == 126
+    assert third.source_node_id == 124
+
+    first.running = False
+    third.running = False
 
 
 def _receive_command(sock, command, timeout=2.0):

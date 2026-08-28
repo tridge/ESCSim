@@ -35,6 +35,7 @@ def test_launcher_preferences_round_trip(tmp_path):
         eeprom="blank",
         configurator="off",
         protocol="direct",
+        esc_count=8,
         can_bus=-1,
     )
     store.save(Settings(launcher=expected))
@@ -76,6 +77,8 @@ def test_control_gui_embeds_and_cleans_up(tmp_path, monkeypatch):
         can_uri="mcast:8",
         backend="renode",
         renode_can=False,
+        esc_number=2,
+        can_esc_index=1,
         poles=14,
         control_port=0,
         log=None,
@@ -95,6 +98,12 @@ def test_control_gui_embeds_and_cleans_up(tmp_path, monkeypatch):
     assert runtime["speed_slider"].value() == 150
     assert runtime["audio_output"].count() >= 1
     assert runtime["audio_status"] is not None
+    if ui.HAVE_PYQTGRAPH:
+        runtime["graph_i_check"].setChecked(True)
+        runtime["graph_rpm_check"].setChecked(True)
+        app.processEvents()
+        assert runtime["graph_windows"]["i"][0].windowTitle().endswith("ESC 2")
+        assert runtime["rpm_graph"]["win"].windowTitle().endswith("ESC 2")
     assert signal.getsignal(signal.SIGINT) == old_sigint
     models = Path(default_config_dir() / "models")
     assert (models / "default_7inch.json").is_file()

@@ -139,6 +139,34 @@ from .backend import (
 from .wave_dialog import wave_pixmap
 from escsim.settings import default_config_dir
 
+_EMBEDDED_SIGINT_LOCK = threading.Lock()
+_EMBEDDED_SIGINT_PENDING = 0
+_EMBEDDED_SIGINT_HANDLER = None
+
+
+def _begin_embedded_sigint_guard():
+    """Keep SIGINT ignored until every concurrently built CAN child starts."""
+    global _EMBEDDED_SIGINT_HANDLER, _EMBEDDED_SIGINT_PENDING
+    with _EMBEDDED_SIGINT_LOCK:
+        if _EMBEDDED_SIGINT_PENDING == 0:
+            _EMBEDDED_SIGINT_HANDLER = signal.getsignal(signal.SIGINT)
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+        _EMBEDDED_SIGINT_PENDING += 1
+    return {"active": True}
+
+
+def _end_embedded_sigint_guard(token):
+    global _EMBEDDED_SIGINT_HANDLER, _EMBEDDED_SIGINT_PENDING
+    with _EMBEDDED_SIGINT_LOCK:
+        if not token["active"]:
+            return
+        token["active"] = False
+        _EMBEDDED_SIGINT_PENDING -= 1
+        if _EMBEDDED_SIGINT_PENDING == 0:
+            signal.signal(signal.SIGINT, _EMBEDDED_SIGINT_HANDLER)
+            _EMBEDDED_SIGINT_HANDLER = None
+
+
 CAN_START_TIMEOUT_S = 5.0
 
 
@@ -696,13 +724,17 @@ def create_ui(args=None, app=None, container=None):
     owns_app = app is None
     can = None
     can_fps = None
-    previous_sigint = None
+    sigint_guard = None
     sigint_restore_timer = None
     # The emulator serves the same two wire protocols, so nearly all of
     # this UI works against it unchanged. What it cannot serve is left
     # visibly disabled rather than silently dead: a control that does
     # nothing is worse than one that says why.
     renode = args.backend == "renode"
+    esc_number = getattr(args, "esc_number", None)
+
+    def esc_title(title):
+        return "%s - ESC %u" % (title, esc_number) if esc_number is not None else title
 
     t0 = time.time()
     logf = open(args.log, "w") if args.log else None
@@ -730,8 +762,8 @@ def create_ui(args=None, app=None, container=None):
         backend_cleaned[0] = True
         if sigint_restore_timer is not None:
             sigint_restore_timer.stop()
-        if previous_sigint is not None:
-            signal.signal(signal.SIGINT, previous_sigint)
+        if sigint_guard is not None:
+            _end_embedded_sigint_guard(sigint_guard)
         ds.running = False
         runner.stop()
         sim.close()
@@ -783,14 +815,19 @@ def create_ui(args=None, app=None, container=None):
     # Ctrl-C only interrupts this process and the child is shut down
     # through node.close() instead of dying with a traceback
     if not owns_app:
-        previous_sigint = signal.getsignal(signal.SIGINT)
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
+        sigint_guard = _begin_embedded_sigint_guard()
+    else:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
     # only the emulated L431 _CAN targets have a CAN peripheral, and the
     # launcher says so with --renode-can; for any other emulated target
     # there is nothing on the other end of a DroneCAN node here
     try:
         can = (
-            CanPanel(args.can_uri)
+            CanPanel(
+                args.can_uri,
+                esc_index=getattr(args, "can_esc_index", 0),
+                node_id=126 - getattr(args, "can_esc_index", 0),
+            )
             if HAVE_DRONECAN and (not renode or args.renode_can)
             else None
         )
@@ -811,15 +848,15 @@ def create_ui(args=None, app=None, container=None):
                     ):
                         return
                     sigint_restore_timer.stop()
-                    signal.signal(signal.SIGINT, previous_sigint)
+                    _end_embedded_sigint_guard(sigint_guard)
 
                 sigint_restore_timer.timeout.connect(restore_sigint_when_started)
                 sigint_restore_timer.start(20)
     finally:
-        if previous_sigint is not None and can is None:
+        if sigint_guard is not None and can is None:
             # The CAN IO child has inherited SIG_IGN; restore the launcher's
             # handler immediately when no child had to be sequenced.
-            signal.signal(signal.SIGINT, previous_sigint)
+            _end_embedded_sigint_guard(sigint_guard)
 
     if owns_app:
         app = QApplication(sys.argv)
@@ -1881,7 +1918,7 @@ def create_ui(args=None, app=None, container=None):
                 plot,
                 [vb],
                 lambda: check.setChecked(False),
-                "AM32 SITL %s" % title,
+                esc_title("AM32 SITL %s" % title),
                 readout=[(label, vb, unit)],
             )
             # per-graph x axis span, in simulated milliseconds
@@ -1956,7 +1993,7 @@ def create_ui(args=None, app=None, container=None):
             plot,
             [p1.vb, thr_vb],
             lambda: graph_rpm_check.setChecked(False),
-            "AM32 SITL rpm / throttle",
+            esc_title("AM32 SITL rpm / throttle"),
             readout=[("rpm", p1.vb, ""), ("throttle", thr_vb, "")],
         )
         # window length control: shrink it to resolve fast waveform

@@ -44,6 +44,7 @@ class LauncherSettings:
     eeprom: str = "defaults"
     configurator: str = "serial"
     protocol: str = "4way"
+    esc_count: int = 1
     can_bus: int = 8
 
 
@@ -135,6 +136,7 @@ class SettingsStore:
             eeprom=str(launcher_raw.get("eeprom", "defaults")),
             configurator=str(launcher_raw.get("configurator", "serial")),
             protocol=str(launcher_raw.get("protocol", "4way")),
+            esc_count=int(launcher_raw.get("esc_count", 1)),
             can_bus=int(launcher_raw.get("can_bus", 8)),
         )
         if launcher.eeprom not in {"defaults", "blank"}:
@@ -143,6 +145,8 @@ class SettingsStore:
             raise ValueError("launcher configurator must be serial, usb, or off")
         if launcher.protocol not in {"4way", "direct"}:
             raise ValueError("launcher protocol must be 4way or direct")
+        if not 1 <= launcher.esc_count <= 8:
+            raise ValueError("launcher esc_count must be 1..8")
         if not -1 <= launcher.can_bus <= 9:
             raise ValueError("launcher can_bus must be -1..9")
         return Settings(

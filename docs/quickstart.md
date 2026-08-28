@@ -50,7 +50,11 @@ published images.
 ## Configurator transports
 
 - **FC with 4-way passthrough** presents a minimal flight controller and the
-  same MSP/BLHeli path used on a real vehicle.
+  same MSP/BLHeli path used on a real vehicle. Select one to eight ESCs to
+  launch that many independent Renode instances behind the same 4-way port;
+  this is useful for testing configurators against a multi-ESC vehicle. With
+  multiple ESCs, the launcher provides **Control1**, **Control2**, and so on,
+  each driving its matching ESC; graph window titles include the ESC number.
 - **Direct 1-wire adapter** presents the raw bootloader wire including adapter
   self-echo.
 - POSIX hosts can use the displayed PTY with desktop configurators.
