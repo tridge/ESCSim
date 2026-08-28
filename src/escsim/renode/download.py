@@ -228,6 +228,23 @@ def _safe_member_name(name):
         raise RuntimeError("unsafe path in Renode package: %s" % name)
 
 
+def _safe_symlink(member):
+    """Allow only relative symlinks whose target stays inside the package."""
+    link = PurePosixPath(member.linkname.replace("\\", "/"))
+    if link.is_absolute() or not link.parts:
+        raise RuntimeError("unsafe link in Renode package: %s" % member.name)
+    resolved = list(PurePosixPath(member.name.replace("\\", "/")).parts[:-1])
+    for part in link.parts:
+        if part == "..":
+            if not resolved:
+                raise RuntimeError(
+                    "unsafe link in Renode package: %s" % member.name
+                )
+            resolved.pop()
+        elif part != ".":
+            resolved.append(part)
+
+
 def _check_expanded_size(sizes):
     sizes = list(sizes)
     if len(sizes) > MAX_ARCHIVE_MEMBERS or sum(sizes) > MAX_EXTRACTED_BYTES:
@@ -242,11 +259,13 @@ def extract(archive, destination, package):
             _check_expanded_size(member.size for member in members)
             for member in members:
                 _safe_member_name(member.name)
-                if not (member.isfile() or member.isdir()):
+                if member.issym():
+                    _safe_symlink(member)
+                elif not (member.isfile() or member.isdir()):
                     raise RuntimeError(
                         "links and special files are not allowed in Renode packages"
                     )
-            bundle.extractall(destination, members=members)
+            bundle.extractall(destination, members=members, filter="data")
         executable_name = "renode"
     elif package["filename"].endswith(".zip"):
         with zipfile.ZipFile(archive) as bundle:

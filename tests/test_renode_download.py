@@ -153,8 +153,46 @@ def test_tar_path_traversal_and_links_are_rejected(tmp_path):
         info.type = tarfile.SYMTYPE
         info.linkname = "/tmp/outside"
         bundle.addfile(info)
-    with pytest.raises(RuntimeError, match="links and special"):
+    with pytest.raises(RuntimeError, match="unsafe link"):
         download.extract(linked, tmp_path / "linked", package)
+
+    escaping = tmp_path / "escaping.tar.gz"
+    with tarfile.open(escaping, "w:gz") as bundle:
+        info = tarfile.TarInfo("renode/link")
+        info.type = tarfile.SYMTYPE
+        info.linkname = "../../outside"
+        bundle.addfile(info)
+    with pytest.raises(RuntimeError, match="unsafe link"):
+        download.extract(escaping, tmp_path / "escaping", package)
+
+    hard = tmp_path / "hard.tar.gz"
+    with tarfile.open(hard, "w:gz") as bundle:
+        info = tarfile.TarInfo("renode/link")
+        info.type = tarfile.LNKTYPE
+        info.linkname = "renode/renode"
+        bundle.addfile(info)
+    with pytest.raises(RuntimeError, match="links and special"):
+        download.extract(hard, tmp_path / "hard", package)
+
+
+def test_tar_internal_symlink_is_extracted(tmp_path):
+    archive = tmp_path / "internal.tar.gz"
+    with tarfile.open(archive, "w:gz") as bundle:
+        info = tarfile.TarInfo("renode/renode")
+        data = b"#!/bin/sh\n"
+        info.size = len(data)
+        bundle.addfile(info, io.BytesIO(data))
+        info = tarfile.TarInfo("renode/plugins/lib/socket-cpp")
+        info.type = tarfile.SYMTYPE
+        info.linkname = "../../renode"
+        bundle.addfile(info)
+    package = {"filename": "renode.tar.gz", "platform": "linux"}
+    destination = tmp_path / "internal"
+    executable = download.extract(archive, destination, package)
+    assert executable == destination / "renode" / "renode"
+    link = destination / "renode" / "plugins" / "lib" / "socket-cpp"
+    assert link.is_symlink()
+    assert link.resolve() == executable.resolve()
 
 
 def test_zip_path_traversal_and_links_are_rejected(tmp_path):
