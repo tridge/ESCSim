@@ -25,6 +25,7 @@ magic addresses for CMD_SET_ADDRESS (protocol v2+):
 
 import os
 import struct
+import time
 
 from . import dshot as sd
 
@@ -206,6 +207,18 @@ class FourWay(object):
         self.port.send_serial(with_crc(bytes([CMD_KEEP_ALIVE, 0])))
         return self._ack(timeout) == ACK_BAD_CMD  # 0xC1 by protocol
 
-    def run(self):
-        """CMD_RUN: ask the bootloader to jump to the application"""
+    def run(self, timeout=2.0):
+        """CMD_RUN: ask the bootloader to jump to the application.
+
+        Renode reports when queued serial bytes have physically left the
+        emulated wire.  Wait for that marker before the FC resumes DShot;
+        otherwise DShot can leave serial mode midway through this final
+        four-byte command and strand the ESC in its bootloader.
+        """
+        tx_done = self.port.tx_done_count
+        reports_tx_done = tx_done > 0
         self.port.send_serial(bytes([CMD_RUN, 0, 0, 0]))
+        if reports_tx_done:
+            deadline = time.monotonic() + timeout
+            while self.port.tx_done_count == tx_done and time.monotonic() < deadline:
+                time.sleep(0.001)

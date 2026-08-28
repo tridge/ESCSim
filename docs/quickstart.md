@@ -55,6 +55,10 @@ published images.
   this is useful for testing configurators against a multi-ESC vehicle. With
   multiple ESCs, the launcher provides **Control1**, **Control2**, and so on,
   each driving its matching ESC; graph window titles include the ESC number.
+  Configurator motor-test panels can leave 4-way mode and use MSP motor
+  control on the same connection. Their motor values drive the corresponding
+  simulated ESCs after a short zero-throttle arming interval, until another
+  4-way session starts or MSP becomes inactive.
 - **Direct 1-wire adapter** presents the raw bootloader wire including adapter
   self-echo.
 - POSIX hosts can use the displayed PTY with desktop configurators.

@@ -2545,7 +2545,7 @@ def create_ui(args=None, app=None, container=None):
             sitl_host=args.host,
             sitl_port=args.port,
             state_port=args.state_port,
-            motor=False,
+            motor=True,
             poles=args.poles,
             endpoint=sitl_usbip.UsbipServer(
                 unix_path="@am32-sitl-usbip.%u.%u" % (os.getuid(), os.getpid()),

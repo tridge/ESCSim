@@ -210,3 +210,26 @@ def test_emulator_exit_during_multi_start_does_not_leave_starting_status():
     lab.saw_log_line("[ESC 3] [emulator exited, status 2]")
 
     assert lab.status == "emulator exited, status 2"
+
+
+def test_fourway_stub_enables_msp_motor_output(monkeypatch):
+    lab = make_lab()
+    lab.runner = FakeRunner(running=True)
+    lab.conf = "serial"
+    lab.protocol = "4way"
+    lab.esc_count = 3
+    lab.generation = 7
+    created = []
+
+    def make_stub(*_args, **kwargs):
+        created.append(kwargs)
+        return FakeStub()
+
+    monkeypatch.setattr(gui.msp_stub_fc, "MspStubFC", make_stub)
+
+    lab._start_stub(7)
+
+    assert created[0]["motor"] is True
+    assert created[0]["esc_ports"] == [57833, 57843, 57853]
+    assert lab.stub is not None
+    lab._stop_stub()

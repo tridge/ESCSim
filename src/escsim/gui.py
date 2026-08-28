@@ -720,7 +720,7 @@ class Lab(object):
                         self.instance_ports(index)[1]
                         for index in range(self.active_esc_count())
                     ],
-                    motor=False,
+                    motor=True,
                     endpoint=endpoint,
                     verbose=False,
                 )

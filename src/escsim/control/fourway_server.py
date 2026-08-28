@@ -244,6 +244,13 @@ class FourWayServer(object):
         if cmd == CMD_INTERFACE_GET_VERSION:
             return self._reply(cmd, address, list(INTERFACE_VERSION), ACK_OK)
         if cmd == CMD_INTERFACE_EXIT:
+            # A real FC releases each signal wire when passthrough ends.  The
+            # AM32 bootloader then runs the application; explicitly issue its
+            # RUN command here because the simulated wire has no electrical
+            # release/timeout event to provide that transition for us.
+            for target in tuple(self.connected):
+                self._client(target).run()
+            self.connected.clear()
             self.exited = True
             return self._reply(cmd, address, [0], ACK_OK)
         if cmd == CMD_INTERFACE_SET_MODE:

@@ -27,8 +27,10 @@ that only accept USB serial ports, the browser included.
 """
 
 import argparse
+from dataclasses import dataclass
 import os
 import select
+import socket
 import struct
 import sys
 import threading
@@ -47,12 +49,21 @@ MSP_API_VERSION = 1
 MSP_FC_VARIANT = 2
 MSP_FEATURE_CONFIG = 36
 MSP_STATUS = 101
+MSP_MOTOR = 104
 MSP_BOXIDS = 119
 MSP_MOTOR_CONFIG = 131
 MSP_MOTOR_TELEMETRY = 139
 MSP_BATTERY_STATE = 130
 MSP_SET_MOTOR = 214
 MSP_SET_PASSTHROUGH = 245
+
+# ArduPilot releases motor control when the configurator stops sending MSP.
+# Apart from being faithful to the FC we emulate, this prevents a stale slider
+# value from fighting the launcher's native Control tabs indefinitely.
+MOTOR_ACTIVE_TIMEOUT = 1.0
+# Fallback for a backend that does not answer Renode's armed-state query.  A
+# real Renode run uses the observed firmware flag instead of wall-clock time.
+MOTOR_ARM_TIME = 1.5
 
 # USB identity for --direct: a vendor id the web configurator treats as
 # a direct single-wire adapter (WCH), with a product id no kernel
@@ -239,6 +250,71 @@ class DirectBridge(object):
         self.port.close()
 
 
+@dataclass
+class MotorState:
+    value: int = 1000
+    rpm: int = 0
+    invalid: float = 100.0
+    temp: float = 0
+    volt_raw: int = 0
+    curr_raw: int = 0
+    edt_seen: bool = False
+    last_edt_cmd: float = 0.0
+    output_ready: bool = False
+
+
+class RenodeArmingProbe:
+    """Read each ESC's real armed flag without subscribing to its scope."""
+
+    MAGIC_CMD = 0x5353
+    MAGIC_INFO = 0x5359
+    REQUEST_INTERVAL = 0.1
+
+    def __init__(self, host, state_ports):
+        self.addresses = [(host, port) for port in state_ports if port]
+        self.indices = {}
+        for index, port in enumerate(state_ports):
+            if port:
+                self.indices.setdefault(port, []).append(index)
+        self.armed = [None] * len(state_ports)
+        self.last_request = 0.0
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.setblocking(False)
+
+    def reset(self):
+        self.armed = [None] * len(self.armed)
+        self.last_request = 0.0
+
+    def poll(self, now):
+        if now - self.last_request >= self.REQUEST_INTERVAL:
+            request = struct.pack("<HBB", self.MAGIC_CMD, 10, 0)
+            for address in self.addresses:
+                try:
+                    self.sock.sendto(request, address)
+                except OSError:
+                    pass
+            self.last_request = now
+        while True:
+            try:
+                data, address = self.sock.recvfrom(512)
+            except BlockingIOError:
+                break
+            except OSError:
+                break
+            if len(data) < 20:
+                continue
+            magic, command, flags = struct.unpack_from("<HBB", data)
+            if magic != self.MAGIC_INFO or command != 9:
+                continue
+            for index in self.indices.get(address[1], ()):
+                self.armed[index] = bool(flags & 4)
+        return list(self.armed)
+
+    def close(self):
+        self.sock.close()
+
+
 class MspStubFC(object):
     def __init__(
         self,
@@ -259,10 +335,11 @@ class MspStubFC(object):
         self.rate = rate
         self.verbose = verbose
         self.tracing = trace or os.environ.get("AM32_FC_TRACE") == "1"
+        self.esc_ports = list(esc_ports or [sitl_port])
         # the ESCs reachable over 4-way passthrough: one SITL input port
         # each, defaulting to the one we drive with DShot
         self.fourway = sitl_fourway_server.FourWayServer(
-            esc_ports=esc_ports or [sitl_port],
+            esc_ports=self.esc_ports,
             host=sitl_host,
             state_port=state_port,
             state_ports=state_ports,
@@ -270,25 +347,34 @@ class MspStubFC(object):
             log=self._log,
         )
         self.in_fourway = False
+        self.motor_lock = threading.Lock()
+        # The real FC keeps sending disarmed (zero-throttle) DShot after
+        # leaving 4-way mode and after an MSP motor-command timeout.  Do not
+        # start it before the first interface exit: Renode initially parks the
+        # ESCs in their bootloaders, where 4-way must own the signal wires.
+        self.motor_output_enabled = False
+        self.motor_active = False
+        self.last_motor_command = 0.0
+        self.motor_arming_until = 0.0
         # set to stop updating the telemetry while still answering MSP,
         # reproducing Betaflight serving its cached values after the
         # BDShot replies stop arriving (it never marks them stale)
         self.freeze = False
-        self.port = sd.InputPort(sitl_host, sitl_port)
-        self.motor_value = 1000  # latest MSP_SET_MOTOR, motor 1
-        self.rpm = 0
-        # raw EDT bytes as Betaflight caches them: voltage in 0.25V
-        # steps, current in the ESC's own units (AM32: 0.5A), temp in C
-        self.volt_raw = 0
-        self.curr_raw = 0
-        self.temp = 0
-        self.invalid = 100.0  # no telemetry until frames arrive
-        self.edt_seen = False
-        self.last_edt_cmd = 0.0
+        self.ports = [sd.InputPort(sitl_host, port) for port in self.esc_ports]
+        self.port = self.ports[0]  # compatibility for single-ESC callers
+        self.motors = [MotorState() for _port in self.ports]
+        self.arming_probe = None
+        if motor:
+            try:
+                self.arming_probe = RenodeArmingProbe(
+                    sitl_host, self.fourway.state_ports
+                )
+            except OSError:
+                pass
         self.running = True
         self.ep = endpoint if endpoint is not None else PtyEndpoint()
-        # driving DShot at the ESC would fight the 4-way session for the
-        # signal wire, so it can be left off for pure configurator work
+        # DShot remains dormant until motor control begins or 4-way exits, and
+        # pauses while the same signal wires are used by another 4-way session.
         self.dshot_thread = None
         if motor:
             self.dshot_thread = threading.Thread(target=self._dshot_loop, daemon=True)
@@ -319,6 +405,7 @@ class MspStubFC(object):
 
     def close(self):
         self.running = False
+        self._stop_motor_control()
         # Do not close a pty descriptor under a blocking read in another
         # thread: close() itself can wait for that read forever on macOS.
         # _msp_loop polls with a short timeout, so both workers can leave
@@ -326,70 +413,197 @@ class MspStubFC(object):
         self.msp_thread.join(0.5)
         if self.dshot_thread is not None:
             self.dshot_thread.join(0.5)
+        self._stop_motor_control()
         self.fourway.close()
+        if self.arming_probe is not None:
+            self.arming_probe.close()
         self.ep.close()
-        self.port.close()
+        for port in self.ports:
+            port.close()
 
     # -- DShot side ----------------------------------------------------
 
-    def _dshot_value(self):
-        """BF motor value 1000..2000 -> 11 bit DShot throttle"""
-        v = self.motor_value
-        if v <= 1000:
-            return 0
-        return 48 + int((min(v, 2000) - 1000) * (2047 - 48) / 1000)
+    @property
+    def motor_value(self):
+        return self.motors[0].value
 
-    def _dshot_loop(self):
-        nxt = time.time()
-        while self.running:
-            now = time.time()
-            burst = 0
-            while now >= nxt and burst < 10:
-                nxt += 1.0 / self.rate
-                value = self._dshot_value()
-                # maintain EDT while stopped, like a real FC with
-                # dshot_edt on (the firmware ignores commands once
-                # spinning)
-                if value == 0 and not self.edt_seen and now - self.last_edt_cmd > 0.5:
-                    self.last_edt_cmd = now
+    @motor_value.setter
+    def motor_value(self, value):
+        self.motors[0].value = value
+
+    @property
+    def rpm(self):
+        return self.motors[0].rpm
+
+    @rpm.setter
+    def rpm(self, value):
+        self.motors[0].rpm = value
+
+    @property
+    def invalid(self):
+        return self.motors[0].invalid
+
+    @invalid.setter
+    def invalid(self, value):
+        self.motors[0].invalid = value
+
+    @property
+    def temp(self):
+        return self.motors[0].temp
+
+    @temp.setter
+    def temp(self, value):
+        self.motors[0].temp = value
+
+    @property
+    def volt_raw(self):
+        return self.motors[0].volt_raw
+
+    @volt_raw.setter
+    def volt_raw(self, value):
+        self.motors[0].volt_raw = value
+
+    @property
+    def curr_raw(self):
+        return self.motors[0].curr_raw
+
+    @curr_raw.setter
+    def curr_raw(self, value):
+        self.motors[0].curr_raw = value
+
+    @staticmethod
+    def _dshot_value(value):
+        """BF motor value 1000..2000 -> 11 bit DShot throttle"""
+        if value <= 1000:
+            return 0
+        return 48 + int((min(value, 2000) - 1000) * (2047 - 48) / 1000)
+
+    def _motor_snapshot(self, now=None):
+        """Return the FC outputs, timing active MSP throttle out safely."""
+        now = time.monotonic() if now is None else now
+        with self.motor_lock:
+            observed = (
+                self.arming_probe.poll(now) if self.arming_probe is not None else None
+            )
+            if observed is not None:
+                for index, armed in enumerate(observed):
+                    if armed:
+                        self.motors[index].output_ready = True
+            ready = [
+                motor.output_ready
+                or (
+                    (observed is None or observed[index] is None)
+                    and now >= self.motor_arming_until
+                )
+                for index, motor in enumerate(self.motors)
+            ]
+            # Renode may run below real time when several ESCs are active.
+            # Preserve the first requested throttle until the firmware has
+            # actually completed its one-second emulated arming interval.
+            waiting_to_arm = self.motor_active and any(
+                motor.value > 1000 and not ready[index]
+                for index, motor in enumerate(self.motors)
+            )
+            if waiting_to_arm:
+                self.last_motor_command = now
+            if (
+                self.motor_active
+                and now - self.last_motor_command > MOTOR_ACTIVE_TIMEOUT
+            ):
+                self.motor_active = False
+                self.motor_arming_until = 0.0
+                for motor in self.motors:
+                    motor.value = 1000
+            if self.in_fourway or not self.motor_output_enabled:
+                return None
+            if not self.motor_active:
+                return [1000] * len(self.motors)
+            if waiting_to_arm:
+                return [1000] * len(self.motors)
+            return [
+                motor.value if ready[index] else 1000
+                for index, motor in enumerate(self.motors)
+            ]
+
+    def _stop_motor_control(self):
+        with self.motor_lock:
+            self.motor_output_enabled = False
+            self.motor_active = False
+            self.motor_arming_until = 0.0
+            for motor in self.motors:
+                motor.value = 1000
+                motor.output_ready = False
+
+    def _send_motor_cycle(self, values, now):
+        # Serialize a complete output cycle against MSP_SET_PASSTHROUGH. Once
+        # that handler marks in_fourway, no later DShot packet can land in the
+        # serial transaction on any ESC wire.
+        with self.motor_lock:
+            if self.in_fourway or not self.motor_output_enabled:
+                return False
+            for index, port in enumerate(self.ports):
+                value = self._dshot_value(values[index])
+                motor = self.motors[index]
+                # maintain EDT while stopped, like a real FC with dshot_edt on
+                # (the firmware ignores commands once spinning)
+                if value == 0 and not motor.edt_seen and now - motor.last_edt_cmd > 0.5:
+                    motor.last_edt_cmd = now
                     for _ in range(20):
-                        self.port.send_dshot(
+                        port.send_dshot(
                             sd.DSHOT_CMD_EDT_ENABLE,
                             ptype=sd.TYPE_DSHOT600,
                             telem=True,
                             bidir=True,
                         )
-                        burst += 1
                     continue
-                self.port.send_dshot(value, ptype=sd.TYPE_DSHOT600, bidir=True)
-                burst += 1
+                port.send_dshot(value, ptype=sd.TYPE_DSHOT600, bidir=True)
+        return True
+
+    def _dshot_loop(self):
+        nxt = time.time()
+        while self.running:
+            now = time.time()
+            values = self._motor_snapshot()
+            if values is None:
+                nxt = now
+                self._drain_replies()
+                time.sleep(0.002)
+                continue
+            cycles = 0
+            while now >= nxt and cycles < 10:
+                nxt += 1.0 / self.rate
+                if not self._send_motor_cycle(values, now):
+                    break
+                cycles += 1
             if now - nxt > 0.25:
                 nxt = now
             self._drain_replies()
             time.sleep(0.0005)
 
     def _drain_replies(self):
-        if self.freeze:
-            self.port.get_replies()  # discard, keep the cached values
-            return
-        for r in self.port.get_replies():
-            kind, val = sd.decode_reply(r[3], edt_expected=True)
-            if kind == "erpm":
-                self.rpm = int(sd.erpm_period_to_rpm(val, self.poles))
-                self.invalid = max(0.0, self.invalid - 1.0)
-            elif kind == "temp":
-                self.temp = val
-                self.edt_seen = True
-            elif kind == "volt":
-                self.volt_raw = int(round(val / 0.25))
-                self.edt_seen = True
-            elif kind == "current":
-                self.curr_raw = int(round(val / 0.5))
-                self.edt_seen = True
-            elif kind == "edt":
-                self.edt_seen = True
-            elif kind == "badcrc":
-                self.invalid = min(100.0, self.invalid + 0.1)
+        for index, port in enumerate(self.ports):
+            replies = port.get_replies()
+            if self.freeze:
+                continue  # discard, keep the cached values
+            motor = self.motors[index]
+            for r in replies:
+                kind, val = sd.decode_reply(r[3], edt_expected=True)
+                if kind == "erpm":
+                    motor.rpm = int(sd.erpm_period_to_rpm(val, self.poles))
+                    motor.invalid = max(0.0, motor.invalid - 1.0)
+                elif kind == "temp":
+                    motor.temp = val
+                    motor.edt_seen = True
+                elif kind == "volt":
+                    motor.volt_raw = int(round(val / 0.25))
+                    motor.edt_seen = True
+                elif kind == "current":
+                    motor.curr_raw = int(round(val / 0.5))
+                    motor.edt_seen = True
+                elif kind == "edt":
+                    motor.edt_seen = True
+                elif kind == "badcrc":
+                    motor.invalid = min(100.0, motor.invalid + 0.1)
 
     # -- MSP side ------------------------------------------------------
 
@@ -414,6 +628,13 @@ class MspStubFC(object):
             self._reply(cmd, bytes([0]))  # one box: ARM
         elif cmd == MSP_FEATURE_CONFIG:
             self._reply(cmd, struct.pack("<I", 0))  # no 3D mode
+        elif cmd == MSP_MOTOR:
+            # MSP v1 has eight fixed motor slots. ArduPilot fills the active
+            # channels and leaves the rest at zero.
+            with self.motor_lock:
+                values = [motor.value for motor in self.motors]
+            values += [0] * (8 - len(values))
+            self._reply(cmd, struct.pack("<8H", *values[:8]))
         elif cmd == MSP_MOTOR_CONFIG:
             self._reply(
                 cmd,
@@ -430,35 +651,51 @@ class MspStubFC(object):
             )
         elif cmd == MSP_MOTOR_TELEMETRY:
             out = bytes([self.fourway.esc_count])
-            for i in range(self.fourway.esc_count):
-                if i == 0:
-                    # matches Betaflight's DShot telemetry serialisation:
-                    # voltage is the 0.25V-step EDT value >> 2, current
-                    # is the raw EDT byte (msp.c MSP_MOTOR_TELEMETRY)
-                    out += struct.pack(
-                        "<IHBHHH",
-                        self.rpm,
-                        int(self.invalid * 100),
-                        int(self.temp),
-                        self.volt_raw >> 2,
-                        self.curr_raw,
-                        0,
-                    )
-                else:
-                    # unused outputs: no telemetry at all
-                    out += struct.pack("<IHBHHH", 0, 10000, 0, 0, 0, 0)
+            for motor in self.motors:
+                # matches Betaflight's DShot telemetry serialisation:
+                # voltage is the 0.25V-step EDT value >> 2, current
+                # is the raw EDT byte (msp.c MSP_MOTOR_TELEMETRY)
+                out += struct.pack(
+                    "<IHBHHH",
+                    motor.rpm,
+                    int(motor.invalid * 100),
+                    int(motor.temp),
+                    motor.volt_raw >> 2,
+                    motor.curr_raw,
+                    0,
+                )
             self._reply(cmd, out)
         elif cmd == MSP_BATTERY_STATE:
             # cells, capacity, voltage in 0.1V, mAh drawn, current in 0.01A
             self._reply(cmd, struct.pack("<BHBHH", 4, 1500, 126, 0, 0))
         elif cmd == MSP_SET_PASSTHROUGH:
+            with self.motor_lock:
+                self.in_fourway = True
+                self.motor_output_enabled = False
+                self.motor_active = False
+                self.motor_arming_until = 0.0
+                for motor in self.motors:
+                    motor.value = 1000
+                    motor.output_ready = False
+                if self.arming_probe is not None:
+                    self.arming_probe.reset()
             self.fourway.begin()
             self._reply(cmd, bytes([self.fourway.esc_count]))
             self._log("4-way passthrough to %u ESC(s)" % self.fourway.esc_count)
-            self.in_fourway = True
         elif cmd == MSP_SET_MOTOR:
-            if len(payload) >= 2:
-                self.motor_value = struct.unpack("<H", payload[0:2])[0]
+            count = min(len(payload) // 2, len(self.motors))
+            if count:
+                with self.motor_lock:
+                    now = time.monotonic()
+                    if not self.motor_output_enabled:
+                        self.motor_output_enabled = True
+                        self.motor_arming_until = now + MOTOR_ARM_TIME
+                    for index in range(count):
+                        self.motors[index].value = struct.unpack_from(
+                            "<H", payload, index * 2
+                        )[0]
+                    self.last_motor_command = max(now, self.motor_arming_until)
+                    self.motor_active = True
             self._reply(cmd)
         else:
             self.ep.write(b"$M!" + struct.pack("<BB", 0, cmd) + bytes([cmd]))
@@ -491,7 +728,16 @@ class MspStubFC(object):
                 return
         if self.fourway.exited:
             self._log("4-way interface exited")
-            self.in_fourway = False
+            with self.motor_lock:
+                self.in_fourway = False
+                self.motor_output_enabled = True
+                self.motor_active = False
+                self.motor_arming_until = time.monotonic() + MOTOR_ARM_TIME
+                for motor in self.motors:
+                    motor.value = 1000
+                    motor.output_ready = False
+                if self.arming_probe is not None:
+                    self.arming_probe.reset()
 
     def _msp_loop(self):
         buf = b""
