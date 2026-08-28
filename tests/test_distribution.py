@@ -13,6 +13,9 @@ def test_required_runtime_resources_are_package_owned():
         package.joinpath("renode", "resources", "platforms", "stm32l431_base.repl"),
         package.joinpath("renode", "resources", "scripts", "am32_l431.resc"),
         package.joinpath(
+            "renode", "resources", "FC_Firmware", "SPEEDYBEEF405V5.hex"
+        ),
+        package.joinpath(
             "renode", "resources", "peripherals", "common", "AM32_GuiLink.cs"
         ),
     )
@@ -25,6 +28,7 @@ def test_packaging_declares_native_library_and_frozen_entrypoint():
     spec = (root / "packaging" / "escsim.spec").read_text()
     entrypoint = (root / "src" / "escsim" / "__main__.py").read_text()
     assert '"renode/lib/*"' in pyproject
+    assert '"renode/resources/FC_Firmware/*.hex"' in pyproject
     assert 'collect_data_files("escsim")' in spec
     assert 'collect_data_files("dronecan"' in spec
     assert '.glob("*.py")' in spec

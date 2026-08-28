@@ -61,6 +61,14 @@ published images.
   active until another 4-way session starts or the simulator connection closes.
 - **Direct 1-wire adapter** presents the raw bootloader wire including adapter
   self-echo.
+- **FlightController** runs the selected board firmware in an additional Renode
+  machine and connects its first four motor timer outputs to independent
+  AM32 ESC machines. Select **SpeedyBeeF405Mini** in **FlightController**;
+  **Protocol** is then fixed to **FlightController**. The ESC count remains
+  selectable from one to eight; this board's modeled outputs drive ESCs 1-4,
+  while any remaining ESCs are available through their Control tabs.
+  The FC's own USB stack is exposed to the host, so ground stations and web
+  tools see the same USB descriptors and protocols as the firmware implements.
 - POSIX hosts can use the displayed PTY with desktop configurators.
 - Linux virtual USB uses `vhci_hcd`; run the explicit USB/IP rule installer
   only if browser access is needed and the documented local privilege tradeoff
@@ -68,6 +76,26 @@ published images.
 - Windows virtual USB is opt-in. The interactive installer offers the bundled,
   SHA-256-verified usbip-win2 0.9.7.7 client when it is missing and warns before
   starting its elevated driver setup.
+
+## Flight-controller DFU
+
+**FC Firmware** selects an image to preload for a direct, non-DFU start. The
+bundled initial choice is Betaflight 2026.6.1 for `SPEEDYBEEF405V5` (revision
+`6dbc4218f`). Re-selecting the same image preserves configuration stored beyond
+its programmed HEX ranges. Future images are reserved under
+`https://firmware.ardupilot.org/Tools/AM32-tools/ESCSim/FC_Firmware/`.
+
+Selecting **Boot in USB DFU** exposes the STM32 ROM-style `0483:df11` DfuSe
+device instead of starting the FC. A successful DFU manifestation disconnects
+that device, starts Renode from the persistent emulated flash, and attaches the
+USB device created by the uploaded bootloader or application. Firmware can be
+loaded with the Betaflight web tool or a normal `dfu-util`/DfuSe workflow.
+
+The emulated FC flash persists in ESCSim's cache across Stop/Start. This permits
+the usual two-stage ArduPilot workflow: upload a SpeedyBeeF405Mini bootloader in
+DFU mode, then upload `arducopter.apj` through the bootloader's USB serial
+endpoint. Sensors return fixed bench values (including a nominal 12 V supply),
+while the four motor outputs and bidirectional DShot capture paths remain live.
 
 ## Command line
 

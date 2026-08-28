@@ -28,12 +28,31 @@ def test_elapsed_and_metrics_parsing():
 0x00123456
 Elapsed Virtual Time: 00:00:12.500
 Elapsed Host Time: 00:00:10.000
+0x00000100
+0x00000080
+0x00000040
 """
     metrics = parse_metrics(text)
     assert metrics["pc"] == 0x08001234
     assert metrics["mips"] == 0x30
     assert metrics["virtual_seconds"] == 12.5
     assert metrics["host_seconds"] == 10.0
+    assert metrics["dshot_frames"] == 256
+    assert metrics["dshot_replies"] == 128
+    assert metrics["dshot_injected"] == 64
+
+
+def test_metrics_parser_rejects_ambiguous_extra_hex_values():
+    text = """
+0x08001234
+0x00000030
+0x00123456
+Elapsed Virtual Time: 00:00:12.500
+Elapsed Host Time: 00:00:10.000
+0x00000001
+"""
+    with pytest.raises(ValueError, match="incomplete Renode monitor metrics"):
+        parse_metrics(text)
 
 
 def test_monitor_text_and_startup_error():

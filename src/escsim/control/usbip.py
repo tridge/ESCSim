@@ -94,6 +94,8 @@ BUSNUM = 1
 DEVNUM = 1
 
 VHCI = "/sys/devices/platform/vhci_hcd.0"
+SYS_USB_DEVICES = "/sys/bus/usb/devices"
+DEV_ROOT = "/dev"
 VDEV_ST_NULL = "004"  # a free port in the status table
 IS_WINDOWS = os.name == "nt"
 WINDOWS_USBIP_TIMEOUT = 15
@@ -243,6 +245,13 @@ class UsbipServer(object):
         rx_max=65536,
         vid=VENDOR_ID,
         pid=PRODUCT_ID,
+        manufacturer=MANUFACTURER,
+        product=PRODUCT,
+        config_descriptor=CONFIG_DESCRIPTOR,
+        interfaces=((0x02, 0x02, 0x01), (0x0A, 0x00, 0x00)),
+        device_class=0x02,
+        device_subclass=0x00,
+        device_protocol=0x00,
     ):
         self.log = log or (lambda s: None)
         self.rx_max = rx_max
@@ -251,8 +260,17 @@ class UsbipServer(object):
         # treats some vendors as direct single-wire adapters rather
         # than flight controllers
         self.vid, self.pid = vid, pid
-        self.descriptor = device_descriptor(vid, pid)
-        self.strings = [MANUFACTURER, PRODUCT, serial]
+        self.descriptor = bytearray(device_descriptor(vid, pid))
+        self.descriptor[4:7] = bytes(
+            (device_class, device_subclass, device_protocol)
+        )
+        self.descriptor = bytes(self.descriptor)
+        self.config_descriptor = bytes(config_descriptor)
+        self.interfaces = tuple(tuple(item) for item in interfaces)
+        self.device_class = device_class
+        self.device_subclass = device_subclass
+        self.device_protocol = device_protocol
+        self.strings = [manufacturer, product, serial]
         self.rx = b""
         self.rx_lock = threading.Condition()
         self.tx_held = b""  # bytes with no urb to carry them yet
@@ -500,20 +518,16 @@ class UsbipServer(object):
             self.vid,
             self.pid,
             0x0100,
-            0x02,
-            0x00,
-            0x00,  # device class/subclass/proto
+            self.device_class,
+            self.device_subclass,
+            self.device_protocol,
             1,
             1,
-            2,
-        )  # config value, configs, ifaces
+            len(self.interfaces),
+        )  # config value, configs, interfaces
 
-    @staticmethod
-    def _usb_interfaces():
-        return (
-            bytes([0x02, 0x02, 0x01, 0])  # communication
-            + bytes([0x0A, 0x00, 0x00, 0])
-        )  # data
+    def _usb_interfaces(self):
+        return b"".join(bytes((*interface, 0)) for interface in self.interfaces)
 
     def _ret_submit(self, seqnum, status, data=b"", actual_length=None):
         """caller must hold send_lock"""
@@ -615,7 +629,7 @@ class UsbipServer(object):
             if dtype == 1:
                 return ST_OK, self.descriptor[:wlength]
             if dtype == 2:
-                return ST_OK, CONFIG_DESCRIPTOR[:wlength]
+                return ST_OK, self.config_descriptor[:wlength]
             if dtype == 3:
                 desc = self._string_descriptor(dindex)
                 if desc is None:
@@ -904,6 +918,8 @@ def attach(unix_path=None, host="127.0.0.1", port=3240, busid=BUSID):
             os.path.abspath(__file__),
             "--attach-to",
             unix_path if unix_path is not None else "%s:%u" % (host, port),
+            "--busid",
+            busid,
         ]
         result = subprocess.run(cmd, check=False, capture_output=True, text=True)
         if result.returncode != 0:
@@ -932,7 +948,7 @@ def attach(unix_path=None, host="127.0.0.1", port=3240, busid=BUSID):
 
 
 def _usb_identity(local_busid):
-    device = Path("/sys/bus/usb/devices", local_busid)
+    device = Path(SYS_USB_DEVICES, local_busid)
 
     def attribute(name):
         try:
@@ -953,6 +969,83 @@ def _our_vhci_ports():
         if _usb_identity(fields[6]) == (MANUFACTURER, PRODUCT):
             ports.append(int(fields[1]))
     return ports
+
+
+def port_attached(port):
+    """Whether an exact Linux VHCI port still owns an imported device.
+
+    Callers already own ``port``; this deliberately does no fuzzy USB
+    identity matching.  usbip-win2's one-shot helper maintains its own device
+    lifecycle, so Windows callers conservatively treat an owned port as live.
+    """
+    if IS_WINDOWS:
+        return True
+    if port is None or isinstance(port, bool):
+        return False
+    try:
+        with open(os.path.join(VHCI, "status")) as status:
+            lines = status.read().splitlines()[1:]
+    except OSError:
+        return False
+    for line in lines:
+        fields = line.split()
+        if len(fields) >= 3 and int(fields[1]) == port:
+            return fields[2] != VDEV_ST_NULL
+    return False
+
+
+def find_tty_on_port(port, timeout=10.0):
+    """Find the serial node belonging to one exact Linux VHCI port.
+
+    Product strings are not unique: a developer can have a physical
+    ArduPilot board connected while testing this emulated one.  The VHCI
+    status table provides the imported device's host bus ID, which lets us
+    follow only that device's USB interfaces into sysfs.
+    """
+    if IS_WINDOWS or port is None or isinstance(port, bool):
+        return None
+    deadline = time.time() + timeout
+    while True:
+        busid = None
+        try:
+            lines = Path(VHCI, "status").read_text().splitlines()[1:]
+        except OSError:
+            lines = []
+        for line in lines:
+            fields = line.split()
+            if (
+                len(fields) >= 7
+                and int(fields[1]) == port
+                and fields[2] != VDEV_ST_NULL
+                and fields[6] != "0-0"
+            ):
+                busid = fields[6]
+                break
+        if busid is not None:
+            sysfs = Path(SYS_USB_DEVICES)
+            names = sorted(
+                path.name
+                for interface in sysfs.glob(f"{busid}:*/tty")
+                for path in interface.iterdir()
+            )
+            for name in names:
+                device = Path(DEV_ROOT, name)
+                by_id = Path(DEV_ROOT, "serial", "by-id")
+                try:
+                    links = sorted(by_id.iterdir())
+                except OSError:
+                    links = []
+                for link in links:
+                    try:
+                        if link.resolve() == device.resolve():
+                            return os.fspath(link)
+                    except OSError:
+                        continue
+                if device.exists():
+                    return os.fspath(device)
+        if time.time() >= deadline:
+            return None
+        time.sleep(0.2)
 
 
 def detach(port=None):
@@ -1021,6 +1114,11 @@ def main():
         "a unix socket name or host:port",
     )
     ap.add_argument(
+        "--busid",
+        default=BUSID,
+        help="exported USB/IP bus ID to import (default %s)" % BUSID,
+    )
+    ap.add_argument(
         "--detach",
         nargs="?",
         type=int,
@@ -1056,9 +1154,9 @@ def main():
         spec = args.attach_to
         if ":" in spec and not spec.startswith("@") and "/" not in spec:
             host, _, port = spec.rpartition(":")
-            attached_port = attach(host=host, port=int(port))
+            attached_port = attach(host=host, port=int(port), busid=args.busid)
         else:
-            attached_port = attach(unix_path=spec)
+            attached_port = attach(unix_path=spec, busid=args.busid)
         if attached_port is None or attached_port is False:
             print("attach failed", file=sys.stderr)
             return 1

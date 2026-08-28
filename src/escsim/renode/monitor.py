@@ -39,15 +39,22 @@ def parse_metrics(text: str) -> dict[str, float | int]:
     values = re.findall(r"(?m)^\s*(0x[0-9A-Fa-f]+)\s*$", text)
     virtual = re.search(r"(?m)^Elapsed Virtual Time:\s*(\S+)\s*$", text)
     host = re.search(r"(?m)^Elapsed Host Time:\s*(\S+)\s*$", text)
-    if len(values) < 3 or virtual is None or host is None:
+    if len(values) not in (3, 6) or virtual is None or host is None:
         raise ValueError("incomplete Renode monitor metrics")
-    return {
+    result = {
         "pc": int(values[0], 16),
         "mips": int(values[1], 16),
         "instructions": int(values[2], 16),
         "virtual_seconds": parse_elapsed(virtual.group(1)),
         "host_seconds": parse_elapsed(host.group(1)),
     }
+    if len(values) == 6:
+        result.update(
+            dshot_frames=int(values[-3], 16),
+            dshot_replies=int(values[-2], 16),
+            dshot_injected=int(values[-1], 16),
+        )
+    return result
 
 
 def startup_error(text: bytes | str) -> str | None:
@@ -90,11 +97,15 @@ class MonitorClient:
     def _read_to_prompt(self, timeout: float, expected: str | None = None) -> str:
         if self.socket is None:
             raise OSError("monitor is not connected")
+        # Keep the socket object local so another thread can call close() to
+        # interrupt a pending monitor read without turning this into a
+        # None.recv() race. Closing the local object wakes recv() with OSError.
+        sock = self.socket
         deadline = time.monotonic() + timeout
         data = bytearray()
         while time.monotonic() < deadline:
             try:
-                chunk = self.socket.recv(65536)
+                chunk = sock.recv(65536)
             except socket.timeout:
                 continue
             if not chunk:

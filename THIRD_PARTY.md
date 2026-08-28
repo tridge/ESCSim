@@ -11,3 +11,13 @@ source distribution.
 
 The native motor simulator contains the small `jsmn` JSON parser originally
 published under the MIT license; see `licenses/jsmn-MIT.txt`.
+
+The SpeedyBeeF405Mini platform and ArduPilot-oriented STM32/sensor peripheral
+models were adapted from the GPL-3.0 ArduPilot Renode environment. Individual
+Renode-derived MIT files retain their SPDX notices and are also covered by
+`licenses/Renode-MIT.txt`.
+
+The bundled `SPEEDYBEEF405V5.hex` flight-controller image is Betaflight
+2026.6.1 revision `6dbc4218f`, distributed under GPL-3.0. Its corresponding
+source is available from the Betaflight repository at
+<https://github.com/betaflight/betaflight/tree/6dbc4218fd6bc33bf16ea32c670304d4f89321d5>.

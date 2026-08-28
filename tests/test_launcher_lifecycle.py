@@ -103,6 +103,73 @@ def test_process_runner_stop_is_serialized():
     assert runner.tree is None
 
 
+def test_stop_interrupts_metrics_and_pauses_on_fresh_monitor(monkeypatch):
+    lab = make_lab()
+    lab.fc_runner = FakeRunner(running=True)
+    lab.protocol = "flightcontroller"
+    commands = []
+
+    class MetricsMonitor:
+        def close(self):
+            commands.append(("metrics-close",))
+
+    class StopMonitor:
+        def __init__(self, host, port):
+            commands.append(("create", host, port))
+
+        def connect(self, timeout):
+            commands.append(("connect", timeout))
+
+        def command(self, command, timeout):
+            commands.append((command, timeout))
+            return "(monitor)"
+
+        def close(self):
+            commands.append(("close",))
+
+    monkeypatch.setattr(gui.renode_monitor, "MonitorClient", StopMonitor)
+    lab.fc_monitor = MetricsMonitor()
+    lab.stop()
+
+    assert commands == [
+        ("metrics-close",),
+        ("create", "127.0.0.1", lab.fc_monitor_port()),
+        ("connect", 2),
+        ("pause", 10),
+        ("close",),
+    ]
+    assert lab.fc_runner.stop_calls == 1
+
+
+def test_stop_reconnects_monitor_to_persist_flash(monkeypatch):
+    lab = make_lab()
+    lab.fc_runner = FakeRunner(running=True)
+    commands = []
+
+    class FakeMonitor:
+        def __init__(self, host, port):
+            commands.append(("create", host, port))
+
+        def connect(self, timeout):
+            commands.append(("connect", timeout))
+
+        def command(self, command, timeout):
+            commands.append((command, timeout))
+
+        def close(self):
+            commands.append(("close",))
+
+    monkeypatch.setattr(gui.renode_monitor, "MonitorClient", FakeMonitor)
+    lab.stop()
+
+    assert commands == [
+        ("create", "127.0.0.1", lab.fc_monitor_port()),
+        ("connect", 2),
+        ("pause", 10),
+        ("close",),
+    ]
+
+
 def test_failed_usb_detach_is_retained_and_retried(monkeypatch):
     lab = make_lab()
     stub = FakeStub()
@@ -112,6 +179,7 @@ def test_failed_usb_detach_is_retained_and_retried(monkeypatch):
     def fail(_port):
         raise RuntimeError("driver busy")
 
+    monkeypatch.setattr(gui.sitl_usbip, "port_attached", lambda _port: True)
     monkeypatch.setattr(gui.sitl_usbip, "detach", fail)
     error = lab._stop_stub()
 
@@ -127,6 +195,20 @@ def test_failed_usb_detach_is_retained_and_retried(monkeypatch):
     assert lab._stop_stub() is None
     assert detached == [12]
     assert not lab.usb_attached
+    assert lab.usb_ports == set()
+
+
+def test_already_disconnected_usb_port_is_forgotten(monkeypatch):
+    lab = make_lab()
+    lab._remember_usb(12)
+    detached = []
+    monkeypatch.setattr(gui.sitl_usbip, "port_attached", lambda _port: False)
+    monkeypatch.setattr(
+        gui.sitl_usbip, "detach", lambda port: detached.append(port) or True
+    )
+
+    assert lab._stop_stub() is None
+    assert detached == []
     assert lab.usb_ports == set()
 
 
@@ -166,6 +248,7 @@ def test_stop_cancels_in_progress_usb_attach(monkeypatch):
     monkeypatch.setattr(
         gui.sitl_usbip, "detach", lambda port: detached.append(port) or True
     )
+    monkeypatch.setattr(gui.sitl_usbip, "port_attached", lambda _port: True)
 
     worker = threading.Thread(target=lab._start_stub, args=(4,))
     worker.start()
@@ -193,6 +276,7 @@ def test_unexpected_emulator_exit_detaches_usb(monkeypatch):
     monkeypatch.setattr(
         gui.sitl_usbip, "detach", lambda port: detached.append(port) or True
     )
+    monkeypatch.setattr(gui.sitl_usbip, "port_attached", lambda _port: True)
 
     lab.saw_log_line("[emulator exited, status 2]")
 
@@ -233,3 +317,46 @@ def test_fourway_stub_enables_msp_motor_output(monkeypatch):
     assert created[0]["esc_ports"] == [57833, 57843, 57853]
     assert lab.stub is not None
     lab._stop_stub()
+
+
+def test_cancelled_firmware_usb_attach_is_detached(monkeypatch):
+    lab = make_lab()
+    lab.fc_runner = FakeRunner(running=True)
+    lab.generation = 3
+    detached = []
+
+    def attach(**_kwargs):
+        lab.generation = 4
+        return 6
+
+    monkeypatch.setattr(gui.sitl_usbip, "attach", attach)
+    monkeypatch.setattr(lab, "_find_fc_tty", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        gui.sitl_usbip, "detach", lambda port: detached.append(port) or True
+    )
+    monkeypatch.setattr(gui.sitl_usbip, "port_attached", lambda _port: True)
+
+    lab._attach_firmware_usb(3)
+
+    assert detached == [6]
+    assert lab.usb_ports == set()
+
+
+def test_fc_dfu_requires_usb_configurator(tmp_path, monkeypatch):
+    firmware = tmp_path / "firmware.elf"
+    firmware.write_bytes(b"elf")
+    lab = make_lab()
+    lab.target = "TEST_TARGET"
+    lab.info = {
+        "family": "f051",
+        "pin": "PA2",
+        "dronecan": False,
+        "app_base": 0x08001000,
+    }
+    lab.bootloader = "none"
+    lab.firmware = str(firmware)
+    lab.flight_controller = "SpeedyBeeF405Mini"
+    lab.fc_boot_mode = "dfu"
+    lab.conf = "off"
+
+    assert lab.start() == "flight-controller DFU mode requires USB"

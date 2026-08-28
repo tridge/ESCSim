@@ -45,6 +45,9 @@ def test_four_way_instances_use_isolated_port_triplets():
     lab.protocol = "direct"
     assert lab.active_esc_count() == 1
 
+    lab.protocol = "flightcontroller"
+    assert lab.active_esc_count() == 8
+
 
 def test_four_way_start_launches_one_command_per_esc(tmp_path, monkeypatch):
     firmware = tmp_path / "firmware.elf"
@@ -103,5 +106,93 @@ def test_four_way_start_launches_one_command_per_esc(tmp_path, monkeypatch):
             assert command[command.index("--outdir") + 1].endswith(
                 "esc%u" % (index + 1)
             )
+    finally:
+        lab.stop()
+
+
+def test_flight_controller_starts_selected_esc_count_without_loader(
+    tmp_path, monkeypatch
+):
+    firmware = tmp_path / "firmware.elf"
+    bootloader = tmp_path / "bootloader.elf"
+    firmware.write_bytes(b"app")
+    bootloader.write_bytes(b"loader")
+    args = SimpleNamespace(
+        bootloader_dir=None,
+        gui_port=58833,
+        state_port=58834,
+        monitor_port=58835,
+        renode=None,
+    )
+    lab = Lab(args)
+    lab.target = "TEST_TARGET"
+    lab.info = {
+        "family": "f421",
+        "pin": "PB4",
+        "dronecan": False,
+        "app_base": 0x08001000,
+    }
+    lab.bootloader = str(bootloader)
+    lab.firmware = str(firmware)
+    lab.flight_controller = "SpeedyBeeF405Mini"
+    lab.fc_boot_mode = "flash"
+    lab.protocol = "flightcontroller"
+    lab.esc_count = 1
+    lab.conf = "off"
+
+    class CapturingRunner:
+        def __init__(self):
+            self.commands = None
+            self.command = None
+            self.is_running = False
+
+        def running(self):
+            return self.is_running
+
+        def all_running(self):
+            return self.is_running
+
+        def start(self, command, **_kwargs):
+            if command and isinstance(command[0], list):
+                self.commands = command
+            else:
+                self.command = command
+            self.is_running = True
+
+        def stop(self):
+            self.is_running = False
+
+    class FakeSpec:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def command(self):
+            return ["renode-fc"]
+
+    lab.runner = CapturingRunner()
+    lab.fc_runner = CapturingRunner()
+    monkeypatch.setenv("ESCSIM_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setattr("escsim.gui.FlightControllerSpec", FakeSpec)
+    monkeypatch.setattr(lab, "wait_port_free", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(lab, "_wait_ready", lambda *_args: None)
+
+    try:
+        assert lab.start() is None
+        assert len(lab.runner.commands) == 1
+        assert lab.fc_runner.command == ["renode-fc"]
+        selected_flash = (
+            tmp_path
+            / "cache"
+            / "flight-controllers"
+            / "SpeedyBeeF405Mini"
+            / "flash.bin"
+        )
+        assert selected_flash.read_bytes()[:8] == bytes.fromhex(
+            "f0ff001085240508"
+        )
+        for command in lab.runner.commands:
+            assert "--elf" in command
+            assert str(firmware) in command
+            assert "--bootloader-elf" not in command
     finally:
         lab.stop()

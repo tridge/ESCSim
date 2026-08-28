@@ -42,6 +42,8 @@ escsim = [
     "resources/*.h",
     "resources/*.png",
     "renode/resources/models/*.json",
+    "renode/resources/FC_Firmware/*.hex",
+    "renode/resources/flight_controllers/*.repl",
     "renode/resources/peripherals/*/*.cs",
     "renode/resources/platforms/*.repl",
     "renode/resources/scripts/*.py",

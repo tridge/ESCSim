@@ -81,6 +81,22 @@ def test_native_library_does_not_trust_working_directory(tmp_path, monkeypatch):
     assert selected is None or Path(selected) != attacker_library
 
 
+def test_native_library_finds_source_checkout_build(tmp_path, monkeypatch):
+    monkeypatch.delenv("ESCSIM_AM32SIM_LIBRARY", raising=False)
+    source = tmp_path / "checkout"
+    module = source / "src" / "escsim" / "renode" / "generator.py"
+    module.parent.mkdir(parents=True)
+    module.touch()
+    (source / "pyproject.toml").touch()
+    built = source / "build" / "native" / "libam32sim.so"
+    built.parent.mkdir(parents=True)
+    built.touch()
+    monkeypatch.setattr(generator, "__file__", str(module))
+    monkeypatch.setattr(generator, "_PACKAGE_ROOT", tmp_path / "empty-package")
+    selected = generator.native_library_path()
+    assert Path(selected).resolve() == built.resolve()
+
+
 def test_renode_setup_precedes_monitor_listener():
     command = generator.renode_command("renode.exe", 57735, "include @target.resc")
     assert command == [

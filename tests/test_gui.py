@@ -37,6 +37,9 @@ def test_launcher_preferences_round_trip(tmp_path):
         protocol="direct",
         esc_count=8,
         can_bus=-1,
+        flight_controller="SpeedyBeeF405Mini",
+        fc_firmware="SPEEDYBEEF405V5",
+        fc_boot_mode="dfu",
     )
     store.save(Settings(launcher=expected))
     assert store.load().launcher == expected

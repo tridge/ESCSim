@@ -29,6 +29,7 @@ import glob
 import hashlib
 from importlib import resources
 import os
+from pathlib import Path
 import re
 import shutil
 import struct
@@ -2914,9 +2915,18 @@ def native_library_path():
     """The packaged or explicitly selected native motor library."""
     override = os.environ.get("ESCSIM_AM32SIM_LIBRARY")
     names = ("am32sim.dll", "libam32sim.dylib", "libam32sim.so")
+    # A source checkout deliberately keeps generated binaries out of the
+    # package tree.  Resolve its build directory from this module, never from
+    # the process working directory (which may contain an untrusted lookalike).
+    source_root = Path(__file__).resolve().parents[3]
+    source_build = (
+        [source_root / "build" / "native" / name for name in names]
+        if (source_root / "pyproject.toml").is_file()
+        else []
+    )
     candidates = ([override] if override else []) + [
         os.path.join(os.fspath(_PACKAGE_ROOT), "lib", name) for name in names
-    ]
+    ] + source_build
     return next(
         (os.path.abspath(path) for path in candidates if path and os.path.isfile(path)),
         None,

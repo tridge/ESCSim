@@ -27,7 +27,10 @@ time, the retired instruction rate and the machine's virtual time.
 with --control-port N the UI can be driven over a localhost TCP
 connection (one command per line), for scripted tests:
   target NAME, bootloader auto|none|PATH, firmware auto|none|PATH,
-  eeprom defaults|blank, conf off|serial|usb, protocol 4way|direct,
+  eeprom defaults|blank, conf off|serial|usb,
+  flightcontroller none|SpeedyBeeF405Mini, fcfirmware NAME,
+  fcboot flash|dfu,
+  protocol 4way|direct|flightcontroller,
   escs 1..8, canbus N, download-renode, start, stop, status, quit
 replies are prefixed OK/ERR/STATUS.
 """
@@ -55,6 +58,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from escsim.control import msp_stub_fc
+from escsim.control import dfu as sitl_dfu
 from escsim.control import ui as sitl_gui
 from escsim.control import usbip as sitl_usbip
 from escsim.control.backend import CanCommandGroup
@@ -67,6 +71,15 @@ from escsim.renode.generator import (
     config,
 )
 from escsim.renode.process import ProcessTree
+from escsim.renode.flight_controller import (
+    FC_FIRMWARE_BASE_URL,
+    FlightControllerSpec,
+    ensure_flash,
+    flight_controller_firmware,
+    flight_controller_firmware_label,
+    flight_controller_firmwares,
+    select_firmware,
+)
 from escsim.renode.session import generator_command, generator_environment
 from escsim.settings import LauncherSettings, SettingsStore, default_cache_dir
 from escsim.settings import TargetSourceSpec
@@ -97,6 +110,12 @@ INSTANCE_PORT_STRIDE = 10
 METRICS_COMMAND = (
     "cpu PC; cpu PerformanceInMips; cpu ExecutedInstructions; "
     "emulation GetTimeSourceInfo"
+)
+FC_METRICS_COMMAND = (
+    METRICS_COMMAND
+    + "; sysbus.motorBridge ReadDoubleWord 0; "
+    "sysbus.motorBridge ReadDoubleWord 4; "
+    "sysbus.motorBridge ReadDoubleWord 8"
 )
 
 
@@ -245,6 +264,9 @@ class Lab(object):
         self.args = args
         self.log_q = queue.Queue()
         self.runner = ProcGroup(self.log_q)
+        self.fc_runner = ProcRunner(self.log_q, label="[FC] ")
+        self.fc_monitor = None
+        self.fc_monitor_lock = threading.Lock()
         self.emulator_ready = False
         self.stub = None
         self.usb_attached = False
@@ -264,6 +286,11 @@ class Lab(object):
         self.conf = "usb" if os.name == "nt" else "serial"
         self.protocol = "4way"  # 4way | direct
         self.esc_count = 1
+        self.flight_controller = "none"
+        self.fc_firmware = "SPEEDYBEEF405V5"
+        self.fc_boot_mode = "flash"
+        self.fc_command = None
+        self.fc_runner_required = False
         self.can_bus = 0
         self.status = "stopped"
         self.conf_port = ""  # the pty / tty path once up
@@ -320,9 +347,11 @@ class Lab(object):
     # -- lifecycle -----------------------------------------------------
 
     def active_esc_count(self):
-        if getattr(self, "protocol", "4way") != "4way":
-            return 1
-        return getattr(self, "esc_count", 1)
+        protocol = getattr(self, "protocol", "4way")
+        return getattr(self, "esc_count", 1) if protocol in (
+            "4way",
+            "flightcontroller",
+        ) else 1
 
     def instance_ports(self, index):
         """Signal, state and monitor ports for one Renode instance."""
@@ -335,7 +364,26 @@ class Lab(object):
 
     def _all_emulators_running(self):
         all_running = getattr(self.runner, "all_running", None)
-        return all_running() if all_running is not None else self.runner.running()
+        escs_running = (
+            all_running() if all_running is not None else self.runner.running()
+        )
+        return escs_running and (
+            not self.fc_runner_required or self.fc_runner.running()
+        )
+
+    def fc_monitor_port(self):
+        return self.args.monitor_port + MAX_ESC_COUNT * INSTANCE_PORT_STRIDE
+
+    def fc_usbip_port(self):
+        return self.fc_monitor_port() + 1
+
+    def fc_flash_path(self):
+        return (
+            default_cache_dir()
+            / "flight-controllers"
+            / self.flight_controller
+            / "flash.bin"
+        )
 
     @staticmethod
     def wait_port_free(port, timeout=8.0, tcp=False):
@@ -367,7 +415,7 @@ class Lab(object):
         )
 
     def start(self):
-        if self.runner.running():
+        if self.runner.running() or self.fc_runner.running():
             return "already running"
         with self.lifecycle_lock:
             if self.usb_starting:
@@ -379,6 +427,15 @@ class Lab(object):
             return "previous USB cleanup failed: %s" % cleanup_error
         if self.target is None or self.info is None:
             return "pick a target first"
+        fc_selected = self.flight_controller != "none"
+        if fc_selected:
+            if self.flight_controller != "SpeedyBeeF405Mini":
+                return "unsupported flight controller %s" % self.flight_controller
+            self.protocol = "flightcontroller"
+            if self.fc_boot_mode == "dfu" and self.conf != "usb":
+                return "flight-controller DFU mode requires USB"
+            if self.conf not in ("usb", "off"):
+                return "a flight controller requires USB or configurator off"
         if not 1 <= self.esc_count <= MAX_ESC_COUNT:
             return "ESC count must be 1..%u" % MAX_ESC_COUNT
         instance_ports = [
@@ -389,6 +446,12 @@ class Lab(object):
             return "instance ports must be 1..65535"
         if len(flat_ports) != len(set(flat_ports)):
             return "instance port ranges overlap; choose different base ports"
+        if fc_selected:
+            fc_ports = (self.fc_monitor_port(), self.fc_usbip_port())
+            if any(not 1 <= port <= 65535 for port in fc_ports):
+                return "flight-controller ports must be 1..65535"
+            if any(port in flat_ports for port in fc_ports):
+                return "flight-controller ports overlap ESC ports"
         for port in [port for ports in instance_ports for port in ports[:2]]:
             if not self.wait_port_free(port):
                 return (
@@ -401,7 +464,18 @@ class Lab(object):
                     "monitor port %u is still in use - a leftover emulator? "
                     "try: pkill -f renode" % port
                 )
-        bl = self.pick_bootloader()
+        if fc_selected:
+            for label, port in (
+                ("FC monitor", self.fc_monitor_port()),
+                ("FC USB/IP", self.fc_usbip_port()),
+            ):
+                if not self.wait_port_free(port, tcp=True):
+                    return "%s port %u is still in use" % (label, port)
+        # The fake 4-way/direct rigs deliberately boot the ESC loader.  A
+        # real flight controller instead needs the ESC application alive to
+        # consume its motor output.  FC-side serial passthrough is separate
+        # future work; do not strand these four signal pins in their loaders.
+        bl = None if fc_selected else self.pick_bootloader()
         if isinstance(bl, str) and not os.path.isfile(bl):
             return bl
         command_tail = []
@@ -452,18 +526,51 @@ class Lab(object):
                     str(index),
                 ]
             commands.append(command + command_tail)
+        self.fc_command = None
+        self.fc_runner_required = False
+        if fc_selected:
+            try:
+                flash = ensure_flash(self.fc_flash_path())
+                if self.fc_boot_mode == "flash":
+                    image = flight_controller_firmware(self.fc_firmware)
+                    changed = select_firmware(flash, image)
+                    self.log(
+                        "%s flight-controller firmware %s"
+                        % ("loaded" if changed else "using", self.fc_firmware)
+                    )
+                fc_outdir = Path(self.launch_work.name) / "flight-controller"
+                self.fc_command = FlightControllerSpec(
+                    model=self.flight_controller,
+                    outdir=fc_outdir,
+                    flash=flash,
+                    esc_ports=tuple(ports[0] for ports in instance_ports),
+                    monitor_port=self.fc_monitor_port(),
+                    usbip_port=self.fc_usbip_port(),
+                    renode=self.args.renode,
+                ).command()
+            except (OSError, RuntimeError, ValueError) as error:
+                self.launch_work.cleanup()
+                self.launch_work = None
+                return "could not prepare flight controller: %s" % error
         self.emulator_ready = False
         self.start_failed = False
         self.conf_port = ""
         count = self.active_esc_count()
+        total = count + (1 if fc_selected and self.fc_boot_mode == "flash" else 0)
         self.status = "starting %s..." % (
-            "emulator" if count == 1 else "%u emulators" % count
+            "emulator" if total == 1 else "%u emulators" % total
         )
         for command in commands:
             self.log("$ " + " ".join(command))
         try:
             self.runner.start(commands, env=generator_environment())
+            if fc_selected and self.fc_boot_mode == "flash":
+                self.log("$ " + " ".join(self.fc_command))
+                self.fc_runner.start(self.fc_command, env=generator_environment())
+                self.fc_runner_required = True
         except Exception as error:
+            self.runner.stop()
+            self.fc_runner.stop()
             self.launch_work.cleanup()
             self.launch_work = None
             return "could not start emulator: %s" % error
@@ -514,15 +621,47 @@ class Lab(object):
                     self.start_failed = True
                     self.log("[monitor ESC %u] %s" % (index + 1, error))
                     break
+        fc_monitor = None
+        if not self.start_failed and self.fc_runner_required:
+            fc_monitor = renode_monitor.MonitorClient(
+                "127.0.0.1", self.fc_monitor_port()
+            )
+            text = None
+            while (
+                time.time() < deadline
+                and self._all_emulators_running()
+                and self._generation_current(generation)
+            ):
+                try:
+                    text = fc_monitor.connect(
+                        timeout=max(1, deadline - time.time())
+                    )
+                    break
+                except OSError:
+                    fc_monitor.close()
+                    time.sleep(0.2)
+                except TimeoutError:
+                    break
+            if text is not None:
+                error = renode_monitor.startup_error(text)
+                if error is not None:
+                    self.status = "flight controller setup failed: %s" % error
+                    self.start_failed = True
+                    self.log("[monitor FC] %s" % error)
         if not self._generation_current(generation):
             for monitor in monitors:
                 monitor.close()
+            if fc_monitor is not None:
+                fc_monitor.close()
             return
         if self.start_failed:
             for monitor in monitors:
                 monitor.close()
+            if fc_monitor is not None:
+                fc_monitor.close()
             if self._generation_current(generation):
                 self.runner.stop()
+                self.fc_runner.stop()
             return
         while (
             time.time() < deadline
@@ -538,22 +677,33 @@ class Lab(object):
         if not self.emulator_ready:
             for monitor in monitors:
                 monitor.close()
+            if fc_monitor is not None:
+                fc_monitor.close()
             if not self._generation_current(generation):
                 return
             # a half-started emulator (a failed port bind still leaves
             # the machine running) must not linger and block the retry
             self.runner.stop()
+            self.fc_runner.stop()
             if not self.status.startswith("emulator exited"):
                 self.status = "emulator did not come up"
             return
-        threading.Thread(
-            target=self._metrics_loop,
-            args=(generation, monitors[0]),
-            daemon=True,
-        ).start()
-        for monitor in monitors[1:]:
+        waiting_for_dfu = (
+            self.protocol == "flightcontroller" and self.fc_boot_mode == "dfu"
+        )
+        if not waiting_for_dfu:
+            threading.Thread(
+                target=self._metrics_loop,
+                args=(generation, fc_monitor or monitors[0]),
+                daemon=True,
+            ).start()
+        for monitor in (
+            monitors
+            if fc_monitor is not None
+            else (monitors if waiting_for_dfu else monitors[1:])
+        ):
             monitor.close()
-        if bl is not None:
+        if bl is not None and self.protocol != "flightcontroller":
             self._enter_bootloader()
         if not self._generation_current(generation):
             return
@@ -599,6 +749,10 @@ class Lab(object):
         client = client or renode_monitor.MonitorClient(
             "127.0.0.1", self.args.monitor_port
         )
+        is_fc_monitor = self.protocol == "flightcontroller"
+        if is_fc_monitor:
+            with self.fc_monitor_lock:
+                self.fc_monitor = client
         history = []
         try:
             if client.socket is None:
@@ -626,9 +780,14 @@ class Lab(object):
                     return
             while generation == self.generation and self._all_emulators_running():
                 try:
+                    command = (
+                        FC_METRICS_COMMAND
+                        if self.protocol == "flightcontroller"
+                        else METRICS_COMMAND
+                    )
                     current = renode_monitor.parse_metrics(
                         client.command(
-                            METRICS_COMMAND, timeout=60 if not history else 5
+                            command, timeout=60 if not history else 5
                         )
                     )
                 except (OSError, TimeoutError, ValueError) as error:
@@ -652,6 +811,10 @@ class Lab(object):
                 self.log_q.put(("__metrics__", generation, current))
                 time.sleep(1)
         finally:
+            if is_fc_monitor:
+                with self.fc_monitor_lock:
+                    if self.fc_monitor is client:
+                        self.fc_monitor = None
             client.close()
 
     def format_metrics(self):
@@ -661,7 +824,11 @@ class Lab(object):
         if m is None:
             return ""
         where = ""
-        app_base = (self.info or {}).get("app_base")
+        app_base = (
+            0x0800C000
+            if self.protocol == "flightcontroller"
+            else (self.info or {}).get("app_base")
+        )
         if app_base:
             flash_base = 0x08000000 if app_base >= 0x08000000 else 0
             if flash_base <= m["pc"] < app_base:
@@ -672,9 +839,20 @@ class Lab(object):
         if m.get("executed_mips") is not None:
             parts.append("%.0f of %u MIPS" % (m["executed_mips"], m["mips"]))
         parts.append("vt %.1fs" % m["virtual_seconds"])
+        if "dshot_frames" in m:
+            parts.append(
+                "DShot %u frames/%u replies/%u injected"
+                % (
+                    m["dshot_frames"],
+                    m["dshot_replies"],
+                    m["dshot_injected"],
+                )
+            )
         return " | ".join(parts)
 
     def _start_stub(self, generation):
+        if self.protocol == "flightcontroller":
+            return self._start_fc_endpoint(generation)
         if self.conf == "usb":
             with self.lifecycle_lock:
                 self.usb_starting.add(generation)
@@ -770,6 +948,215 @@ class Lab(object):
                     with self.lifecycle_lock:
                         self.usb_starting.discard(generation)
 
+    def _start_fc_endpoint(self, generation):
+        """Attach either factory DFU or the USB device driven by FC firmware."""
+        with self.lifecycle_lock:
+            self.usb_starting.add(generation)
+        endpoint = None
+        attached = None
+        published = False
+        try:
+            if self.fc_boot_mode == "dfu" and not self.fc_runner_required:
+                endpoint = sitl_dfu.DfuDevice(
+                    self.fc_flash_path(),
+                    on_manifest=lambda: self._dfu_manifest(generation),
+                    unix_path=(
+                        None
+                        if os.name == "nt"
+                        else "@escsim-fc-dfu.%u.%u" % (os.getuid(), os.getpid())
+                    ),
+                )
+                attached = sitl_usbip.attach(
+                    unix_path=endpoint.unix_path,
+                    host=endpoint.host,
+                    port=endpoint.port,
+                    busid="1-1",
+                )
+                if attached is None or attached is False:
+                    raise RuntimeError("USB/IP DFU attach was refused")
+                self._remember_usb(attached)
+                with self.lifecycle_lock:
+                    if generation != self.generation:
+                        return
+                    self.stub = endpoint
+                    self.conf_port = "USB DFU 0483:df11"
+                    self.status = "running - FC in USB DFU mode"
+                    published = True
+                self.log(self.status)
+                return
+            self._attach_firmware_usb(generation)
+        finally:
+            if endpoint is not None and not published:
+                if attached is not None and attached is not False:
+                    error = self._detach_owned_usb(attached)
+                    if error is not None:
+                        self.log(
+                            "USB/IP detach failed after cancelled DFU start: %s"
+                            % error
+                        )
+                endpoint.close()
+            with self.lifecycle_lock:
+                self.usb_starting.discard(generation)
+
+    def _attach_firmware_usb(self, generation):
+        """Attach Renode's firmware-driven USB/IP device after enumeration."""
+        deadline = time.time() + 120
+        attached = None
+        last_error = None
+        while (
+            time.time() < deadline
+            and self._generation_current(generation)
+            and self.fc_runner.running()
+        ):
+            try:
+                attached = sitl_usbip.attach(
+                    host="127.0.0.1",
+                    port=self.fc_usbip_port(),
+                    busid="1-0",
+                )
+                if attached is not None and attached is not False:
+                    break
+            except (OSError, RuntimeError) as error:
+                last_error = error
+            time.sleep(0.5)
+        if attached is None or attached is False:
+            raise RuntimeError(
+                "FC USB did not enumerate%s"
+                % (": %s" % last_error if last_error is not None else "")
+            )
+        self._remember_usb(attached)
+        tty = self._find_fc_tty(timeout=15, usb_port=attached)
+        published = False
+        with self.lifecycle_lock:
+            if generation == self.generation and self.fc_runner.running():
+                self.conf_port = tty or "USB device (WebUSB)"
+                self.status = "running - flight controller: %s" % self.conf_port
+                published = True
+        if published:
+            self.log(self.status)
+            threading.Thread(
+                target=self._watch_fc_usb,
+                args=(generation,),
+                daemon=True,
+            ).start()
+        else:
+            error = self._detach_owned_usb(attached)
+            if error is not None:
+                self.log("USB/IP detach failed after cancelled FC start: %s" % error)
+
+    def _watch_fc_usb(self, generation):
+        """Re-import firmware USB after its bootloader/application reset.
+
+        A Renode USB/IP connection represents one USB attachment.  STM32
+        firmware deliberately disconnects while rebooting, so Linux vhci_hcd
+        drops that connection and needs the same emulated device imported
+        again once it enumerates.  This also covers repeated Betaflight DFU
+        flashes and ordinary ArduPilot reboots.
+        """
+        while self._generation_current(generation) and self.fc_runner.running():
+            with self.lifecycle_lock:
+                ports = list(self.usb_ports)
+            if ports and any(sitl_usbip.port_attached(port) for port in ports):
+                time.sleep(0.5)
+                continue
+            for port in ports:
+                self._forget_usb(port)
+            try:
+                attached = sitl_usbip.attach(
+                    host="127.0.0.1",
+                    port=self.fc_usbip_port(),
+                    busid="1-0",
+                )
+                if attached is None or attached is False:
+                    raise RuntimeError("FC USB/IP reattach was refused")
+            except (OSError, RuntimeError):
+                time.sleep(0.5)
+                continue
+            self._remember_usb(attached)
+            if not self._generation_current(generation):
+                self._detach_owned_usb(attached)
+                return
+            tty = self._find_fc_tty(timeout=5, usb_port=attached)
+            with self.lifecycle_lock:
+                if generation != self.generation:
+                    continue
+                self.conf_port = tty or "USB device (WebUSB)"
+                self.status = "running - flight controller: %s" % self.conf_port
+            self.log("flight-controller USB reattached: %s" % self.conf_port)
+
+    @staticmethod
+    def _find_fc_tty(timeout=10, usb_port=None):
+        if os.name != "nt" and usb_port is not None:
+            return sitl_usbip.find_tty_on_port(usb_port, timeout=timeout)
+        deadline = time.time() + timeout
+        patterns = (
+            "/dev/serial/by-id/usb-ArduPilot_*",
+            "/dev/serial/by-id/usb-Betaflight_*",
+            "/dev/serial/by-id/usb-INAV_*",
+        )
+        while True:
+            hits = sorted(path for pattern in patterns for path in glob.glob(pattern))
+            if hits:
+                return hits[0]
+            if time.time() >= deadline:
+                return None
+            time.sleep(0.2)
+
+    def _dfu_manifest(self, generation):
+        """Replace the factory ROM device with the newly flashed firmware."""
+        if not self._generation_current(generation):
+            return
+        startup_token = ("dfu-handoff", generation)
+        with self.lifecycle_lock:
+            self.usb_starting.add(startup_token)
+        self.status = "DFU complete; starting emulated flight controller..."
+        self.log(self.status)
+        try:
+            cleanup_error = self._stop_stub()
+            if cleanup_error is not None:
+                raise RuntimeError(cleanup_error)
+            # Serialize the generation check with process publication.  Stop
+            # increments the generation under this same lock, so it either
+            # wins before this block (and no FC starts), or runs afterwards
+            # and sees/stops the newly published runner.
+            with self.lifecycle_lock:
+                if generation != self.generation:
+                    return
+                self.fc_runner.start(
+                    self.fc_command, env=generator_environment()
+                )
+                self.fc_runner_required = True
+            monitor = renode_monitor.MonitorClient(
+                "127.0.0.1", self.fc_monitor_port()
+            )
+            deadline = time.time() + 120
+            text = None
+            while time.time() < deadline and self.fc_runner.running():
+                try:
+                    text = monitor.connect(timeout=max(1, deadline - time.time()))
+                    break
+                except OSError:
+                    monitor.close()
+                    time.sleep(0.2)
+            error = renode_monitor.startup_error(text or "")
+            if text is None or error is not None:
+                monitor.close()
+                raise RuntimeError(error or "FC monitor did not become ready")
+            threading.Thread(
+                target=self._metrics_loop,
+                args=(generation, monitor),
+                daemon=True,
+            ).start()
+            self._attach_firmware_usb(generation)
+        except Exception as error:
+            self.status = "DFU handoff failed: %s" % error
+            self.log(self.status)
+            self.fc_runner.stop()
+            self.fc_runner_required = False
+        finally:
+            with self.lifecycle_lock:
+                self.usb_starting.discard(startup_token)
+
     def _remember_usb(self, port):
         with self.lifecycle_lock:
             self.usb_ports.add(port)
@@ -787,6 +1174,12 @@ class Lab(object):
             with self.lifecycle_lock:
                 if port not in self.usb_ports:
                     return None
+            # Firmware can disconnect itself before the launcher gets here
+            # (DFU manifestation and bootloader/application reboots do this).
+            # Treat an already-empty exact VHCI slot as successfully detached.
+            if not sitl_usbip.port_attached(port):
+                self._forget_usb(port)
+                return None
             try:
                 if not sitl_usbip.detach(port):
                     raise RuntimeError("detach was refused")
@@ -811,11 +1204,40 @@ class Lab(object):
         return cleanup_error
 
     def stop(self):
+        # AP_PersistentMemory writes the emulated STM32 flash backing file on
+        # pause. Invalidate and interrupt the metrics worker, then use a fresh
+        # monitor connection to pause before ProcessTree terminates Renode;
+        # otherwise
+        # parameters changed by FC firmware disappear across Stop/Start.
         with self.lifecycle_lock:
             self.generation += 1
+        with self.fc_monitor_lock:
+            metrics_monitor = self.fc_monitor
+            self.fc_monitor = None
+        if metrics_monitor is not None:
+            metrics_monitor.close()
+        if self.fc_runner.running():
+            # Persistence must not depend on the display thread being healthy,
+            # and Stop must not wait behind its first 60-second metrics poll.
+            monitor = renode_monitor.MonitorClient(
+                "127.0.0.1", self.fc_monitor_port()
+            )
+            try:
+                monitor.connect(timeout=2)
+                try:
+                    monitor.command("pause", timeout=10)
+                except (OSError, TimeoutError) as error:
+                    self.log("flight-controller flash save failed: %s" % error)
+            except (OSError, TimeoutError) as error:
+                self.log("flight-controller flash save failed: %s" % error)
+            finally:
+                monitor.close()
         self.metrics = None
         cleanup_error = self._stop_stub()
+        self.fc_runner.stop()
         self.runner.stop()
+        self.fc_runner_required = False
+        self.fc_command = None
         if self.launch_work is not None:
             self.launch_work.cleanup()
             self.launch_work = None
@@ -846,6 +1268,7 @@ class Lab(object):
                     self.status = (
                         "emulator exited; USB cleanup failed: %s" % cleanup_error
                     )
+                self.fc_runner.stop()
                 self.runner.stop()
             self.emulator_ready = False
             if self.status.startswith(("running", "starting")):
@@ -921,6 +1344,7 @@ def main(argv=None):
     from PySide6.QtGui import QIcon, QPixmap
     from PySide6.QtWidgets import (
         QApplication,
+        QCheckBox,
         QComboBox,
         QFileDialog,
         QGridLayout,
@@ -998,6 +1422,43 @@ def main(argv=None):
     source_url_btn.setToolTip("Current targets.h source: %s" % source_location)
     source_file_btn.setToolTip("Current targets.h source: %s" % source_location)
 
+    grid.addWidget(QLabel("FlightController"), 2, 0)
+    fc_combo = QComboBox()
+    fc_combo.addItem("None", "none")
+    fc_combo.addItem("SpeedyBeeF405Mini", "SpeedyBeeF405Mini")
+    selected_fc = fc_combo.findData(preferences.flight_controller)
+    fc_combo.setCurrentIndex(max(0, selected_fc))
+    fc_combo.setToolTip(
+        "Run a real flight-controller firmware in Renode and wire its first\n"
+        "four motor timer outputs to ESCs 1-4. None uses ESCSim's compact\n"
+        "4-way or direct configurator bridge."
+    )
+    grid.addWidget(fc_combo, 2, 1, 1, 2)
+    fc_dfu_check = QCheckBox("Boot in USB DFU")
+    fc_dfu_check.setChecked(preferences.fc_boot_mode == "dfu")
+    fc_dfu_check.setToolTip(
+        "Expose the STM32 factory-ROM DFU device (0483:df11). After a\n"
+        "successful download, ESCSim boots the programmed image and hands\n"
+        "USB over to the emulated flight-controller firmware."
+    )
+    grid.addWidget(fc_dfu_check, 2, 3)
+
+    grid.addWidget(QLabel("FC Firmware"), 3, 0)
+    fc_fw_combo = QComboBox()
+    for firmware_name in flight_controller_firmwares():
+        fc_fw_combo.addItem(
+            flight_controller_firmware_label(firmware_name), firmware_name
+        )
+    selected_fc_firmware = fc_fw_combo.findData(preferences.fc_firmware)
+    fc_fw_combo.setCurrentIndex(max(0, selected_fc_firmware))
+    fc_fw_combo.setToolTip(
+        "Firmware preloaded into the selected flight controller when USB DFU\n"
+        "mode is off. Reusing the same image preserves its configuration.\n"
+        "Future published images will be served from:\n%s"
+        % FC_FIRMWARE_BASE_URL
+    )
+    grid.addWidget(fc_fw_combo, 3, 1, 1, 3)
+
     target_names = []
     initial_target = [preferences.target]
 
@@ -1073,11 +1534,11 @@ def main(argv=None):
     source_file_btn.clicked.connect(choose_targets_file)
 
     # -- bootloader ----------------------------------------------------
-    grid.addWidget(QLabel("Bootloader"), 2, 0)
+    grid.addWidget(QLabel("Bootloader"), 4, 0)
     bl_combo = QComboBox()
-    grid.addWidget(bl_combo, 2, 1, 1, 2)
+    grid.addWidget(bl_combo, 4, 1, 1, 2)
     bl_browse = QPushButton("Browse...")
-    grid.addWidget(bl_browse, 2, 3)
+    grid.addWidget(bl_browse, 4, 3)
 
     def refresh_bootloaders():
         desired = lab.bootloader
@@ -1137,7 +1598,7 @@ def main(argv=None):
     bl_browse.clicked.connect(browse_bl)
 
     # -- firmware / can ------------------------------------------------
-    grid.addWidget(QLabel("Firmware"), 3, 0)
+    grid.addWidget(QLabel("Firmware"), 5, 0)
     fw_combo = QComboBox()
     fw_combo.addItem("Auto (newest obj/AM32_<TARGET>_*.elf)", "auto")
     fw_combo.addItem("None (blank flash, factory-fresh ESC)", "none")
@@ -1154,9 +1615,9 @@ def main(argv=None):
         "None gives a part with only the bootloader: everything else\n"
         "reads erased 0xFF, as an ESC fresh from the factory does."
     )
-    grid.addWidget(fw_combo, 3, 1, 1, 2)
+    grid.addWidget(fw_combo, 5, 1, 1, 2)
     fw_browse = QPushButton("Browse...")
-    grid.addWidget(fw_browse, 3, 3)
+    grid.addWidget(fw_browse, 5, 3)
 
     def browse_fw():
         path, _ = QFileDialog.getOpenFileName(
@@ -1193,7 +1654,7 @@ def main(argv=None):
         if index >= 0:
             fw_combo.setCurrentIndex(index)
 
-    grid.addWidget(QLabel("CAN bus"), 4, 0)
+    grid.addWidget(QLabel("CAN bus"), 6, 0)
     can_spin = QSpinBox()
     can_spin.setRange(-1, 9)
     can_spin.setValue(preferences.can_bus)
@@ -1213,9 +1674,9 @@ def main(argv=None):
         "the CAN unconnected entirely."
     )
     can_spin.setEnabled(False)
-    grid.addWidget(can_spin, 4, 1)
+    grid.addWidget(can_spin, 6, 1)
 
-    grid.addWidget(QLabel("EEPROM"), 5, 0)
+    grid.addWidget(QLabel("EEPROM"), 7, 0)
     ee_combo = QComboBox()
     ee_combo.addItem("Defaults, tuned for the simulated motor", "defaults")
     ee_combo.addItem("Blank (0xFF, factory-fresh ESC)", "blank")
@@ -1226,19 +1687,19 @@ def main(argv=None):
         "Blank: erased 0xFF, as a factory-fresh ESC ships - what a\n"
         "configurator sees before the first save."
     )
-    grid.addWidget(ee_combo, 5, 1, 1, 2)
+    grid.addWidget(ee_combo, 7, 1, 1, 2)
 
     # -- Renode download -----------------------------------------------
-    grid.addWidget(QLabel("Renode"), 6, 0)
+    grid.addWidget(QLabel("Renode"), 8, 0)
     renode_path = QLineEdit(args.renode or "not selected")
     renode_path.setReadOnly(True)
     renode_path.setToolTip("Managed downloads are stored in %s" % renode_cache)
-    grid.addWidget(renode_path, 6, 1, 1, 2)
+    grid.addWidget(renode_path, 8, 1, 1, 2)
     download_renode = QPushButton("Download Renode")
-    grid.addWidget(download_renode, 6, 3)
+    grid.addWidget(download_renode, 8, 3)
 
     # -- configurator port ---------------------------------------------
-    grid.addWidget(QLabel("Configurator"), 7, 0)
+    grid.addWidget(QLabel("Configurator"), 9, 0)
     conf_combo = QComboBox()
     if os.name != "nt":
         conf_combo.addItem("Serial port (pty)", "serial")
@@ -1255,13 +1716,14 @@ def main(argv=None):
         "Linux uses vhci_hcd; Windows uses the separately installed signed\n"
         "USB/IP virtual host-controller driver."
     )
-    grid.addWidget(conf_combo, 7, 1, 1, 2)
+    grid.addWidget(conf_combo, 9, 1, 1, 2)
 
     # -- protocol: what sits on that port ------------------------------
-    grid.addWidget(QLabel("Protocol"), 8, 0)
+    grid.addWidget(QLabel("Protocol"), 10, 0)
     proto_combo = QComboBox()
     proto_combo.addItem("FC with 4-way passthrough", "4way")
     proto_combo.addItem("Direct 1-wire adapter", "direct")
+    proto_combo.addItem("FlightController", "flightcontroller")
     proto_combo.setCurrentIndex(max(0, proto_combo.findData(preferences.protocol)))
     proto_combo.setToolTip(
         "What the configurator port pretends to be.\n"
@@ -1272,37 +1734,86 @@ def main(argv=None):
         "such an adapter produces. The web configurator decides\n"
         "FC-vs-adapter by USB vendor id, so the USB device enumerates\n"
         "accordingly; the Offline-Configurator uses its direct/1-wire\n"
-        "checkbox on the pty or tty."
+        "checkbox on the pty or tty.\n"
+        "FlightController: the selected board's own firmware and USB stack,\n"
+        "with its modeled motor timers wired to emulated ESC signal pins."
     )
-    grid.addWidget(proto_combo, 8, 1, 1, 2)
+    grid.addWidget(proto_combo, 10, 1, 1, 2)
 
-    grid.addWidget(QLabel("ESCs"), 9, 0)
+    grid.addWidget(QLabel("ESCs"), 11, 0)
     esc_count_spin = QSpinBox()
     esc_count_spin.setRange(1, MAX_ESC_COUNT)
     esc_count_spin.setValue(preferences.esc_count)
     esc_count_spin.setToolTip(
-        "Number of independent Renode ESCs exposed through the fake FC.\n"
+        "Number of independent Renode ESCs to launch (1 to 8).\n"
         "Each ESC uses its own signal, state and monitor ports. This is\n"
-        "available only for FC 4-way passthrough; direct wiring reaches\n"
-        "one signal pad."
+        "available for FC 4-way passthrough and FlightController modes;\n"
+        "direct wiring reaches one signal pad. The SpeedyBee model connects\n"
+        "its four modeled motor outputs to ESCs 1 through 4."
     )
-    grid.addWidget(esc_count_spin, 9, 1)
+    grid.addWidget(esc_count_spin, 11, 1)
+
+    last_bridge_protocol = [
+        preferences.protocol
+        if preferences.protocol in ("4way", "direct")
+        else "4way"
+    ]
 
     def protocol_changed():
-        esc_count_spin.setEnabled(proto_combo.currentData() == "4way")
+        fc_selected = fc_combo.currentData() != "none"
+        current = proto_combo.currentData()
+        if fc_selected:
+            if current in ("4way", "direct"):
+                last_bridge_protocol[0] = current
+            if current != "flightcontroller":
+                proto_combo.setCurrentIndex(
+                    proto_combo.findData("flightcontroller")
+                )
+                return
+            proto_combo.setEnabled(False)
+            esc_count_spin.setEnabled(
+                not (lab.runner.running() or lab.fc_runner.running())
+            )
+            fc_fw_combo.setEnabled(
+                not fc_dfu_check.isChecked()
+                and not (lab.runner.running() or lab.fc_runner.running())
+            )
+            fc_dfu_check.setEnabled(True)
+            if conf_combo.currentData() == "serial":
+                usb_index = conf_combo.findData("usb")
+                if usb_index >= 0:
+                    conf_combo.setCurrentIndex(usb_index)
+        else:
+            if current == "flightcontroller":
+                proto_combo.setCurrentIndex(
+                    proto_combo.findData(last_bridge_protocol[0])
+                )
+                return
+            if current in ("4way", "direct"):
+                last_bridge_protocol[0] = current
+            proto_combo.setEnabled(not lab.runner.running())
+            esc_count_spin.setEnabled(current == "4way" and not lab.runner.running())
+            fc_fw_combo.setEnabled(False)
+            fc_dfu_check.setEnabled(False)
+
+    def flight_controller_changed():
+        if lab.runner.running() or lab.fc_runner.running():
+            do_stop()
+        protocol_changed()
+        rebuild_control_panel()
 
     proto_combo.currentIndexChanged.connect(lambda _index: protocol_changed())
-    protocol_changed()
+    fc_dfu_check.stateChanged.connect(lambda _state: protocol_changed())
 
     # -- start/stop, status, log ---------------------------------------
     start_btn = QPushButton("Start")
     stop_btn = QPushButton("Stop")
     stop_btn.setEnabled(False)
-    grid.addWidget(start_btn, 10, 2)
-    grid.addWidget(stop_btn, 10, 3)
+    grid.addWidget(start_btn, 12, 2)
+    grid.addWidget(stop_btn, 12, 3)
     status_label = QLabel("stopped")
     status_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-    grid.addWidget(status_label, 10, 0, 1, 2)
+    grid.addWidget(status_label, 12, 0, 1, 2)
     metrics_label = QLabel("")
     metrics_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
     metrics_label.setToolTip(
@@ -1311,12 +1822,12 @@ def main(argv=None):
         "instructions actually retired per wall second against the\n"
         "configured PerformanceInMips, and the machine's virtual time."
     )
-    grid.addWidget(metrics_label, 11, 0, 1, 4)
+    grid.addWidget(metrics_label, 13, 0, 1, 4)
     log_view = QPlainTextEdit()
     log_view.setReadOnly(True)
     log_view.setMaximumBlockCount(2000)
     log_view.setMinimumSize(640, 240)
-    grid.addWidget(log_view, 12, 0, 1, 4)
+    grid.addWidget(log_view, 14, 0, 1, 4)
 
     control_cleanups = []
     control_signature = None
@@ -1325,7 +1836,11 @@ def main(argv=None):
         nonlocal control_pages, control_cleanups, control_signature
         if lab.target is None or lab.info is None:
             return
-        count = esc_count_spin.value() if proto_combo.currentData() == "4way" else 1
+        count = (
+            esc_count_spin.value()
+            if proto_combo.currentData() in ("4way", "flightcontroller")
+            else 1
+        )
         signature = (
             lab.target,
             bool(lab.info["dronecan"]),
@@ -1403,6 +1918,8 @@ def main(argv=None):
     can_spin.valueChanged.connect(lambda _value: rebuild_control_panel())
     esc_count_spin.valueChanged.connect(lambda _value: rebuild_control_panel())
     proto_combo.currentIndexChanged.connect(lambda _index: rebuild_control_panel())
+    fc_combo.currentIndexChanged.connect(lambda _index: flight_controller_changed())
+    protocol_changed()
 
     download_active = False
 
@@ -1465,6 +1982,9 @@ def main(argv=None):
         lab.conf = conf_combo.currentData()
         lab.protocol = proto_combo.currentData()
         lab.esc_count = esc_count_spin.value()
+        lab.flight_controller = fc_combo.currentData()
+        lab.fc_firmware = fc_fw_combo.currentData()
+        lab.fc_boot_mode = "dfu" if fc_dfu_check.isChecked() else "flash"
         lab.can_bus = can_spin.value()
         err = lab.start()
         if err:
@@ -1476,6 +1996,9 @@ def main(argv=None):
         stop_btn.setEnabled(True)
         proto_combo.setEnabled(False)
         esc_count_spin.setEnabled(False)
+        fc_combo.setEnabled(False)
+        fc_fw_combo.setEnabled(False)
+        fc_dfu_check.setEnabled(False)
 
     def do_start():
         firmware = fw_combo.currentData() or "auto"
@@ -1547,6 +2070,9 @@ def main(argv=None):
                     protocol=proto_combo.currentData(),
                     esc_count=esc_count_spin.value(),
                     can_bus=can_spin.value(),
+                    flight_controller=fc_combo.currentData(),
+                    fc_firmware=fc_fw_combo.currentData(),
+                    fc_boot_mode=("dfu" if fc_dfu_check.isChecked() else "flash"),
                 ),
             )
         )
@@ -1556,6 +2082,7 @@ def main(argv=None):
         start_btn.setEnabled(True)
         stop_btn.setEnabled(False)
         proto_combo.setEnabled(True)
+        fc_combo.setEnabled(True)
         protocol_changed()
         status_label.setText(lab.status)
 
@@ -1779,16 +2306,44 @@ def main(argv=None):
                 return "ERR conf off|serial|usb"
             conf_combo.setCurrentIndex(i)
             return "OK"
+        if cmd == "flightcontroller":
+            if lab.runner.running() or lab.fc_runner.running():
+                return "ERR stop before changing flight controller"
+            selection = rest or "none"
+            i = fc_combo.findData(selection)
+            if i < 0:
+                return "ERR flightcontroller none|SpeedyBeeF405Mini"
+            fc_combo.setCurrentIndex(i)
+            return "OK"
+        if cmd == "fcfirmware":
+            if lab.runner.running() or lab.fc_runner.running():
+                return "ERR stop before changing FC firmware"
+            i = fc_fw_combo.findData(rest)
+            if i < 0:
+                return "ERR fcfirmware %s" % "|".join(
+                    flight_controller_firmwares()
+                )
+            fc_fw_combo.setCurrentIndex(i)
+            return "OK"
+        if cmd == "fcboot":
+            if lab.runner.running() or lab.fc_runner.running():
+                return "ERR stop before changing FC boot mode"
+            if rest not in ("flash", "dfu"):
+                return "ERR fcboot flash|dfu"
+            fc_dfu_check.setChecked(rest == "dfu")
+            return "OK"
         if cmd == "protocol":
-            if lab.runner.running():
+            if lab.runner.running() or lab.fc_runner.running():
                 return "ERR stop before changing protocol"
             i = proto_combo.findData(rest)
             if i < 0:
-                return "ERR protocol 4way|direct"
+                return "ERR protocol 4way|direct|flightcontroller"
+            if rest == "flightcontroller" and fc_combo.currentData() == "none":
+                return "ERR select a flight controller first"
             proto_combo.setCurrentIndex(i)
             return "OK"
         if cmd == "escs":
-            if lab.runner.running():
+            if lab.runner.running() or lab.fc_runner.running():
                 return "ERR stop before changing ESC count"
             try:
                 count = int(rest)

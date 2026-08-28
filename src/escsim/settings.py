@@ -46,6 +46,9 @@ class LauncherSettings:
     protocol: str = "4way"
     esc_count: int = 1
     can_bus: int = 8
+    flight_controller: str = "none"
+    fc_firmware: str = "SPEEDYBEEF405V5"
+    fc_boot_mode: str = "flash"
 
 
 @dataclass(frozen=True)
@@ -138,17 +141,32 @@ class SettingsStore:
             protocol=str(launcher_raw.get("protocol", "4way")),
             esc_count=int(launcher_raw.get("esc_count", 1)),
             can_bus=int(launcher_raw.get("can_bus", 8)),
+            flight_controller=str(
+                launcher_raw.get("flight_controller", "none")
+            ),
+            fc_firmware=str(
+                launcher_raw.get("fc_firmware", "SPEEDYBEEF405V5")
+            ),
+            fc_boot_mode=str(launcher_raw.get("fc_boot_mode", "flash")),
         )
         if launcher.eeprom not in {"defaults", "blank"}:
             raise ValueError("launcher eeprom must be defaults or blank")
         if launcher.configurator not in {"serial", "usb", "off"}:
             raise ValueError("launcher configurator must be serial, usb, or off")
-        if launcher.protocol not in {"4way", "direct"}:
-            raise ValueError("launcher protocol must be 4way or direct")
+        if launcher.protocol not in {"4way", "direct", "flightcontroller"}:
+            raise ValueError(
+                "launcher protocol must be 4way, direct, or flightcontroller"
+            )
         if not 1 <= launcher.esc_count <= 8:
             raise ValueError("launcher esc_count must be 1..8")
         if not -1 <= launcher.can_bus <= 9:
             raise ValueError("launcher can_bus must be -1..9")
+        if launcher.flight_controller not in {"none", "SpeedyBeeF405Mini"}:
+            raise ValueError("unsupported launcher flight_controller")
+        if launcher.fc_firmware != "SPEEDYBEEF405V5":
+            raise ValueError("unsupported launcher fc_firmware")
+        if launcher.fc_boot_mode not in {"flash", "dfu"}:
+            raise ValueError("launcher fc_boot_mode must be flash or dfu")
         return Settings(
             schema=SETTINGS_SCHEMA,
             targets_source=source,
