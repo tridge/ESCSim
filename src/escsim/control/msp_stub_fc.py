@@ -416,11 +416,21 @@ class MspStubFC(object):
             self._reply(cmd, struct.pack("<I", 0))  # no 3D mode
         elif cmd == MSP_MOTOR_CONFIG:
             self._reply(
-                cmd, struct.pack("<HHHBBBB", 1070, 2000, 1000, 4, self.poles, 1, 0)
+                cmd,
+                struct.pack(
+                    "<HHHBBBB",
+                    1070,
+                    2000,
+                    1000,
+                    self.fourway.esc_count,
+                    self.poles,
+                    1,
+                    0,
+                ),
             )
         elif cmd == MSP_MOTOR_TELEMETRY:
-            out = bytes([4])
-            for i in range(4):
+            out = bytes([self.fourway.esc_count])
+            for i in range(self.fourway.esc_count):
                 if i == 0:
                     # matches Betaflight's DShot telemetry serialisation:
                     # voltage is the 0.25V-step EDT value >> 2, current

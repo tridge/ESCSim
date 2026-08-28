@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import queue
 import threading
 from types import SimpleNamespace
 
@@ -40,6 +41,66 @@ def make_lab():
     lab = gui.Lab(args)
     lab.runner = FakeRunner()
     return lab
+
+
+def test_process_group_stop_is_serialized():
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingRunner:
+        def __init__(self):
+            self.stop_calls = 0
+
+        def stop(self):
+            self.stop_calls += 1
+            entered.set()
+            assert release.wait(2)
+
+    runner = BlockingRunner()
+    group = gui.ProcGroup(queue.Queue())
+    group.runners = [runner]
+    first = threading.Thread(target=group.stop)
+    second = threading.Thread(target=group.stop)
+    first.start()
+    assert entered.wait(2)
+    second.start()
+    release.set()
+    first.join(2)
+    second.join(2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert runner.stop_calls == 1
+
+
+def test_process_runner_stop_is_serialized():
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingTree:
+        def __init__(self):
+            self.stop_calls = 0
+
+        def stop(self):
+            self.stop_calls += 1
+            entered.set()
+            assert release.wait(2)
+
+    runner = gui.ProcRunner(queue.Queue())
+    runner.proc = object()
+    runner.tree = BlockingTree()
+    first = threading.Thread(target=runner.stop)
+    second = threading.Thread(target=runner.stop)
+    first.start()
+    assert entered.wait(2)
+    second.start()
+    release.set()
+    first.join(2)
+    second.join(2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert runner.tree is None
 
 
 def test_failed_usb_detach_is_retained_and_retried(monkeypatch):
@@ -138,4 +199,14 @@ def test_unexpected_emulator_exit_detaches_usb(monkeypatch):
     assert detached == [9]
     assert stub.closed
     assert not lab.usb_attached
+    assert lab.status == "emulator exited, status 2"
+
+
+def test_emulator_exit_during_multi_start_does_not_leave_starting_status():
+    lab = make_lab()
+    lab.runner = FakeRunner(running=False)
+    lab.status = "starting 8 emulators..."
+
+    lab.saw_log_line("[ESC 3] [emulator exited, status 2]")
+
     assert lab.status == "emulator exited, status 2"

@@ -260,14 +260,34 @@ class DshotPanel(object):
                 self.status = status
 
 
+class CanCommandGroup(object):
+    """RawCommand vector shared only by panels from one control-tab set."""
+
+    def __init__(self):
+        self.panels = weakref.WeakSet()
+        self.lock = threading.Lock()
+
+    def add(self, panel):
+        with self.lock:
+            self.panels.add(panel)
+
+    def raw_commands(self):
+        with self.lock:
+            panels = [panel for panel in self.panels if panel.running]
+        if not panels:
+            return [0]
+        commands = [0] * (max(panel.esc_index for panel in panels) + 1)
+        for panel in panels:
+            if panel.enabled and panel.send_rawcommand:
+                commands[panel.esc_index] = int(8191 * panel.throttle)
+        return commands
+
+
 class CanPanel(object):
     """DroneCAN node thread: RawCommand/ArmingStatus stream, telemetry
     handlers and parameter set requests"""
 
-    _groups = {}
-    _groups_lock = threading.Lock()
-
-    def __init__(self, uri, esc_index=0, node_id=None):
+    def __init__(self, uri, esc_index=0, node_id=None, command_group=None):
         self.uri = uri
         self.enabled = False
         self.dna_server = False
@@ -289,26 +309,16 @@ class CanPanel(object):
         # set once make_node has spawned the IO child (or failed), so the
         # caller can sequence signal handler setup around the spawn
         self.started = threading.Event()
-        with self._groups_lock:
-            self._groups.setdefault(uri, weakref.WeakSet()).add(self)
+        self.command_group = command_group or CanCommandGroup()
+        self.command_group.add(self)
         self.thread = threading.Thread(target=self._can_thread, daemon=True)
         self.thread.start()
 
     NODE_ID = 126
 
     def _group_raw_commands(self):
-        """One consistent RawCommand vector shared by this bus's panels."""
-        with self._groups_lock:
-            panels = [
-                panel for panel in self._groups.get(self.uri, ()) if panel.running
-            ]
-        if not panels:
-            return [0]
-        commands = [0] * (max(panel.esc_index for panel in panels) + 1)
-        for panel in panels:
-            if panel.enabled and panel.send_rawcommand:
-                commands[panel.esc_index] = int(8191 * panel.throttle)
-        return commands
+        """One consistent RawCommand vector shared by this tab set."""
+        return self.command_group.raw_commands()
 
     def _can_thread(self):
         try:

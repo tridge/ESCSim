@@ -827,6 +827,7 @@ def create_ui(args=None, app=None, container=None):
                 args.can_uri,
                 esc_index=getattr(args, "can_esc_index", 0),
                 node_id=126 - getattr(args, "can_esc_index", 0),
+                command_group=getattr(args, "can_command_group", None),
             )
             if HAVE_DRONECAN and (not renode or args.renode_can)
             else None

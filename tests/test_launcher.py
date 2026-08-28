@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from escsim.gui import Lab
 
 
-def test_emulator_ports_bound_requires_both_udp_ports(monkeypatch):
+def test_emulator_ports_bound_requires_both_udp_ports():
     first = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     second = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     first.bind(("127.0.0.1", 0))
@@ -18,13 +18,8 @@ def test_emulator_ports_bound_requires_both_udp_ports(monkeypatch):
     lab.args = args
     try:
         assert lab.emulator_ports_bound()
-        assert not lab.packaged_ports_ready()
-        monkeypatch.setattr("escsim.gui.sys.frozen", True, raising=False)
-        monkeypatch.setattr("escsim.gui.sys.stdout", None)
-        assert lab.packaged_ports_ready()
         second.close()
         assert not lab.emulator_ports_bound()
-        assert not lab.packaged_ports_ready()
     finally:
         first.close()
         second.close()

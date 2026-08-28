@@ -57,6 +57,7 @@ from types import SimpleNamespace
 from escsim.control import msp_stub_fc
 from escsim.control import ui as sitl_gui
 from escsim.control import usbip as sitl_usbip
+from escsim.control.backend import CanCommandGroup
 from escsim.artifacts.catalog import ArtifactRepository
 from escsim.renode import download as renode_download
 from escsim.renode import monitor as renode_monitor
@@ -159,23 +160,25 @@ class ProcRunner(object):
         self.label = label
         self.proc = None
         self.tree = None
+        self.lock = threading.RLock()
 
     def start(self, cmd, cwd=None, env=None):
         # stdin must be a pipe we hold open: renode's console exits on
         # EOF, so inheriting a nohup'd or exhausted stdin kills the
         # emulator moments after it starts
-        self.tree = ProcessTree(
-            cmd,
-            cwd=cwd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            errors="replace",
-            env=env,
-        )
-        self.proc = self.tree.process
-        threading.Thread(target=self._pump, args=(self.proc,), daemon=True).start()
+        with self.lock:
+            self.tree = ProcessTree(
+                cmd,
+                cwd=cwd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                errors="replace",
+                env=env,
+            )
+            self.proc = self.tree.process
+            threading.Thread(target=self._pump, args=(self.proc,), daemon=True).start()
 
     def _pump(self, proc):
         for line in proc.stdout:
@@ -184,14 +187,16 @@ class ProcRunner(object):
         self.out_q.put("%s[emulator exited, status %s]" % (self.label, proc.wait()))
 
     def running(self):
-        return self.proc is not None and self.proc.poll() is None
+        with self.lock:
+            return self.proc is not None and self.proc.poll() is None
 
     def stop(self):
-        if self.proc is None:
-            return
-        self.tree.stop()
-        self.tree = None
-        self.proc = None
+        with self.lock:
+            if self.proc is None:
+                return
+            self.tree.stop()
+            self.tree = None
+            self.proc = None
 
 
 class ProcGroup(object):
@@ -200,29 +205,36 @@ class ProcGroup(object):
     def __init__(self, out_q):
         self.out_q = out_q
         self.runners = []
+        self.lock = threading.RLock()
 
     def start(self, commands, cwd=None, env=None):
-        count = len(commands)
-        try:
-            for index, command in enumerate(commands):
-                label = "[ESC %u] " % (index + 1) if count > 1 else ""
-                runner = ProcRunner(self.out_q, label=label)
-                self.runners.append(runner)
-                runner.start(command, cwd=cwd, env=env)
-        except BaseException:
-            self.stop()
-            raise
+        with self.lock:
+            count = len(commands)
+            try:
+                for index, command in enumerate(commands):
+                    label = "[ESC %u] " % (index + 1) if count > 1 else ""
+                    runner = ProcRunner(self.out_q, label=label)
+                    self.runners.append(runner)
+                    runner.start(command, cwd=cwd, env=env)
+            except BaseException:
+                self.stop()
+                raise
 
     def running(self):
-        return any(runner.running() for runner in self.runners)
+        with self.lock:
+            return any(runner.running() for runner in self.runners)
 
     def all_running(self):
-        return bool(self.runners) and all(runner.running() for runner in self.runners)
+        with self.lock:
+            return bool(self.runners) and all(
+                runner.running() for runner in self.runners
+            )
 
     def stop(self):
-        for runner in self.runners:
-            runner.stop()
-        self.runners = []
+        with self.lock:
+            for runner in self.runners:
+                runner.stop()
+            self.runners = []
 
 
 class Lab(object):
@@ -352,21 +364,6 @@ class Lab(object):
             not self.wait_port_free(port, timeout=0)
             for index in range(self.active_esc_count())
             for port in self.instance_ports(index)[:2]
-        )
-
-    def packaged_ports_ready(self):
-        """Fallback readiness signal for a windowed packaged launcher.
-
-        The ordinary source-tree launcher learns readiness from Renode's
-        ``input port on udp`` log line.  A PyInstaller windowed child has no
-        console, however, so Renode's inherited console output does not reach
-        the parent pipe.  Restrict the port signal to that exact condition so
-        source-tree launches retain the established log-based ordering.
-        """
-        return bool(
-            getattr(sys, "frozen", False)
-            and sys.stdout is None
-            and self.emulator_ports_bound()
         )
 
     def start(self):
@@ -532,7 +529,7 @@ class Lab(object):
             and self._all_emulators_running()
             and self._generation_current(generation)
         ):
-            if self.emulator_ready or self.packaged_ports_ready():
+            if self.emulator_ports_bound():
                 self.emulator_ready = True
                 break
             if self.start_failed:
@@ -607,7 +604,10 @@ class Lab(object):
             if client.socket is None:
                 deadline = time.monotonic() + 45
                 while time.monotonic() < deadline:
-                    if generation != self.generation or not self.runner.running():
+                    if (
+                        generation != self.generation
+                        or not self._all_emulators_running()
+                    ):
                         return
                     try:
                         client.connect()
@@ -624,7 +624,7 @@ class Lab(object):
                         )
                     )
                     return
-            while generation == self.generation and self.runner.running():
+            while generation == self.generation and self._all_emulators_running():
                 try:
                     current = renode_monitor.parse_metrics(
                         client.command(
@@ -745,7 +745,7 @@ class Lab(object):
             else:
                 conf_port = stub.slave_path
             with self.lifecycle_lock:
-                if generation != self.generation or not self.runner.running():
+                if generation != self.generation or not self._all_emulators_running():
                     return
                 self.stub = stub
                 self.conf_port = conf_port
@@ -848,7 +848,7 @@ class Lab(object):
                     )
                 self.runner.stop()
             self.emulator_ready = False
-            if self.status.startswith("running"):
+            if self.status.startswith(("running", "starting")):
                 exit_at = line.find("[emulator exited")
                 self.status = line[exit_at + 1 : -1]
 
@@ -1338,6 +1338,7 @@ def main(argv=None):
             if cleanup is not None:
                 cleanup()
         control_cleanups = []
+        can_command_group = CanCommandGroup()
 
         old_selected = tabs.currentWidget()
         selected_control = next(
@@ -1366,6 +1367,7 @@ def main(argv=None):
                 renode_can=(bool(lab.info["dronecan"]) and can_spin.value() >= 0),
                 esc_number=esc_index + 1 if count > 1 else None,
                 can_esc_index=esc_index,
+                can_command_group=can_command_group,
                 poles=14,
                 control_port=0,
                 log=None,
@@ -1393,12 +1395,10 @@ def main(argv=None):
                 layout.addWidget(QLabel("Could not load controls: %s" % error))
                 layout.addStretch(1)
                 control_cleanups.append(None)
-                control_signature = None
                 continue
         if selected_control is not None:
             tabs.setCurrentWidget(control_pages[min(selected_control, count - 1)])
-        if all(cleanup is not None for cleanup in control_cleanups):
-            control_signature = signature
+        control_signature = signature
 
     can_spin.valueChanged.connect(lambda _value: rebuild_control_panel())
     esc_count_spin.valueChanged.connect(lambda _value: rebuild_control_panel())
