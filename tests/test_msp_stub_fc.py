@@ -15,7 +15,6 @@ def make_stub(count):
     stub.motor_lock = threading.Lock()
     stub.motor_output_enabled = False
     stub.motor_active = False
-    stub.last_motor_command = 0.0
     stub.motor_arming_until = 0.0
     stub.in_fourway = False
     stub.freeze = False
@@ -62,7 +61,7 @@ def test_set_motor_routes_all_simulated_escs_and_msp_motor_reports_them():
     assert reported == tuple(requested[:6] + [0, 0])
 
 
-def test_motor_control_pauses_for_fourway_and_times_out():
+def test_motor_control_pauses_for_fourway_and_holds_last_value():
     stub = make_stub(4)
     stub._handle(msp_stub_fc.MSP_SET_MOTOR, struct.pack("<4H", 1200, 1300, 1400, 1500))
     stub._handle(msp_stub_fc.MSP_SET_PASSTHROUGH, b"")
@@ -75,14 +74,15 @@ def test_motor_control_pauses_for_fourway_and_times_out():
 
     stub.in_fourway = False
     stub._handle(msp_stub_fc.MSP_SET_MOTOR, struct.pack("<H", 1600))
-    timeout_from = stub.last_motor_command
-    assert (
-        stub._motor_snapshot(timeout_from + msp_stub_fc.MOTOR_ACTIVE_TIMEOUT + 0.01)
-        == [1000] * 4
-    )
-    assert not stub.motor_active
+    assert stub._motor_snapshot(stub.motor_arming_until + 60.0) == [
+        1600,
+        1000,
+        1000,
+        1000,
+    ]
+    assert stub.motor_active
     assert stub.motor_output_enabled
-    assert [motor.value for motor in stub.motors] == [1000] * 4
+    assert [motor.value for motor in stub.motors] == [1600, 1000, 1000, 1000]
 
 
 def test_motor_control_waits_for_observed_renode_arming():
@@ -98,10 +98,8 @@ def test_motor_control_waits_for_observed_renode_arming():
     stub._handle(msp_stub_fc.MSP_SET_MOTOR, struct.pack("<2H", 1400, 1500))
 
     assert stub._motor_snapshot(10.0) == [1000, 1000]
-    assert stub.last_motor_command == 10.0
     probe.armed = [True, False]
     assert stub._motor_snapshot(10.1) == [1000, 1000]
-    assert stub.last_motor_command == 10.1
     probe.armed = [True, True]
     assert stub._motor_snapshot(10.2) == [1400, 1500]
 

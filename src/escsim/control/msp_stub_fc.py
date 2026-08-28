@@ -57,10 +57,6 @@ MSP_BATTERY_STATE = 130
 MSP_SET_MOTOR = 214
 MSP_SET_PASSTHROUGH = 245
 
-# ArduPilot releases motor control when the configurator stops sending MSP.
-# Apart from being faithful to the FC we emulate, this prevents a stale slider
-# value from fighting the launcher's native Control tabs indefinitely.
-MOTOR_ACTIVE_TIMEOUT = 1.0
 # Fallback for a backend that does not answer Renode's armed-state query.  A
 # real Renode run uses the observed firmware flag instead of wall-clock time.
 MOTOR_ARM_TIME = 1.5
@@ -354,7 +350,6 @@ class MspStubFC(object):
         # ESCs in their bootloaders, where 4-way must own the signal wires.
         self.motor_output_enabled = False
         self.motor_active = False
-        self.last_motor_command = 0.0
         self.motor_arming_until = 0.0
         # set to stop updating the telemetry while still answering MSP,
         # reproducing Betaflight serving its cached values after the
@@ -504,16 +499,6 @@ class MspStubFC(object):
                 motor.value > 1000 and not ready[index]
                 for index, motor in enumerate(self.motors)
             )
-            if waiting_to_arm:
-                self.last_motor_command = now
-            if (
-                self.motor_active
-                and now - self.last_motor_command > MOTOR_ACTIVE_TIMEOUT
-            ):
-                self.motor_active = False
-                self.motor_arming_until = 0.0
-                for motor in self.motors:
-                    motor.value = 1000
             if self.in_fourway or not self.motor_output_enabled:
                 return None
             if not self.motor_active:
@@ -694,7 +679,6 @@ class MspStubFC(object):
                         self.motors[index].value = struct.unpack_from(
                             "<H", payload, index * 2
                         )[0]
-                    self.last_motor_command = max(now, self.motor_arming_until)
                     self.motor_active = True
             self._reply(cmd)
         else:
