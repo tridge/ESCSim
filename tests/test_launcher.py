@@ -49,6 +49,34 @@ def test_four_way_instances_use_isolated_port_triplets():
     assert lab.active_esc_count() == 8
 
 
+def test_metrics_are_formatted_on_one_line_per_renode_instance():
+    lab = object.__new__(Lab)
+    lab.protocol = "flightcontroller"
+    lab.esc_count = 2
+    lab.fc_runner_required = True
+    lab.info = {"app_base": 0x08001000}
+    lab._all_emulators_running = lambda: True
+    sample = {
+        "pc": 0x08001234,
+        "mips": 125,
+        "instructions": 100,
+        "virtual_seconds": 12.5,
+        "host_seconds": 10.0,
+        "speedup": 0.75,
+        "executed_mips": 20.0,
+    }
+    lab.metrics = {
+        "FC": dict(sample, pc=0x08010000),
+        "ESC 1": sample,
+    }
+
+    assert lab.format_metrics_lines() == [
+        "FC: PC 0x08010000 | 0.75x realtime | 20 of 125 MIPS | vt 12.5s",
+        "ESC 1: PC 0x08001234 | 0.75x realtime | 20 of 125 MIPS | vt 12.5s",
+        "ESC 2: waiting for PC and speedup...",
+    ]
+
+
 def test_four_way_start_launches_one_command_per_esc(tmp_path, monkeypatch):
     firmware = tmp_path / "firmware.elf"
     firmware.write_bytes(b"elf")

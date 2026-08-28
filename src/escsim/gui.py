@@ -19,9 +19,9 @@ built for the target's signal pin (a PA2 bootloader on a PB4 target
 answers nothing), so the list only offers AM32_<MCU>_BOOTLOADER_<PIN>*
 builds from configured search paths and the artifact catalog.
 
-The Renode monitor is served on a telnet port and polled once a
-second, so the status panel shows the live PC (labelled when it is
-executing inside the bootloader), the emulation speed against real
+Each Renode monitor is served on a telnet port and polled once a
+second, so the status panel shows each instance's live PC (labelled when
+it is executing inside the bootloader), the emulation speed against real
 time, the retired instruction rate and the machine's virtual time.
 
 with --control-port N the UI can be driven over a localhost TCP
@@ -284,7 +284,7 @@ class Lab(object):
         self.firmware = "auto"  # auto | none | path
         self.targets_header = None
         self.eeprom = "defaults"  # defaults | blank
-        self.metrics = None  # latest monitor sample
+        self.metrics = {}  # latest monitor samples, keyed by FC / ESC number
         self.generation = 0  # invalidates old pollers
         self.conf = "usb" if os.name == "nt" else "serial"
         self.protocol = "4way"  # 4way | direct
@@ -557,6 +557,7 @@ class Lab(object):
                 return "could not prepare flight controller: %s" % error
         self.emulator_ready = False
         self.start_failed = False
+        self.metrics = {}
         self.conf_port = ""
         count = self.active_esc_count()
         total = count + (1 if fc_selected and self.fc_boot_mode == "flash" else 0)
@@ -691,21 +692,18 @@ class Lab(object):
             if not self.status.startswith("emulator exited"):
                 self.status = "emulator did not come up"
             return
-        waiting_for_dfu = (
-            self.protocol == "flightcontroller" and self.fc_boot_mode == "dfu"
-        )
-        if not waiting_for_dfu:
+        metric_monitors = [
+            ("ESC %u" % (index + 1), monitor, False)
+            for index, monitor in enumerate(monitors)
+        ]
+        if fc_monitor is not None:
+            metric_monitors.insert(0, ("FC", fc_monitor, True))
+        for label, monitor, is_fc in metric_monitors:
             threading.Thread(
                 target=self._metrics_loop,
-                args=(generation, fc_monitor or monitors[0]),
+                args=(generation, label, monitor, is_fc),
                 daemon=True,
             ).start()
-        for monitor in (
-            monitors
-            if fc_monitor is not None
-            else (monitors if waiting_for_dfu else monitors[1:])
-        ):
-            monitor.close()
         if bl is not None and self.protocol != "flightcontroller":
             self._enter_bootloader()
         if not self._generation_current(generation):
@@ -744,7 +742,7 @@ class Lab(object):
             s.close()
         self.log("holding the signal wire; ESC reset into the bootloader")
 
-    def _metrics_loop(self, generation, client=None):
+    def _metrics_loop(self, generation, label, client=None, is_fc_monitor=False):
         """poll the Renode monitor for PC and timing, and derive the
         realtime speedup from virtual-vs-wall deltas over a sliding
         window (Renode advances in bursts, so an instant ratio just
@@ -752,7 +750,6 @@ class Lab(object):
         client = client or renode_monitor.MonitorClient(
             "127.0.0.1", self.args.monitor_port
         )
-        is_fc_monitor = self.protocol == "flightcontroller"
         if is_fc_monitor:
             with self.fc_monitor_lock:
                 self.fc_monitor = client
@@ -777,24 +774,23 @@ class Lab(object):
                         (
                             "__monitor_error__",
                             generation,
+                            label,
                             "monitor did not become ready",
                         )
                     )
                     return
             while generation == self.generation and self._all_emulators_running():
                 try:
-                    command = (
-                        FC_METRICS_COMMAND
-                        if self.protocol == "flightcontroller"
-                        else METRICS_COMMAND
-                    )
+                    command = FC_METRICS_COMMAND if is_fc_monitor else METRICS_COMMAND
                     current = renode_monitor.parse_metrics(
                         client.command(
                             command, timeout=60 if not history else 5
                         )
                     )
                 except (OSError, TimeoutError, ValueError) as error:
-                    self.log_q.put(("__monitor_error__", generation, str(error)))
+                    self.log_q.put(
+                        ("__monitor_error__", generation, label, str(error))
+                    )
                     return
                 current["wall_seconds"] = time.monotonic()
                 history.append(current)
@@ -811,7 +807,7 @@ class Lab(object):
                     if wall > 0 and virtual >= 0:
                         current["speedup"] = virtual / wall
                         current["executed_mips"] = executed / wall / 1e6
-                self.log_q.put(("__metrics__", generation, current))
+                self.log_q.put(("__metrics__", generation, label, current))
                 time.sleep(1)
         finally:
             if is_fc_monitor:
@@ -820,16 +816,12 @@ class Lab(object):
                         self.fc_monitor = None
             client.close()
 
-    def format_metrics(self):
-        """one status line: PC (with the flash region it is executing
-        from), realtime speedup, executed MIPS and virtual time"""
-        m = self.metrics
-        if m is None:
-            return ""
+    def _format_instance_metrics(self, label, m):
+        """Format one Renode process's PC, speed and optional FC counters."""
         where = ""
         app_base = (
             0x0800C000
-            if self.protocol == "flightcontroller"
+            if label == "FC"
             else (self.info or {}).get("app_base")
         )
         if app_base:
@@ -860,7 +852,30 @@ class Lab(object):
                         m["dshot_type"],
                     )
                 )
-        return " | ".join(parts)
+        return "%s: %s" % (label, " | ".join(parts))
+
+    def metric_labels(self):
+        labels = ["ESC %u" % (index + 1) for index in range(self.active_esc_count())]
+        if self.fc_runner_required:
+            labels.insert(0, "FC")
+        return labels
+
+    def format_metrics_lines(self):
+        """One Target-tab line per currently running Renode process."""
+        if not self._all_emulators_running():
+            return []
+        return [
+            (
+                self._format_instance_metrics(label, self.metrics[label])
+                if label in self.metrics
+                else "%s: waiting for PC and speedup..." % label
+            )
+            for label in self.metric_labels()
+        ]
+
+    def format_metrics(self):
+        """Compact all per-process metrics for the text control interface."""
+        return " || ".join(self.format_metrics_lines())
 
     def _start_stub(self, generation):
         if self.protocol == "flightcontroller":
@@ -1156,7 +1171,7 @@ class Lab(object):
                 raise RuntimeError(error or "FC monitor did not become ready")
             threading.Thread(
                 target=self._metrics_loop,
-                args=(generation, monitor),
+                args=(generation, "FC", monitor, True),
                 daemon=True,
             ).start()
             self._attach_firmware_usb(generation)
@@ -1244,7 +1259,7 @@ class Lab(object):
                 self.log("flight-controller flash save failed: %s" % error)
             finally:
                 monitor.close()
-        self.metrics = None
+        self.metrics = {}
         cleanup_error = self._stop_stub()
         self.fc_runner.stop()
         self.runner.stop()
@@ -1826,20 +1841,25 @@ def main(argv=None):
     status_label = QLabel("stopped")
     status_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
     grid.addWidget(status_label, 12, 0, 1, 2)
-    metrics_label = QLabel("")
-    metrics_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-    metrics_label.setToolTip(
-        "Live from the Renode monitor: current PC (labelled when it is\n"
+    metrics_labels = []
+    metrics_tooltip = (
+        "Live from one Renode monitor: current PC (labelled when it is\n"
         "executing the bootloader), emulation speed against real time,\n"
         "instructions actually retired per wall second against the\n"
         "configured PerformanceInMips, and the machine's virtual time."
     )
-    grid.addWidget(metrics_label, 13, 0, 1, 4)
+    for index in range(MAX_ESC_COUNT + 1):
+        label = QLabel("")
+        label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        label.setToolTip(metrics_tooltip)
+        label.setVisible(False)
+        grid.addWidget(label, 13 + index, 0, 1, 4)
+        metrics_labels.append(label)
     log_view = QPlainTextEdit()
     log_view.setReadOnly(True)
     log_view.setMaximumBlockCount(2000)
     log_view.setMinimumSize(640, 240)
-    grid.addWidget(log_view, 14, 0, 1, 4)
+    grid.addWidget(log_view, 13 + len(metrics_labels), 0, 1, 4)
 
     control_cleanups = []
     control_signature = None
@@ -2159,11 +2179,11 @@ def main(argv=None):
                 continue
             if isinstance(item, tuple) and item[0] == "__metrics__":
                 if item[1] == lab.generation:
-                    lab.metrics = item[2]
+                    lab.metrics[item[2]] = item[3]
                 continue
             if isinstance(item, tuple) and item[0] == "__monitor_error__":
                 if item[1] == lab.generation:
-                    lines.append("[monitor] %s" % item[2])
+                    lines.append("[monitor %s] %s" % (item[2], item[3]))
                 continue
             if isinstance(item, tuple) and item[0] == "__target__":
                 _tag, t, info = item
@@ -2249,7 +2269,11 @@ def main(argv=None):
         if lines:
             log_view.appendPlainText("\n".join(lines))
         status_label.setText(lab.status)
-        metrics_label.setText(lab.format_metrics())
+        metric_lines = lab.format_metrics_lines()
+        for index, label in enumerate(metrics_labels):
+            text = metric_lines[index] if index < len(metric_lines) else ""
+            label.setText(text)
+            label.setVisible(bool(text))
 
     timer = QTimer()
     timer.timeout.connect(drain_log)

@@ -48,6 +48,7 @@ def test_speedybee_platform_wires_four_escs_and_fixed_sensors(tmp_path):
     assert "adc1 FeedSample 1500 17 -1" in script_text
     assert "sysbus WriteWord 0x1FFF7A2A 1500" in script_text
     assert 'emulation CreateUSBIPServer 5200 "usb"' in script_text
+    assert 'emulation SetGlobalQuantum "0.001"' in script_text
     assert "macro reset" in script_text
     assert "cpu VectorTableOffset 0x08000000" in script_text
 

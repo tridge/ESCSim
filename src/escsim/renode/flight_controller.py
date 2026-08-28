@@ -350,7 +350,11 @@ def write_speedybee_script(
         f"    cpu VectorTableOffset 0x{FLASH_BASE:08X}",
         '"""',
         "cpu PerformanceInMips 125",
-        'emulation SetGlobalQuantum "0.0001"',
+        # Match the proven ArduPilot F405 setup.  DShot response timing is
+        # scheduled inside the machine and does not require a sub-millisecond
+        # global synchronization quantum; 0.1ms only makes Renode rendezvous
+        # ten times as often.
+        'emulation SetGlobalQuantum "0.001"',
         "logLevel 3 sysbus.adc1",
         "logLevel 3 sysbus.dma1",
         "logLevel 3 sysbus.dma2",
