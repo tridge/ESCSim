@@ -14,6 +14,12 @@ def test_required_runtime_resources_are_package_owned():
         package.joinpath("renode", "resources", "scripts", "am32_l431.resc"),
         package.joinpath("renode", "resources", "FC_Firmware", "SPEEDYBEEF405V5.hex"),
         package.joinpath(
+            "renode",
+            "resources",
+            "FC_Firmware",
+            "ARDUPILOT_SPEEDYBEEF405MINI.hex",
+        ),
+        package.joinpath(
             "renode", "resources", "peripherals", "common", "AM32_GuiLink.cs"
         ),
     )

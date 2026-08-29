@@ -25,10 +25,11 @@ FLASH_BASE = 0x08000000
 FLASH_SIZE = 1024 * 1024
 BETAFLIGHT_POLL_TRAMPOLINE = FLASH_BASE + FLASH_SIZE - 16
 BETAFLIGHT_SCHEDULER_TRAMPOLINE = FLASH_BASE + FLASH_SIZE - 48
-# Betaflight's STM32F405 linker reserves flash sector 1 for configuration.
-# Its distributed HEX is dense and contains erased bytes over this sector, so
-# repeat-start image matching must ignore live settings written there.
-BETAFLIGHT_CONFIG_RANGES = ((0x4000, 0x8000),)
+# Both bundled F405 firmwares reserve flash sector 1 for configuration
+# (ArduPilot uses STORAGE_FLASH_PAGE 1). Their HEX files are dense and contain
+# erased bytes over this sector, so repeat-start matching must ignore settings
+# written there by either firmware.
+FC_CONFIG_RANGES = ((0x4000, 0x8000),)
 USBIP_PORT_OFFSET = 2
 MONITOR_PORT_OFFSET = 4
 FC_FIRMWARE_BASE_URL = (
@@ -38,6 +39,10 @@ FC_FIRMWARES = {
     "SPEEDYBEEF405V5": {
         "filename": "SPEEDYBEEF405V5.hex",
         "label": "Betaflight 2026.6.1 (SPEEDYBEEF405V5)",
+    },
+    "ARDUPILOT_SPEEDYBEEF405MINI": {
+        "filename": "ARDUPILOT_SPEEDYBEEF405MINI.hex",
+        "label": "ArduPilot Copter 4.8.0-dev (SpeedyBeeF405Mini)",
     },
 }
 
@@ -289,7 +294,7 @@ def _matches_selected_firmware(
 ) -> bool:
     """Compare immutable firmware bytes, excluding saved configuration."""
     spans = [(offset, offset + len(payload))]
-    for preserve_start, preserve_end in BETAFLIGHT_CONFIG_RANGES:
+    for preserve_start, preserve_end in FC_CONFIG_RANGES:
         next_spans = []
         for start, end in spans:
             if end <= preserve_start or start >= preserve_end:
@@ -658,10 +663,10 @@ def load_image(flash: Path, image: Path, address: int = FLASH_BASE) -> None:
 def select_firmware(flash: Path, image: Path) -> bool:
     """Select an Intel HEX FC image, preserving settings on repeat starts.
 
-    Returns true when flash was replaced. The first changed programmed byte
+    Returns true when flash was replaced. The first changed immutable byte
     selects a new image; in that case erased flash is rebuilt atomically and
-    every HEX chunk is applied. If all image chunks already match, bytes not
-    present in the HEX (normally firmware configuration) remain untouched.
+    every HEX chunk is applied. If all immutable bytes already match, the
+    reserved configuration sector and bytes absent from the HEX remain intact.
     """
     image = Path(image)
     try:
@@ -744,7 +749,7 @@ def write_speedybee_platform(
         for index, port in enumerate(connected_state_ports)
     )
     path.write_text(
-        f'''using "{base}"
+        f"""using "{base}"
 
 rcc:
     hseFrequency: 8000000
@@ -834,7 +839,7 @@ gpioPortB:
 
 gpioPortA:
     4 -> spi1Mux@0
-''',
+""",
         encoding="utf-8",
     )
     return path

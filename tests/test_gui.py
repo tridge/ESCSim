@@ -38,7 +38,7 @@ def test_launcher_preferences_round_trip(tmp_path):
         esc_count=8,
         can_bus=-1,
         flight_controller="SpeedyBeeF405Mini",
-        fc_firmware="SPEEDYBEEF405V5",
+        fc_firmware="ARDUPILOT_SPEEDYBEEF405MINI",
         fc_boot_mode="dfu",
     )
     store.save(Settings(launcher=expected))

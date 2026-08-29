@@ -80,9 +80,12 @@ published images.
 ## Flight-controller DFU
 
 **FC Firmware** selects an image to preload for a direct, non-DFU start. The
-bundled initial choice is Betaflight 2026.6.1 for `SPEEDYBEEF405V5` (revision
-`6dbc4218f`). Re-selecting the same image preserves configuration stored beyond
-its programmed HEX ranges. Future images are reserved under
+bundled choices are Betaflight 2026.6.1 for `SPEEDYBEEF405V5` (revision
+`6dbc4218f`) and ArduPilot Copter 4.8.0-dev for `SpeedyBeeF405Mini` (revision
+`af2a1bafc8a`). The ArduPilot image includes its bootloader, so either choice
+boots directly. Re-selecting the same image preserves its flash-backed
+configuration; selecting a different firmware replaces the emulated flash.
+Future images are reserved under
 `https://firmware.ardupilot.org/Tools/AM32-tools/ESCSim/FC_Firmware/`.
 
 Selecting **Boot in USB DFU** exposes the STM32 ROM-style `0483:df11` DfuSe
@@ -91,11 +94,12 @@ that device, starts Renode from the persistent emulated flash, and attaches the
 USB device created by the uploaded bootloader or application. Firmware can be
 loaded with the Betaflight web tool or a normal `dfu-util`/DfuSe workflow.
 
-The emulated FC flash persists in ESCSim's cache across Stop/Start. This permits
-the usual two-stage ArduPilot workflow: upload a SpeedyBeeF405Mini bootloader in
-DFU mode, then upload `arducopter.apj` through the bootloader's USB serial
-endpoint. Sensors return fixed bench values (including a nominal 12 V supply),
-while the four motor outputs and bidirectional DShot capture paths remain live.
+The emulated FC flash persists in ESCSim's cache across Stop/Start. In addition
+to direct selection of the bundled ArduPilot image, this permits the usual
+two-stage ArduPilot workflow: upload a SpeedyBeeF405Mini bootloader in DFU mode,
+then upload `arducopter.apj` through the bootloader's USB serial endpoint.
+Sensors return fixed bench values (including a nominal 12 V supply), while the
+four motor outputs and bidirectional DShot capture paths remain live.
 
 ESCSim recognizes supported Betaflight Thumb instruction sequences and enables
 the startup and 4-way optimizations automatically; no ELF is required. During

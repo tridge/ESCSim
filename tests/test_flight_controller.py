@@ -305,18 +305,28 @@ def test_stm32f4_otg_assigns_firmware_address_before_usbip_setup():
     assert "_ => HandleSetupPacket(packet, additionalData," in otg
 
 
-def test_bundled_betaflight_image_is_valid_and_selectable(tmp_path):
-    assert flight_controller_firmwares() == ("SPEEDYBEEF405V5",)
-    image = flight_controller_firmware("SPEEDYBEEF405V5")
+@pytest.mark.parametrize(
+    ("firmware", "vectors"),
+    (
+        ("SPEEDYBEEF405V5", "f0ff001085240508"),
+        ("ARDUPILOT_SPEEDYBEEF405MINI", "00060020e1010008"),
+    ),
+)
+def test_bundled_fc_images_are_valid_and_selectable(tmp_path, firmware, vectors):
+    assert flight_controller_firmwares() == (
+        "SPEEDYBEEF405V5",
+        "ARDUPILOT_SPEEDYBEEF405MINI",
+    )
+    image = flight_controller_firmware(firmware)
     flash = tmp_path / "flash.bin"
 
     assert select_firmware(flash, image)
     content = flash.read_bytes()
     assert len(content) == FLASH_SIZE
-    assert content[:8] == bytes.fromhex("f0ff001085240508")
+    assert content[:8] == bytes.fromhex(vectors)
 
-    # Re-selecting an unchanged firmware must preserve configuration bytes
-    # outside the HEX image instead of factory-resetting every app start.
+    # Re-selecting an unchanged firmware must preserve its reserved settings
+    # sector and bytes outside its programmed extent.
     with flash.open("r+b") as stream:
         stream.seek(0x4000)
         stream.write(b"configured sector")
