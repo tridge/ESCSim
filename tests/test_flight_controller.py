@@ -22,6 +22,7 @@ from escsim.renode.flight_controller import (
     write_speedybee_platform,
     write_speedybee_script,
 )
+from escsim.renode.generator import renode_path
 
 
 def test_speedybee_platform_wires_four_escs_and_fixed_sensors(tmp_path):
@@ -104,7 +105,7 @@ def test_speedybee_script_installs_verified_elf_hotpatches(tmp_path):
         ),
     ).read_text()
 
-    assert f"sysbus LoadSymbolsFrom @{symbols}" in script
+    assert f"sysbus LoadSymbolsFrom @{renode_path(symbols)}" in script
     assert "cpu AddHook 0x08001000" in script
     assert "system_state_address=0x20000100" in script
     assert "systick_uptime_address=0x20000104" in script

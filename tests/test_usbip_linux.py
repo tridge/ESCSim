@@ -161,6 +161,7 @@ def test_exact_vhci_port_liveness(tmp_path, monkeypatch):
     assert not usbip.port_attached(7)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Linux sysfs path test")
 def test_find_tty_for_exact_vhci_port(tmp_path, monkeypatch):
     vhci = tmp_path / "vhci"
     vhci.mkdir()
