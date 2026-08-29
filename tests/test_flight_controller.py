@@ -22,7 +22,10 @@ from escsim.renode.flight_controller import (
 def test_speedybee_platform_wires_four_escs_and_fixed_sensors(tmp_path):
     flash = ensure_flash(tmp_path / "flash.bin")
     platform = write_speedybee_platform(
-        tmp_path, (5101, 5102, 5103, 5104), flash
+        tmp_path,
+        (5101, 5102, 5103, 5104),
+        flash,
+        (5201, 5202, 5203, 5204),
     )
     script = write_speedybee_script(tmp_path, platform, flash, 5200)
 
@@ -37,6 +40,11 @@ def test_speedybee_platform_wires_four_escs_and_fixed_sensors(tmp_path):
         True,
     ]
     assert "motorBridge: Miscellaneous.ESCSim_STM32_DShot" in platform_text
+    assert "gpio: gpioPortB" in platform_text
+    assert "[0-3] -> gpioPortB@[1, 0, 10, 11]" in platform_text
+    assert "[1, 0, 10, 11] -> motorBridge@[0-3]" in platform_text
+    assert "esc1StatePort: 5201" in platform_text
+    assert "esc4StatePort: 5204" in platform_text
     assert "timer2: timer2" in platform_text
     assert "timer3: timer3" in platform_text
     assert "timer4: timer4" in platform_text
@@ -67,6 +75,9 @@ def test_speedybee_dshot_bridge_supports_betaflight_channel_dma():
     assert "case Timer2Base + Ccr3:" in bridge
     assert "case Timer2Base + Ccr4:" in bridge
     assert "ObservedStreams = { 1, 2, 3, 6, 7 }" in bridge
+    assert "SampleSerialBit" in bridge
+    assert "HoldEscHighAndReset" in bridge
+    assert "ReplaySerialReply" in bridge
 
     uart_pump = (
         flight_controller_firmware("SPEEDYBEEF405V5").parents[1]

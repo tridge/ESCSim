@@ -38,6 +38,7 @@ class FlightControllerSpec:
     outdir: Path
     flash: Path
     esc_ports: tuple[int, ...]
+    esc_state_ports: tuple[int, ...]
     monitor_port: int
     usbip_port: int
     renode: str | None = None
@@ -45,7 +46,12 @@ class FlightControllerSpec:
     def command(self) -> list[str]:
         if self.model != "SpeedyBeeF405Mini":
             raise ValueError(f"unsupported flight controller {self.model}")
-        platform = write_speedybee_platform(self.outdir, self.esc_ports, self.flash)
+        platform = write_speedybee_platform(
+            self.outdir,
+            self.esc_ports,
+            self.flash,
+            self.esc_state_ports,
+        )
         script = write_speedybee_script(self.outdir, platform, self.flash, self.usbip_port)
         return [
             find_renode(self.renode),
@@ -180,7 +186,10 @@ def select_firmware(flash: Path, image: Path) -> bool:
 
 
 def write_speedybee_platform(
-    outdir: Path, esc_ports: tuple[int, ...], flash: Path
+    outdir: Path,
+    esc_ports: tuple[int, ...],
+    flash: Path,
+    esc_state_ports: tuple[int, ...] = (),
 ) -> Path:
     """Generate the small board overlay; port values are launch-specific."""
     if not 1 <= len(esc_ports) <= 8:
@@ -195,9 +204,17 @@ def write_speedybee_platform(
     # requested; additional ESCs still run and have their own Control tabs.
     connected_ports = list(esc_ports[:4])
     connected_ports.extend([0] * (4 - len(connected_ports)))
+    connected_state_ports = list(esc_state_ports[:4])
+    connected_state_ports.extend([0] * (4 - len(connected_state_ports)))
+    if esc_state_ports and len(esc_state_ports) != len(esc_ports):
+        raise ValueError("ESC state ports must match ESC signal ports")
     ports = "\n".join(
         f"    esc{index + 1}Port: {port}"
         for index, port in enumerate(connected_ports)
+    )
+    state_ports = "\n".join(
+        f"    esc{index + 1}StatePort: {port}"
+        for index, port in enumerate(connected_state_ports)
     )
     path.write_text(
         f'''using "{base}"
@@ -275,10 +292,16 @@ timer4UpdateDMA: Miscellaneous.AP_STM32_Timer_UpdateDMA @ sysbus 0x60000140
 
 motorBridge: Miscellaneous.ESCSim_STM32_DShot @ sysbus 0x60000200
     dma: dma1
+    gpio: gpioPortB
     timer2: timer2
     timer3: timer3
     timer4: timer4
 {ports}
+{state_ports}
+    [0-3] -> gpioPortB@[1, 0, 10, 11]
+
+gpioPortB:
+    [1, 0, 10, 11] -> motorBridge@[0-3]
 
 gpioPortA:
     4 -> spi1Mux@0

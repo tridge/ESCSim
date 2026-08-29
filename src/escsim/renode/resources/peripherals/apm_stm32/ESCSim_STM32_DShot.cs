@@ -11,6 +11,8 @@
 // separate Renode processes do not share virtual time, and this one-cycle
 // pipeline keeps the FC's 80us capture window deterministic.
 using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading;
@@ -20,28 +22,51 @@ using Antmicro.Renode.Core.Structure.Registers;
 using Antmicro.Renode.Peripherals;
 using Antmicro.Renode.Peripherals.Bus;
 using Antmicro.Renode.Peripherals.DMA;
+using Antmicro.Renode.Peripherals.GPIOPort;
 using Antmicro.Renode.Peripherals.Timers;
 using Antmicro.Renode.Time;
 
 namespace Antmicro.Renode.Peripherals.Miscellaneous
 {
     public sealed class ESCSim_STM32_DShot : IDoubleWordPeripheral, IKnownSize,
-        IDisposable
+        IGPIOReceiver, INumberedGPIOOutput, IDisposable
     {
         public ESCSim_STM32_DShot(IMachine machine, STM32DMA dma,
+            STM32_GPIOPort gpio,
             STM32_Timer timer2, STM32_Timer timer3, STM32_Timer timer4,
-            int esc1Port, int esc2Port, int esc3Port, int esc4Port)
+            int esc1Port, int esc2Port, int esc3Port, int esc4Port,
+            int esc1StatePort = 0, int esc2StatePort = 0,
+            int esc3StatePort = 0, int esc4StatePort = 0)
         {
             this.machine = machine;
             this.dma = dma;
+            this.gpio = gpio;
             this.timer2 = timer2;
             this.timer3 = timer3;
             this.timer4 = timer4;
+            Connections = Enumerable.Range(0, EscCount)
+                .ToDictionary(index => index, _ => (IGPIO)new GPIO());
             sockets = new UdpClient[EscCount];
+            stateSockets = new UdpClient[EscCount];
             cachedReplies = new ushort?[EscCount];
+            serialReplyBytes = new Queue<byte>[EscCount];
+            serialReplyReady = new AutoResetEvent[EscCount];
+            serialRequestBytes = new List<byte>[EscCount];
+            lineLevels = new bool[EscCount];
+            decoding = new bool[EscCount];
+            replyDriving = new bool[EscCount];
+            serialSessions = new bool[EscCount];
+            expectingBufferData = new bool[EscCount];
+            serialGeneration = new uint[EscCount];
             var ports = new[] { esc1Port, esc2Port, esc3Port, esc4Port };
+            var statePorts = new[] {
+                esc1StatePort, esc2StatePort, esc3StatePort, esc4StatePort,
+            };
             for(var index = 0; index < EscCount; index++)
             {
+                serialReplyBytes[index] = new Queue<byte>();
+                serialReplyReady[index] = new AutoResetEvent(false);
+                serialRequestBytes[index] = new List<byte>();
                 if(ports[index] <= 0)
                 {
                     continue;
@@ -57,6 +82,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     Name = string.Format("ESCSim ESC{0} reply", index + 1),
                 };
                 thread.Start();
+                if(statePorts[index] > 0)
+                {
+                    stateSockets[index] = new UdpClient();
+                    stateSockets[index].Connect(IPAddress.Loopback,
+                        statePorts[index]);
+                }
             }
 
             foreach(var stream in ObservedStreams)
@@ -80,6 +111,21 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             LastFrame = 0;
             BidirectionalFrames = 0;
             LastDshotType = 0;
+            SerialRequests = 0;
+            SerialReplies = 0;
+            lock(serialSync)
+            {
+                for(var index = 0; index < EscCount; index++)
+                {
+                    serialReplyBytes[index].Clear();
+                    serialRequestBytes[index].Clear();
+                    decoding[index] = false;
+                    replyDriving[index] = false;
+                    serialSessions[index] = false;
+                    expectingBufferData[index] = false;
+                    serialGeneration[index]++;
+                }
+            }
         }
 
         public uint ReadDoubleWord(long offset)
@@ -92,6 +138,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             case 0x0C: return LastFrame;
             case 0x10: return BidirectionalFrames;
             case 0x14: return LastDshotType;
+            case 0x18: return SerialRequests;
+            case 0x1C: return SerialReplies;
             default: return 0;
             }
         }
@@ -106,6 +154,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public uint LastFrame { get; private set; }
         public uint BidirectionalFrames { get; private set; }
         public uint LastDshotType { get; private set; }
+        public uint SerialRequests { get; private set; }
+        public uint SerialReplies { get; private set; }
+
+        public IReadOnlyDictionary<int, IGPIO> Connections { get; private set; }
 
         public void Dispose()
         {
@@ -117,6 +169,41 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     socket.Close();
                 }
             }
+            foreach(var socket in stateSockets)
+            {
+                if(socket != null)
+                {
+                    socket.Close();
+                }
+            }
+            foreach(var ready in serialReplyReady)
+            {
+                ready.Dispose();
+            }
+        }
+
+        // Betaflight's 4-way implementation changes each motor pin from its
+        // timer alternate function to ordinary GPIO and bit-bangs 19200 8N1.
+        // The four ESCs are separate Renode machines, so this bridge decodes
+        // those real pin writes into the existing serial-over-UDP wire format
+        // and replays the bootloader's bytes onto the FC GPIO input.
+        public void OnGPIO(int number, bool value)
+        {
+            if(number < 0 || number >= EscCount)
+            {
+                return;
+            }
+            lineLevels[number] = value;
+            if(replyDriving[number] || !IsGpioOutput(number) ||
+               decoding[number] || value)
+            {
+                return;
+            }
+            decoding[number] = true;
+            serialBit[number] = 0;
+            serialByte[number] = 0;
+            machine.ScheduleAction(TimeInterval.FromMicroseconds(SerialHalfStartUs),
+                _ => SampleSerialBit(number), name: "Betaflight 4-way RX sample");
         }
 
         private uint? ObserveStream(int stream, uint configuration)
@@ -355,8 +442,32 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 try
                 {
                     var packet = sockets[esc].Receive(ref endpoint);
-                    if(packet.Length < 8 || Get16(packet, 0) != Magic ||
-                       packet[3] != 4 || packet[2] > Dshot600)
+                    if(packet.Length < 6 || Get16(packet, 0) != Magic)
+                    {
+                        continue;
+                    }
+                    if(packet[2] == SerialType)
+                    {
+                        var length = packet[3];
+                        var flags = Get16(packet, 4);
+                        if(packet.Length != SerialHeaderSize + length ||
+                           (flags & SerialTxDone) != 0 || length == 0)
+                        {
+                            continue;
+                        }
+                        lock(serialSync)
+                        {
+                            for(var offset = 0; offset < length; offset++)
+                            {
+                                serialReplyBytes[esc].Enqueue(
+                                    packet[SerialHeaderSize + offset]);
+                            }
+                        }
+                        serialReplyReady[esc].Set();
+                        continue;
+                    }
+                    if(packet.Length < 8 || packet[3] != 4 ||
+                       packet[2] > Dshot600)
                     {
                         continue;
                     }
@@ -378,6 +489,282 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 {
                     return;
                 }
+            }
+        }
+
+        private bool IsGpioOutput(int esc)
+        {
+            var pin = GpioPins[esc];
+            return ((gpio.ReadDoubleWord(GpioMode) >> (pin * 2)) & 3) ==
+                GpioOutput;
+        }
+
+        private void SampleSerialBit(int esc)
+        {
+            if(!decoding[esc] || replyDriving[esc])
+            {
+                return;
+            }
+            if(lineLevels[esc])
+            {
+                serialByte[esc] |= (byte)(1 << serialBit[esc]);
+            }
+            serialBit[esc]++;
+            if(serialBit[esc] < 8)
+            {
+                machine.ScheduleAction(TimeInterval.FromMicroseconds(SerialBitUs),
+                    _ => SampleSerialBit(esc),
+                    name: "Betaflight 4-way RX sample");
+                return;
+            }
+
+            decoding[esc] = false;
+            uint generation;
+            lock(serialSync)
+            {
+                serialRequestBytes[esc].Add(serialByte[esc]);
+                generation = ++serialGeneration[esc];
+            }
+            // At the final data-bit centre the stop bit has not begun yet.
+            // Forty microseconds later Betaflight has either started the next
+            // byte or released the pin to input while it waits for the ESC.
+            machine.ScheduleAction(TimeInterval.FromMicroseconds(SerialReleaseCheckUs),
+                _ => CheckSerialRelease(esc, generation),
+                name: "Betaflight 4-way direction check");
+            machine.ScheduleAction(TimeInterval.FromMicroseconds(SerialStaleUs),
+                _ => DiscardStaleSerial(esc, generation),
+                name: "Betaflight 4-way stale byte cleanup");
+        }
+
+        private void CheckSerialRelease(int esc, uint generation)
+        {
+            byte[] request;
+            lock(serialSync)
+            {
+                if(generation != serialGeneration[esc] || IsGpioOutput(esc) ||
+                   serialRequestBytes[esc].Count == 0)
+                {
+                    return;
+                }
+                request = serialRequestBytes[esc].ToArray();
+                serialRequestBytes[esc].Clear();
+            }
+
+            var isBootProbe = IsBootProbe(request);
+            if(isBootProbe && !serialSessions[esc])
+            {
+                // AM32 enters its loader when the signal is held high across
+                // reset. This is the electrical action a real FC/ESC power
+                // transition supplies; the state socket is the simulated
+                // power-cycle line.
+                serialSessions[esc] = HoldEscHighAndReset(esc);
+            }
+
+            SendSerial(esc, request);
+            SerialRequests++;
+            var wanted = ExpectedSerialReply(esc, request, isBootProbe);
+            if(wanted == 0)
+            {
+                return;
+            }
+            var reply = WaitForSerialReply(esc, wanted);
+            if(reply.Length == 0)
+            {
+                return;
+            }
+            SerialReplies += (uint)reply.Length;
+            ReplaySerialReply(esc, reply);
+        }
+
+        private void DiscardStaleSerial(int esc, uint generation)
+        {
+            lock(serialSync)
+            {
+                if(generation == serialGeneration[esc] && IsGpioOutput(esc))
+                {
+                    serialRequestBytes[esc].Clear();
+                }
+            }
+        }
+
+        private void SendSerial(int esc, byte[] payload)
+        {
+            var socket = sockets[esc];
+            if(socket == null || payload.Length == 0)
+            {
+                return;
+            }
+            for(var offset = 0; offset < payload.Length; offset += SerialMax)
+            {
+                var length = Math.Min(SerialMax, payload.Length - offset);
+                var packet = new byte[SerialHeaderSize + length];
+                Put16(packet, 0, Magic);
+                packet[2] = SerialType;
+                packet[3] = (byte)length;
+                Put16(packet, 4, (ushort)(SerialIdleHigh |
+                    (offset == 0 ? SerialGap : 0)));
+                Array.Copy(payload, offset, packet, SerialHeaderSize, length);
+                try
+                {
+                    socket.Send(packet, packet.Length);
+                }
+                catch(SocketException)
+                {
+                    // The ESC may be between its application and bootloader.
+                    return;
+                }
+            }
+        }
+
+        private bool HoldEscHighAndReset(int esc)
+        {
+            var socket = sockets[esc];
+            if(socket == null)
+            {
+                return false;
+            }
+            var line = new byte[8];
+            Put16(line, 0, Magic);
+            line[2] = LineType;
+            line[3] = 4;
+            Put16(line, 4, SerialIdleHigh);
+            Put16(line, 6, 0);
+            try
+            {
+                socket.Send(line, line.Length);
+                // Let the ESC wire peripheral latch the high level before
+                // resetting the MCU, matching the launcher's proven direct
+                // 4-way sequence.
+                Thread.Sleep(300);
+                var state = stateSockets[esc];
+                if(state != null)
+                {
+                    var reset = new byte[] {
+                        (byte)(StateMagic & 0xFF), (byte)(StateMagic >> 8),
+                        StateReset, 0,
+                    };
+                    state.Send(reset, reset.Length);
+                    Thread.Sleep(100);
+                    return true;
+                }
+            }
+            catch(SocketException)
+            {
+                // A retry from Betaflight will repeat the boot probe.
+            }
+            return false;
+        }
+
+        private byte[] WaitForSerialReply(int esc, int wanted)
+        {
+            var result = new List<byte>(wanted);
+            var deadline = Environment.TickCount64 + SerialHostTimeoutMs;
+            while(result.Count < wanted)
+            {
+                lock(serialSync)
+                {
+                    while(serialReplyBytes[esc].Count > 0 && result.Count < wanted)
+                    {
+                        result.Add(serialReplyBytes[esc].Dequeue());
+                    }
+                }
+                if(result.Count >= wanted)
+                {
+                    break;
+                }
+                var remaining = deadline - Environment.TickCount64;
+                if(remaining <= 0 ||
+                   !serialReplyReady[esc].WaitOne((int)Math.Min(remaining, 250)))
+                {
+                    if(Environment.TickCount64 >= deadline)
+                    {
+                        break;
+                    }
+                }
+            }
+            return result.ToArray();
+        }
+
+        private void ReplaySerialReply(int esc, byte[] data)
+        {
+            replyDriving[esc] = true;
+            ulong delay = SerialReplyLeadUs;
+            foreach(var value in data)
+            {
+                ScheduleLine(esc, false, delay); // start bit
+                delay += SerialBitUs;
+                for(var bit = 0; bit < 8; bit++)
+                {
+                    ScheduleLine(esc, ((value >> bit) & 1) != 0, delay);
+                    delay += SerialBitUs;
+                }
+                ScheduleLine(esc, true, delay); // stop bit
+                delay += SerialBitUs;
+            }
+            machine.ScheduleAction(TimeInterval.FromMicroseconds(delay), _ =>
+            {
+                Connections[esc].Set(true);
+                replyDriving[esc] = false;
+            }, name: "Betaflight 4-way reply complete");
+        }
+
+        private void ScheduleLine(int esc, bool level, ulong delay)
+        {
+            machine.ScheduleAction(TimeInterval.FromMicroseconds(delay),
+                _ => Connections[esc].Set(level),
+                name: "Betaflight 4-way reply bit");
+        }
+
+        private static bool IsBootProbe(byte[] request)
+        {
+            return request.Length >= 17 && request[8] == 13 &&
+                request[9] == (byte)'B' && request[16] == 0x7D;
+        }
+
+        private int ExpectedSerialReply(int esc, byte[] request, bool bootProbe)
+        {
+            if(bootProbe)
+            {
+                return 9;
+            }
+            if(request.Length == 0)
+            {
+                return 0;
+            }
+            // SET_BUFFER is a two-part transaction. Its six-byte header has
+            // deliberately no acknowledgement; the loader acknowledges the
+            // following data+CRC block, whose first byte is unconstrained.
+            if(expectingBufferData[esc])
+            {
+                expectingBufferData[esc] = false;
+                return 1;
+            }
+            if(request[0] == BootSetBuffer && request.Length == 6)
+            {
+                expectingBufferData[esc] = true;
+                return 0;
+            }
+            switch(request[0])
+            {
+            case BootRun:
+                if(request.Length == 4)
+                {
+                    // DeviceReset has returned this ESC to its application.
+                    // A later configurator session must power-cycle it back
+                    // into the loader before probing again.
+                    serialSessions[esc] = false;
+                    expectingBufferData[esc] = false;
+                    return 0;
+                }
+                return 1;
+            case BootRead:
+                if(request.Length >= 2)
+                {
+                    return (request[1] == 0 ? 256 : request[1]) + 3;
+                }
+                return 1;
+            default:
+                return 1;
             }
         }
 
@@ -536,12 +923,26 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private readonly IMachine machine;
         private readonly STM32DMA dma;
+        private readonly STM32_GPIOPort gpio;
         private readonly STM32_Timer timer2;
         private readonly STM32_Timer timer3;
         private readonly STM32_Timer timer4;
         private readonly UdpClient[] sockets;
+        private readonly UdpClient[] stateSockets;
         private readonly ushort?[] cachedReplies;
+        private readonly Queue<byte>[] serialReplyBytes;
+        private readonly AutoResetEvent[] serialReplyReady;
+        private readonly List<byte>[] serialRequestBytes;
+        private readonly bool[] lineLevels;
+        private readonly bool[] decoding;
+        private readonly bool[] replyDriving;
+        private readonly bool[] serialSessions;
+        private readonly bool[] expectingBufferData;
+        private readonly uint[] serialGeneration;
+        private readonly byte[] serialBit = new byte[EscCount];
+        private readonly byte[] serialByte = new byte[EscCount];
         private readonly object sync = new object();
+        private readonly object serialSync = new object();
         private volatile bool disposed;
 
         private static readonly uint[] GcrTable = {
@@ -554,8 +955,29 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private const byte Dshot150 = 1;
         private const byte Dshot300 = 2;
         private const byte Dshot600 = 3;
+        private const byte SerialType = 4;
+        private const byte LineType = 5;
+        private const ushort SerialIdleHigh = 0x0001;
+        private const ushort SerialGap = 0x0004;
+        private const ushort SerialTxDone = 0x0008;
+        private const int SerialHeaderSize = 6;
+        private const ushort StateMagic = 0x5353;
+        private const byte StateReset = 9;
+        private const byte BootRun = 0x00;
+        private const byte BootRead = 0x03;
+        private const byte BootSetBuffer = 0xFE;
+        private const long GpioMode = 0x00;
+        private const uint GpioOutput = 1;
+        private const ulong SerialBitUs = 52;
+        private const ulong SerialHalfStartUs = 78;
+        private const ulong SerialReleaseCheckUs = 40;
+        private const ulong SerialReplyLeadUs = 5;
+        private const ulong SerialStaleUs = 2000;
+        private const int SerialHostTimeoutMs = 12000;
+        private const int SerialMax = 200;
         private const int EscCount = 4;
         private const int ChannelsPerTimer = 4;
+        private static readonly int[] GpioPins = { 1, 0, 10, 11 };
         private static readonly int[] Timer3Escs = { -1, -1, 3, 2 };
         private static readonly int[] Timer4Escs = { 0, 1, -1, -1 };
         private const int DshotPreamble = 1;

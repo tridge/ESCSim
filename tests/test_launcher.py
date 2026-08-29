@@ -138,7 +138,7 @@ def test_four_way_start_launches_one_command_per_esc(tmp_path, monkeypatch):
         lab.stop()
 
 
-def test_flight_controller_starts_selected_esc_count_without_loader(
+def test_flight_controller_starts_selected_esc_count_with_loader(
     tmp_path, monkeypatch
 ):
     firmware = tmp_path / "firmware.elf"
@@ -221,6 +221,8 @@ def test_flight_controller_starts_selected_esc_count_without_loader(
         for command in lab.runner.commands:
             assert "--elf" in command
             assert str(firmware) in command
-            assert "--bootloader-elf" not in command
+            assert "--bootloader-elf" in command
+            assert str(bootloader) in command
+        assert lab.fc_command is not None
     finally:
         lab.stop()

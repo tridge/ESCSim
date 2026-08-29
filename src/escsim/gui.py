@@ -118,7 +118,9 @@ FC_METRICS_COMMAND = (
     "sysbus.motorBridge ReadDoubleWord 8; "
     "sysbus.motorBridge ReadDoubleWord 0x0c; "
     "sysbus.motorBridge ReadDoubleWord 0x10; "
-    "sysbus.motorBridge ReadDoubleWord 0x14"
+    "sysbus.motorBridge ReadDoubleWord 0x14; "
+    "sysbus.motorBridge ReadDoubleWord 0x18; "
+    "sysbus.motorBridge ReadDoubleWord 0x1c"
 )
 
 
@@ -474,11 +476,11 @@ class Lab(object):
             ):
                 if not self.wait_port_free(port, tcp=True):
                     return "%s port %u is still in use" % (label, port)
-        # The fake 4-way/direct rigs deliberately boot the ESC loader.  A
-        # real flight controller instead needs the ESC application alive to
-        # consume its motor output.  FC-side serial passthrough is separate
-        # future work; do not strand these four signal pins in their loaders.
-        bl = None if fc_selected else self.pick_bootloader()
+        # Install the loader in front of the application in every mode.  With
+        # a real FC the loader sees the motor line, jumps to the application
+        # for ordinary DShot, and remains available when Betaflight switches
+        # that same pin to 4-way's 19200-baud GPIO protocol.
+        bl = self.pick_bootloader()
         if isinstance(bl, str) and not os.path.isfile(bl):
             return bl
         command_tail = []
@@ -547,6 +549,7 @@ class Lab(object):
                     outdir=fc_outdir,
                     flash=flash,
                     esc_ports=tuple(ports[0] for ports in instance_ports),
+                    esc_state_ports=tuple(ports[1] for ports in instance_ports),
                     monitor_port=self.fc_monitor_port(),
                     usbip_port=self.fc_usbip_port(),
                     renode=self.args.renode,
@@ -851,6 +854,11 @@ class Lab(object):
                         m["dshot_bidir_frames"],
                         m["dshot_type"],
                     )
+                )
+            if "serial_requests" in m:
+                parts.append(
+                    "4-way %u requests/%u reply bytes"
+                    % (m["serial_requests"], m["serial_replies"])
                 )
         return "%s: %s" % (label, " | ".join(parts))
 

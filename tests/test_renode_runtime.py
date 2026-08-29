@@ -74,6 +74,26 @@ Elapsed Host Time: 00:00:10.000
     assert metrics["dshot_type"] == 2
 
 
+def test_metrics_parser_reads_fourway_bridge_diagnostics():
+    text = """0x08001234
+0x00000030
+0x00123456
+Elapsed Virtual Time: 00:00:12.500
+Elapsed Host Time: 00:00:10.000
+0x00000100
+0x00000080
+0x00000040
+0x0000A55A
+0x000000F0
+0x00000002
+0x00000004
+0x00000024
+"""
+    metrics = parse_metrics(text)
+    assert metrics["serial_requests"] == 4
+    assert metrics["serial_replies"] == 36
+
+
 def test_monitor_text_and_startup_error():
     data = (
         b"\x1b[31mThere was an error executing command 'include'\x1b[0m\r\n"
