@@ -112,8 +112,7 @@ METRICS_COMMAND = (
     "emulation GetTimeSourceInfo"
 )
 FC_METRICS_COMMAND = (
-    METRICS_COMMAND
-    + "; sysbus.motorBridge ReadDoubleWord 0; "
+    METRICS_COMMAND + "; sysbus.motorBridge ReadDoubleWord 0; "
     "sysbus.motorBridge ReadDoubleWord 4; "
     "sysbus.motorBridge ReadDoubleWord 8; "
     "sysbus.motorBridge ReadDoubleWord 0x0c; "
@@ -357,10 +356,15 @@ class Lab(object):
 
     def active_esc_count(self):
         protocol = getattr(self, "protocol", "4way")
-        return getattr(self, "esc_count", 1) if protocol in (
-            "4way",
-            "flightcontroller",
-        ) else 1
+        return (
+            getattr(self, "esc_count", 1)
+            if protocol
+            in (
+                "4way",
+                "flightcontroller",
+            )
+            else 1
+        )
 
     def instance_ports(self, index):
         """Signal, state and monitor ports for one Renode instance."""
@@ -649,9 +653,7 @@ class Lab(object):
                 and self._generation_current(generation)
             ):
                 try:
-                    text = fc_monitor.connect(
-                        timeout=max(1, deadline - time.time())
-                    )
+                    text = fc_monitor.connect(timeout=max(1, deadline - time.time()))
                     break
                 except OSError:
                     fc_monitor.close()
@@ -795,14 +797,10 @@ class Lab(object):
                 try:
                     command = FC_METRICS_COMMAND if is_fc_monitor else METRICS_COMMAND
                     current = renode_monitor.parse_metrics(
-                        client.command(
-                            command, timeout=60 if not history else 5
-                        )
+                        client.command(command, timeout=60 if not history else 5)
                     )
                 except (OSError, TimeoutError, ValueError) as error:
-                    self.log_q.put(
-                        ("__monitor_error__", generation, label, str(error))
-                    )
+                    self.log_q.put(("__monitor_error__", generation, label, str(error)))
                     return
                 current["wall_seconds"] = time.monotonic()
                 history.append(current)
@@ -831,11 +829,7 @@ class Lab(object):
     def _format_instance_metrics(self, label, m):
         """Format one Renode process's PC, speed and optional FC counters."""
         where = ""
-        app_base = (
-            0x0800C000
-            if label == "FC"
-            else (self.info or {}).get("app_base")
-        )
+        app_base = 0x0800C000 if label == "FC" else (self.info or {}).get("app_base")
         if app_base:
             flash_base = 0x08000000 if app_base >= 0x08000000 else 0
             if flash_base <= m["pc"] < app_base:
@@ -1040,8 +1034,7 @@ class Lab(object):
                     error = self._detach_owned_usb(attached)
                     if error is not None:
                         self.log(
-                            "USB/IP detach failed after cancelled DFU start: %s"
-                            % error
+                            "USB/IP detach failed after cancelled DFU start: %s" % error
                         )
                 endpoint.close()
             with self.lifecycle_lock:
@@ -1171,13 +1164,9 @@ class Lab(object):
             with self.lifecycle_lock:
                 if generation != self.generation:
                     return
-                self.fc_runner.start(
-                    self.fc_command, env=generator_environment()
-                )
+                self.fc_runner.start(self.fc_command, env=generator_environment())
                 self.fc_runner_required = True
-            monitor = renode_monitor.MonitorClient(
-                "127.0.0.1", self.fc_monitor_port()
-            )
+            monitor = renode_monitor.MonitorClient("127.0.0.1", self.fc_monitor_port())
             deadline = time.time() + 120
             text = None
             while time.time() < deadline and self.fc_runner.running():
@@ -1268,9 +1257,7 @@ class Lab(object):
         if self.fc_runner.running():
             # Persistence must not depend on the display thread being healthy,
             # and Stop must not wait behind its first 60-second metrics poll.
-            monitor = renode_monitor.MonitorClient(
-                "127.0.0.1", self.fc_monitor_port()
-            )
+            monitor = renode_monitor.MonitorClient("127.0.0.1", self.fc_monitor_port())
             try:
                 monitor.connect(timeout=2)
                 try:
@@ -1507,8 +1494,7 @@ def main(argv=None):
     fc_fw_combo.setToolTip(
         "Firmware preloaded into the selected flight controller when USB DFU\n"
         "mode is off. Reusing the same image preserves its configuration.\n"
-        "Future published images will be served from:\n%s"
-        % FC_FIRMWARE_BASE_URL
+        "Future published images will be served from:\n%s" % FC_FIRMWARE_BASE_URL
     )
     grid.addWidget(fc_fw_combo, 3, 1, 1, 3)
 
@@ -1807,9 +1793,7 @@ def main(argv=None):
     grid.addWidget(esc_count_spin, 11, 1)
 
     last_bridge_protocol = [
-        preferences.protocol
-        if preferences.protocol in ("4way", "direct")
-        else "4way"
+        preferences.protocol if preferences.protocol in ("4way", "direct") else "4way"
     ]
 
     def protocol_changed():
@@ -1819,9 +1803,7 @@ def main(argv=None):
             if current in ("4way", "direct"):
                 last_bridge_protocol[0] = current
             if current != "flightcontroller":
-                proto_combo.setCurrentIndex(
-                    proto_combo.findData("flightcontroller")
-                )
+                proto_combo.setCurrentIndex(proto_combo.findData("flightcontroller"))
                 return
             proto_combo.setEnabled(False)
             esc_count_spin.setEnabled(
@@ -2382,9 +2364,7 @@ def main(argv=None):
                 return "ERR stop before changing FC firmware"
             i = fc_fw_combo.findData(rest)
             if i < 0:
-                return "ERR fcfirmware %s" % "|".join(
-                    flight_controller_firmwares()
-                )
+                return "ERR fcfirmware %s" % "|".join(flight_controller_firmwares())
             fc_fw_combo.setCurrentIndex(i)
             return "OK"
         if cmd == "fcboot":

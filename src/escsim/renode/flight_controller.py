@@ -178,8 +178,8 @@ def _thumb_bw_target(source: int, first: int, second: int) -> int:
     sign = (first >> 10) & 1
     j1 = (second >> 13) & 1
     j2 = (second >> 11) & 1
-    i1 = ((~(j1 ^ sign)) & 1)
-    i2 = ((~(j2 ^ sign)) & 1)
+    i1 = (~(j1 ^ sign)) & 1
+    i2 = (~(j2 ^ sign)) & 1
     encoded = (
         (sign << 24)
         | (i1 << 23)
@@ -242,16 +242,15 @@ def _restore_existing_instruction_patches(data: bytearray) -> None:
     if data[poll_cave : poll_cave + 16] != b"\xff" * 16:
         words = struct.unpack_from("<8H", data, poll_cave)
         if words[:2] != (0x2800, 0xD001) or words[4] != 0xBF30 or words[7] != 0xBF00:
-            raise ValueError("flight-controller firmware has an invalid polling trampoline")
-        poll = _thumb_bw_target(
-            BETAFLIGHT_POLL_TRAMPOLINE + 4, words[2], words[3]
-        ) - 4
-        if (
-            _thumb_bw_target(BETAFLIGHT_POLL_TRAMPOLINE + 10, words[5], words[6])
-            != poll - 6
-            or struct.unpack_from("<HH", data, poll - FLASH_BASE)
-            != _thumb_bw(poll, BETAFLIGHT_POLL_TRAMPOLINE)
-        ):
+            raise ValueError(
+                "flight-controller firmware has an invalid polling trampoline"
+            )
+        poll = _thumb_bw_target(BETAFLIGHT_POLL_TRAMPOLINE + 4, words[2], words[3]) - 4
+        if _thumb_bw_target(
+            BETAFLIGHT_POLL_TRAMPOLINE + 10, words[5], words[6]
+        ) != poll - 6 or struct.unpack_from(
+            "<HH", data, poll - FLASH_BASE
+        ) != _thumb_bw(poll, BETAFLIGHT_POLL_TRAMPOLINE):
             raise ValueError("flight-controller polling trampoline targets are invalid")
         struct.pack_into("<HH", data, poll - FLASH_BASE, 0x2800, 0xD0FA)
         data[poll_cave : poll_cave + 16] = b"\xff" * 16
@@ -265,19 +264,20 @@ def _restore_existing_instruction_patches(data: bytearray) -> None:
             or words[9] != 0xBF00
             or data[scheduler_cave + 20 : scheduler_cave + 32] != b"\xff" * 12
         ):
-            raise ValueError("flight-controller firmware has an invalid scheduler trampoline")
+            raise ValueError(
+                "flight-controller firmware has an invalid scheduler trampoline"
+            )
         poll = _thumb_bw_target(
             BETAFLIGHT_SCHEDULER_TRAMPOLINE + 14, words[7], words[8]
         )
-        if (
-            _thumb_bw_target(
-                BETAFLIGHT_SCHEDULER_TRAMPOLINE + 8, words[4], words[5]
+        if _thumb_bw_target(
+            BETAFLIGHT_SCHEDULER_TRAMPOLINE + 8, words[4], words[5]
+        ) != poll + 8 or struct.unpack_from(
+            "<HH", data, poll - FLASH_BASE
+        ) != _thumb_bw(poll, BETAFLIGHT_SCHEDULER_TRAMPOLINE):
+            raise ValueError(
+                "flight-controller scheduler trampoline targets are invalid"
             )
-            != poll + 8
-            or struct.unpack_from("<HH", data, poll - FLASH_BASE)
-            != _thumb_bw(poll, BETAFLIGHT_SCHEDULER_TRAMPOLINE)
-        ):
-            raise ValueError("flight-controller scheduler trampoline targets are invalid")
         data[poll - FLASH_BASE : poll - FLASH_BASE + 8] = bytes.fromhex(
             "54680b1b002bfbdc"
         )
@@ -372,8 +372,10 @@ def recognize_betaflight_hotpatches(flash: Path) -> BetaflightHotPatches:
     if data[scheduler_cave_offset : scheduler_cave_offset + 32] != b"\xff" * 32:
         raise ValueError("flight-controller firmware has no scheduler patch trampoline")
     initial_sp, reset = struct.unpack_from("<II", data)
-    if not _is_sram(initial_sp) or not reset & 1 or not (
-        FLASH_BASE <= reset & ~1 < FLASH_BASE + FLASH_SIZE
+    if (
+        not _is_sram(initial_sp)
+        or not reset & 1
+        or not (FLASH_BASE <= reset & ~1 < FLASH_BASE + FLASH_SIZE)
     ):
         raise ValueError("flight-controller firmware has invalid ARM vectors")
 
@@ -452,16 +454,16 @@ def recognize_betaflight_hotpatches(flash: Path) -> BetaflightHotPatches:
         not _thumb_branch_w(data, set_esc_input + 8)
         or _thumb_literal16(data, set_esc_input, 3) != putc_hardware
         or data[bl_send_buf : bl_send_buf + 0x1C]
-        != bytes.fromhex(
-            "f8b5154e154b96f8e47004460d4653f827000121cff74afa25440023"
-        )
+        != bytes.fromhex("f8b5154e154b96f8e47004460d4653f827000121cff74afa25440023")
         or _thumb_literal16(data, bl_send_buf + 2, 6) != selected_base
         or _thumb_literal16(data, bl_send_buf + 4, 3) != putc_hardware
         or not bl_send_buf <= tail <= bl_send_buf + 0x70
         or _thumb_branch16(data, tail + 6) != FLASH_BASE + set_esc_input
     ):
         raise ValueError("flight-controller firmware has an invalid BL_SendBuf tail")
-    if not all(_is_sram(value) for value in (selected_esc, systick_uptime, putc_hardware)):
+    if not all(
+        _is_sram(value) for value in (selected_esc, systick_uptime, putc_hardware)
+    ):
         raise ValueError("flight-controller 4-way literals are outside SRAM")
 
     # Startup acceleration is independent of 4-way.  If its signatures evolve,
@@ -475,8 +477,7 @@ def recognize_betaflight_hotpatches(flash: Path) -> BetaflightHotPatches:
         if (
             delay < 0
             or data[delay : delay + 4] != b"\x2d\xe9\xf0\x47"
-            or data[delay + 8 : delay + 0x10]
-            != b"\x47\x1e\x10\x26\x4f\xf0\xe0\x20"
+            or data[delay + 8 : delay + 0x10] != b"\x47\x1e\x10\x26\x4f\xf0\xe0\x20"
             or data[delay + 0x2A : delay + 0x38]
             != b"\xd3\xf8\xd4\x26\x84\x69\xd3\xf8\xd4\x16\x8a\x42\xf8\xd1"
         ):
@@ -490,8 +491,7 @@ def recognize_betaflight_hotpatches(flash: Path) -> BetaflightHotPatches:
             scheduler < 0
             or data[scheduler : scheduler + 6] != b"\x2d\xe9\xf0\x4f\x89\xb0"
             or not _thumb_bl(data, scheduler + 6)
-            or data[scheduler + 0x0A : scheduler + 0x10]
-            != b"\x9a\x4b\x07\x90\x1b\x78"
+            or data[scheduler + 0x0A : scheduler + 0x10] != b"\x9a\x4b\x07\x90\x1b\x78"
             or not scheduler <= scheduler_wait_poll < scheduler + 0x800
         ):
             raise ValueError("invalid scheduler sequence")
@@ -502,8 +502,7 @@ def recognize_betaflight_hotpatches(flash: Path) -> BetaflightHotPatches:
         state_function = state_anchor - 0x1C
         if (
             state_function < 0
-            or data[state_function : state_function + 6]
-            != b"\x08\xb5\x01\x21\x00\x20"
+            or data[state_function : state_function + 6] != b"\x08\xb5\x01\x21\x00\x20"
         ):
             raise ValueError("invalid systemState sequence")
         system_state = _thumb_literal16(data, state_function + 0x1A, 3)
@@ -602,10 +601,13 @@ def betaflight_hotpatches(symbol_elf: Path, flash: Path) -> BetaflightHotPatches
         "suart_getc": _symbol_address(symbols, "suart_getc_") & ~1,
         "suart_putc": _symbol_address(symbols, "suart_putc_.isra.0") & ~1,
     }
-    if any(
-        getattr(sequence_patches, name) != address
-        for name, address in resolved_4way.items()
-    ) or sequence_patches.scheduler_wait_poll != scheduler_address + 0x31C:
+    if (
+        any(
+            getattr(sequence_patches, name) != address
+            for name, address in resolved_4way.items()
+        )
+        or sequence_patches.scheduler_wait_poll != scheduler_address + 0x31C
+    ):
         raise ValueError(
             "flight-controller ELF symbols disagree with recognized sequences"
         )
@@ -691,8 +693,10 @@ def select_firmware(flash: Path, image: Path) -> bool:
         # behaviour and cause the selected firmware to be reloaded.
         matching_current = bytearray(current)
 
-    if all(_matches_selected_firmware(matching_current, offset, payload)
-           for offset, payload in normalized):
+    if all(
+        _matches_selected_firmware(matching_current, offset, payload)
+        for offset, payload in normalized
+    ):
         return False
     replacement = bytearray(b"\xff" * FLASH_SIZE)
     for offset, payload in normalized:
@@ -733,8 +737,7 @@ def write_speedybee_platform(
     if esc_state_ports and len(esc_state_ports) != len(esc_ports):
         raise ValueError("ESC state ports must match ESC signal ports")
     ports = "\n".join(
-        f"    esc{index + 1}Port: {port}"
-        for index, port in enumerate(connected_ports)
+        f"    esc{index + 1}Port: {port}" for index, port in enumerate(connected_ports)
     )
     state_ports = "\n".join(
         f"    esc{index + 1}StatePort: {port}"
@@ -936,9 +939,7 @@ def write_speedybee_script(
         flush = renode_execfile(root / "scripts" / "betaflight_4way_flush.py")
         sendbuf = renode_execfile(root / "scripts" / "betaflight_4way_sendbuf.py")
         if hotpatches.symbols is not None:
-            lines.append(
-                f"sysbus LoadSymbolsFrom @{renode_path(hotpatches.symbols)}"
-            )
+            lines.append(f"sysbus LoadSymbolsFrom @{renode_path(hotpatches.symbols)}")
         if all(
             address is not None
             for address in (
@@ -979,22 +980,20 @@ def write_speedybee_script(
             ),
             (
                 f'cpu AddHook 0x{hotpatches.bl_send_buf:08X} "'
-                f'selected_esc_address=0x{hotpatches.selected_esc:08X}; '
+                f"selected_esc_address=0x{hotpatches.selected_esc:08X}; "
                 f'{sendbuf}"'
             ),
             (
                 f'cpu AddHook 0x{hotpatches.suart_putc:08X} "'
-                f'selected_esc_address=0x{hotpatches.selected_esc:08X}; '
+                f"selected_esc_address=0x{hotpatches.selected_esc:08X}; "
                 f'{putc}"'
             ),
             (
                 f'cpu AddHook 0x{hotpatches.suart_getc:08X} "'
-                f'selected_esc_address=0x{hotpatches.selected_esc:08X}; '
+                f"selected_esc_address=0x{hotpatches.selected_esc:08X}; "
                 f'{getc}"'
             ),
-            (
-                f'cpu AddHook 0x{hotpatches.set_esc_input:08X} "{flush}"'
-            ),
+            (f'cpu AddHook 0x{hotpatches.set_esc_input:08X} "{flush}"'),
         ]
     lines.append("start")
     path = Path(outdir) / "SpeedyBeeF405Mini.resc"

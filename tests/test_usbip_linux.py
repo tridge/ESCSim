@@ -46,6 +46,7 @@ def test_privileged_linux_attach_reports_exact_port_zero(monkeypatch):
     monkeypatch.setattr(usbip.os, "geteuid", lambda: 1000, raising=False)
     monkeypatch.setattr(usbip.os, "access", lambda *args: False)
     monkeypatch.setattr(usbip, "privilege_prefix", lambda: ["pkexec"])
+
     def run(command, **_kwargs):
         commands.append(command)
         return SimpleNamespace(
@@ -61,11 +62,46 @@ def test_privileged_linux_attach_reports_exact_port_zero(monkeypatch):
 
 
 def test_udev_rule_names_the_selected_serial_group():
-    assert usbip.serial_group() in ("dialout", "uucp")
     rule = usbip.udev_rule("uucp")
     assert "chgrp uucp /sys%p/attach /sys%p/detach" in rule
-    assert "KERNEL==\"vhci_hcd.0\"" in rule
+    assert 'KERNEL=="vhci_hcd.0"' in rule
     assert "%%" not in rule
+
+
+def test_serial_group_prefers_one_the_caller_belongs_to():
+    groups = {
+        "dialout": SimpleNamespace(gr_name="dialout", gr_gid=20),
+        "uucp": SimpleNamespace(gr_name="uucp", gr_gid=30),
+    }
+
+    assert usbip.serial_group({30}, groups.__getitem__) == "uucp"
+    assert usbip.serial_group(set(), groups.__getitem__) == "dialout"
+
+
+def test_install_rules_passes_callers_serial_group_to_root(monkeypatch):
+    commands = []
+    monkeypatch.setattr(usbip.os, "geteuid", lambda: 1000, raising=False)
+    monkeypatch.setattr(usbip, "serial_group", lambda: "uucp")
+    monkeypatch.setattr(usbip, "privilege_prefix", lambda: ["pkexec"])
+    monkeypatch.setattr(
+        usbip.subprocess,
+        "run",
+        lambda command, **_kwargs: (
+            commands.append(command) or SimpleNamespace(returncode=0)
+        ),
+    )
+
+    assert usbip.install_rules()
+    assert commands == [
+        [
+            "pkexec",
+            usbip.sys.executable,
+            usbip.os.path.abspath(usbip.__file__),
+            "--install-rules",
+            "--serial-group",
+            "uucp",
+        ]
+    ]
 
 
 def test_ensure_vhci_loads_missing_module(tmp_path, monkeypatch):
@@ -74,8 +110,7 @@ def test_ensure_vhci_loads_missing_module(tmp_path, monkeypatch):
     monkeypatch.setattr(
         usbip.subprocess,
         "run",
-        lambda cmd, **kwargs: commands.append(cmd)
-        or SimpleNamespace(returncode=0),
+        lambda cmd, **kwargs: commands.append(cmd) or SimpleNamespace(returncode=0),
     )
 
     usbip._ensure_vhci()
@@ -130,8 +165,7 @@ def test_find_tty_for_exact_vhci_port(tmp_path, monkeypatch):
     vhci = tmp_path / "vhci"
     vhci.mkdir()
     (vhci / "status").write_text(
-        "hub port sta spd dev sockfd local_busid\n"
-        "hs 0002 006 002 00010001 000107 7-1\n"
+        "hub port sta spd dev sockfd local_busid\nhs 0002 006 002 00010001 000107 7-1\n"
     )
     sys_usb = tmp_path / "sys-usb"
     tty_dir = sys_usb / "7-1:1.0" / "tty"

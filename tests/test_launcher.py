@@ -138,9 +138,7 @@ def test_four_way_start_launches_one_command_per_esc(tmp_path, monkeypatch):
         lab.stop()
 
 
-def test_flight_controller_starts_selected_esc_count_with_loader(
-    tmp_path, monkeypatch
-):
+def test_flight_controller_starts_selected_esc_count_with_loader(tmp_path, monkeypatch):
     firmware = tmp_path / "firmware.elf"
     bootloader = tmp_path / "bootloader.elf"
     firmware.write_bytes(b"app")
@@ -215,9 +213,7 @@ def test_flight_controller_starts_selected_esc_count_with_loader(
             / "SpeedyBeeF405Mini"
             / "flash.bin"
         )
-        assert selected_flash.read_bytes()[:8] == bytes.fromhex(
-            "f0ff001085240508"
-        )
+        assert selected_flash.read_bytes()[:8] == bytes.fromhex("f0ff001085240508")
         for command in lab.runner.commands:
             assert "--elf" in command
             assert str(firmware) in command

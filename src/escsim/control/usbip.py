@@ -261,9 +261,7 @@ class UsbipServer(object):
         # than flight controllers
         self.vid, self.pid = vid, pid
         self.descriptor = bytearray(device_descriptor(vid, pid))
-        self.descriptor[4:7] = bytes(
-            (device_class, device_subclass, device_protocol)
-        )
+        self.descriptor[4:7] = bytes((device_class, device_subclass, device_protocol))
         self.descriptor = bytes(self.descriptor)
         self.config_descriptor = bytes(config_descriptor)
         self.interfaces = tuple(tuple(item) for item in interfaces)
@@ -722,18 +720,44 @@ def import_device(unix_path=None, host="127.0.0.1", port=3240, busid=BUSID):
     return sock, (busnum << 16) | devnum, speed
 
 
-def serial_group():
-    """the group owning serial devices: dialout on Debian-style systems,
-    uucp on Arch; pick the first one which exists on this host"""
-    import grp
+SERIAL_GROUPS = ("dialout", "uucp")
 
-    for name in ("dialout", "uucp"):
+
+def serial_group(gids=None, getgrnam=None):
+    """Select an existing serial group, preferring caller membership."""
+    if getgrnam is None:
+        import grp
+
+        getgrnam = grp.getgrnam
+    if gids is None:
+        gids = set(os.getgroups())
+        gids.add(os.getgid())
+    else:
+        gids = set(gids)
+    existing = []
+    for name in SERIAL_GROUPS:
         try:
-            grp.getgrnam(name)
-            return name
+            entry = getgrnam(name)
         except KeyError:
             continue
-    return "dialout"
+        existing.append(entry)
+        if entry.gr_gid in gids:
+            return name
+    if existing:
+        return existing[0].gr_name
+    raise RuntimeError("neither dialout nor uucp exists on this host")
+
+
+def _validate_serial_group(group):
+    if group not in SERIAL_GROUPS:
+        raise RuntimeError("invalid serial group %r" % group)
+    import grp
+
+    try:
+        grp.getgrnam(group)
+    except KeyError as ex:
+        raise RuntimeError("serial group %s does not exist" % group) from ex
+    return group
 
 
 def udev_rule(group):
@@ -756,18 +780,21 @@ def _ensure_vhci():
         subprocess.run(["modprobe", "vhci_hcd"], check=False)
 
 
-def install_rules():
+def install_rules(group=None):
     """one-time root setup after which no attach ever needs root:
     load vhci_hcd at boot and make its attach/detach files writable by
     the serial group (the same group the resulting tty needs anyway)"""
     if os.geteuid() != 0:
+        group = serial_group()
         cmd = privilege_prefix() + [
             sys.executable,
             os.path.abspath(__file__),
             "--install-rules",
+            "--serial-group",
+            group,
         ]
         return subprocess.run(cmd, check=False).returncode == 0
-    group = serial_group()
+    group = serial_group() if group is None else _validate_serial_group(group)
     with open(UDEV_RULE_PATH, "w") as f:
         f.write(udev_rule(group))
     with open(MODULES_LOAD_PATH, "w") as f:
@@ -1160,6 +1187,12 @@ def main():
         "make its attach/detach group-writable (dialout/uucp), "
         "so no later attach or detach needs root",
     )
+    ap.add_argument(
+        "--serial-group",
+        choices=SERIAL_GROUPS,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -1168,7 +1201,7 @@ def main():
             print("usbip: %s" % msg, file=sys.stderr, flush=True)
 
     if args.install_rules:
-        return 0 if install_rules() else 1
+        return 0 if install_rules(args.serial_group) else 1
 
     if args.detach is not None:
         return 0 if detach(None if args.detach < 0 else args.detach) else 1

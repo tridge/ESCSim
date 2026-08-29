@@ -237,9 +237,7 @@ def _safe_symlink(member):
     for part in link.parts:
         if part == "..":
             if not resolved:
-                raise RuntimeError(
-                    "unsafe link in Renode package: %s" % member.name
-                )
+                raise RuntimeError("unsafe link in Renode package: %s" % member.name)
             resolved.pop()
         elif part != ".":
             resolved.append(part)

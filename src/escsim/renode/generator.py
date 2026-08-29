@@ -2924,9 +2924,11 @@ def native_library_path():
         if (source_root / "pyproject.toml").is_file()
         else []
     )
-    candidates = ([override] if override else []) + [
-        os.path.join(os.fspath(_PACKAGE_ROOT), "lib", name) for name in names
-    ] + source_build
+    candidates = (
+        ([override] if override else [])
+        + [os.path.join(os.fspath(_PACKAGE_ROOT), "lib", name) for name in names]
+        + source_build
+    )
     return next(
         (os.path.abspath(path) for path in candidates if path and os.path.isfile(path)),
         None,

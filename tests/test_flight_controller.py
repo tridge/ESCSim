@@ -222,14 +222,11 @@ def test_betaflight_hotpatches_require_exact_flash_identity(tmp_path, monkeypatc
 def test_speedybee_dshot_bridge_supports_betaflight_channel_dma():
     resource_root = flight_controller_firmware("SPEEDYBEEF405V5").parents[1]
     bridge = (
-        resource_root
-        / "peripherals"
-        / "apm_stm32"
-        / "ESCSim_STM32_DShot.cs"
+        resource_root / "peripherals" / "apm_stm32" / "ESCSim_STM32_DShot.cs"
     ).read_text(encoding="utf-8")
-    gui_link = (
-        resource_root / "peripherals" / "common" / "AM32_GuiLink.cs"
-    ).read_text(encoding="utf-8")
+    gui_link = (resource_root / "peripherals" / "common" / "AM32_GuiLink.cs").read_text(
+        encoding="utf-8"
+    )
 
     assert "TryDecodeDirect" in bridge
     assert "LastFrameBase = 0x60" in bridge
@@ -325,8 +322,8 @@ def test_bundled_betaflight_image_is_valid_and_selectable(tmp_path):
         stream.seek(0xF0000)
         stream.write(b"configured")
     assert not select_firmware(flash, image)
-    assert flash.read_bytes()[0x4000 : 0x4011] == b"configured sector"
-    assert flash.read_bytes()[0xF0000 : 0xF000A] == b"configured"
+    assert flash.read_bytes()[0x4000:0x4011] == b"configured sector"
+    assert flash.read_bytes()[0xF0000:0xF000A] == b"configured"
 
 
 def test_bundled_betaflight_sequences_resolve_without_elf(tmp_path):
@@ -403,10 +400,9 @@ def test_persisted_instruction_patches_preserve_fc_configuration(tmp_path):
     image = flight_controller_firmware("SPEEDYBEEF405V5")
     select_firmware(flash, image)
     patches = recognize_betaflight_hotpatches(flash)
-    words = (
-        flight_controller._read_byte_crc_wfi_patch(patches.read_byte_crc_poll)
-        + flight_controller._scheduler_wfi_patch(patches.scheduler_wait_poll)
-    )
+    words = flight_controller._read_byte_crc_wfi_patch(
+        patches.read_byte_crc_poll
+    ) + flight_controller._scheduler_wfi_patch(patches.scheduler_wait_poll)
     with flash.open("r+b") as stream:
         stream.seek(0x4000)
         stream.write(b"saved config")
@@ -419,7 +415,7 @@ def test_persisted_instruction_patches_preserve_fc_configuration(tmp_path):
     again = recognize_betaflight_hotpatches(flash)
     assert again.scheduler_wait_poll == patches.scheduler_wait_poll
     assert not select_firmware(flash, image)
-    assert flash.read_bytes()[0x4000 : 0x400C] == b"saved config"
+    assert flash.read_bytes()[0x4000:0x400C] == b"saved config"
 
 
 def test_flight_controller_leaves_unknown_firmware_unpatched(tmp_path):

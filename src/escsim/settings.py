@@ -141,12 +141,8 @@ class SettingsStore:
             protocol=str(launcher_raw.get("protocol", "4way")),
             esc_count=int(launcher_raw.get("esc_count", 1)),
             can_bus=int(launcher_raw.get("can_bus", 8)),
-            flight_controller=str(
-                launcher_raw.get("flight_controller", "none")
-            ),
-            fc_firmware=str(
-                launcher_raw.get("fc_firmware", "SPEEDYBEEF405V5")
-            ),
+            flight_controller=str(launcher_raw.get("flight_controller", "none")),
+            fc_firmware=str(launcher_raw.get("fc_firmware", "SPEEDYBEEF405V5")),
             fc_boot_mode=str(launcher_raw.get("fc_boot_mode", "flash")),
         )
         if launcher.eeprom not in {"defaults", "blank"}:
