@@ -1,7 +1,8 @@
 //
 // ICM-42688-P IMU as AP_InertialSensor_Invensensev3 drives it. The
 // model supplies banked register storage, the 0x47 product ID, and
-// 16-byte little-endian FIFO records at 1kHz. Acceleration and angular-rate
+// 16-byte little-endian FIFO records at the programmed output data rate.
+// Acceleration and angular-rate
 // samples follow physics truth after applying the board's sensor rotation;
 // temperature remains constant at 25C.
 //
@@ -9,6 +10,7 @@ using System;
 using System.Collections.Generic;
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Peripherals;
+using Antmicro.Renode.Peripherals.GPIOPort;
 using Antmicro.Renode.Peripherals.SPI;
 using Antmicro.Renode.Peripherals.Miscellaneous;
 using Antmicro.Renode.Peripherals.Timers;
@@ -21,15 +23,17 @@ namespace Antmicro.Renode.Peripherals.Sensors
     // the parser after an aborted or endless-mode transfer.
     public class AP_ICM42688 : ISPIPeripheral, IGPIOReceiver
     {
-        public AP_ICM42688(IMachine machine, byte whoAmI = DefaultWhoAmI, byte rotation = 8)
+        public AP_ICM42688(IMachine machine, byte whoAmI = DefaultWhoAmI,
+            byte rotation = 8, int samplePeriodUs = SamplePeriodUs)
         {
             this.whoAmI = whoAmI;
             this.rotation = rotation;
+            IRQ = new GPIO();
             physics = AP_PhysicsState.ForMachine(machine);
             fifo = new Queue<byte>();
             registers = new byte[BankCount, RegisterCount];
             sampleTimer = new LimitTimer(machine.ClockSource, 1000000, this, "icm42688 odr",
-                                         limit: SamplePeriodUs, direction: Direction.Ascending,
+                                         limit: (ulong)Math.Max(1, samplePeriodUs), direction: Direction.Ascending,
                                          enabled: true, workMode: WorkMode.Periodic, eventEnabled: true);
             sampleTimer.LimitReached += OnSampleTick;
             Reset();
@@ -44,6 +48,7 @@ namespace Antmicro.Renode.Peripherals.Sensors
             currentRegister = 0;
             reading = false;
             timestamp = 0;
+            IRQ.Unset();
             registers[0, WhoAmI] = whoAmI;
             registers[0, Icm45686WhoAmI] = whoAmI;
         }
@@ -130,13 +135,38 @@ namespace Antmicro.Renode.Peripherals.Sensors
                 return;
             }
             registers[currentBank, register] = value;
+            if(currentBank == 0 && register == GyroConfig0)
+            {
+                UpdateSamplePeriod(value & OutputDataRateMask);
+            }
+        }
+
+        private void UpdateSamplePeriod(int outputDataRate)
+        {
+            // ICM42688 GYRO_ODR encodings used by Betaflight and ArduPilot.
+            // Keeping this clock event at the real sensor cadence also gives
+            // a Cortex-M in WFI an exact scheduling boundary to wake on.
+            switch(outputDataRate)
+            {
+            case 3: sampleTimer.Limit = 125; break;  // 8 kHz
+            case 4: sampleTimer.Limit = 250; break;  // 4 kHz
+            case 5: sampleTimer.Limit = 500; break;  // 2 kHz
+            case 6: sampleTimer.Limit = 1000; break; // 1 kHz
+            }
         }
 
         private void OnSampleTick()
         {
             var sampleSize = CurrentSampleSize;
+            if((registers[0, PowerManagement] & SensorsLowNoise) != SensorsLowNoise)
+            {
+                return;
+            }
+            // SPEEDYBEEF405V5 wires the gyro data-ready signal to PC4/EXTI4.
+            // Pulsing it at the programmed ODR mirrors the hardware and wakes
+            // the sequence-patched scheduler exactly at its gyro boundary.
+            IRQ.Blink();
             if((registers[0, FifoConfig1] & FifoSensorsEnabled) != FifoSensorsEnabled ||
-               (registers[0, PowerManagement] & SensorsLowNoise) != SensorsLowNoise ||
                fifo.Count + sampleSize > FifoCapacity)
             {
                 return;
@@ -216,6 +246,7 @@ namespace Antmicro.Renode.Peripherals.Sensors
         private readonly byte whoAmI;
         private readonly byte rotation;
         private readonly AP_PhysicsState physics;
+        public GPIO IRQ { get; }
         private int transferByte;
         private byte currentBank;
         private byte currentRegister;
@@ -231,6 +262,7 @@ namespace Antmicro.Renode.Peripherals.Sensors
 
         private const byte SignalPathReset = 0x4B;
         private const byte PowerManagement = 0x4E;
+        private const byte GyroConfig0 = 0x4F;
         private const byte FifoConfig1 = 0x5F;
         private const byte InterruptStatus = 0x2D;
         private const byte FifoCountLow = 0x2E;
@@ -243,6 +275,7 @@ namespace Antmicro.Renode.Peripherals.Sensors
         private const byte ReadFlag = 0x80;
         private const byte RegisterMask = 0x7F;
         private const byte BankMask = 0x07;
+        private const byte OutputDataRateMask = 0x0F;
         private const byte DefaultWhoAmI = 0x47;
         private const byte DataReady = 0x08;
         private const byte FifoFlush = 0x02;

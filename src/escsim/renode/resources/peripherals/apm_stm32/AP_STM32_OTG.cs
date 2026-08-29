@@ -812,9 +812,11 @@ namespace Antmicro.Renode.Peripherals.USB
                 server.GetType().GetMethod("SetDeviceConnected");
             if(setConnected == null)
             {
-                this.Log(LogLevel.Warning,
-                    "USB/IP server does not support device connection state");
-                return false;
+                // Older Renode USB/IP servers export a device permanently and
+                // have no API for changing its connection state.  Treat that
+                // legacy behaviour as success so the emulated USB peripheral
+                // can still enumerate; only dynamic disconnect is unavailable.
+                return true;
             }
             try
             {

@@ -97,6 +97,23 @@ DFU mode, then upload `arducopter.apj` through the bootloader's USB serial
 endpoint. Sensors return fixed bench values (including a nominal 12 V supply),
 while the four motor outputs and bidirectional DShot capture paths remain live.
 
+ESCSim recognizes supported Betaflight Thumb instruction sequences and enables
+the startup and 4-way optimizations automatically; no ELF is required. During
+4-way mode the FC yields virtual time while waiting for configurator input, and
+AM32 bytes pass through the existing UDP wire model without simulating
+Betaflight's 19200-baud GPIO and microsecond delay loops instruction by
+instruction. Firmware pages use a recognized bulk `BL_SendBuf` path rather
+than crossing the Python hook once per byte. Outside 4-way mode, the scheduler's
+cycle-counter wait sleeps until the modeled gyro data-ready interrupt at the
+configured ODR instead of busy-polling. The actual MSP, 4-way and AM32
+bootloader exchanges are unchanged.
+Recognition requires unique function signatures, validates their control flow,
+and decodes cross-checked PC-relative global addresses. Unknown or ambiguous
+firmware runs without hooks. For development builds, `--fc-symbols PATH.elf`
+additionally verifies every immutable flash-backed ELF byte (excluding the
+saved Betaflight configuration sector) and requires its symbols to agree with
+the recognized sequences.
+
 ## Command line
 
 ```sh

@@ -52,6 +52,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             serialReplyBytes = new Queue<byte>[EscCount];
             serialReplyReady = new AutoResetEvent[EscCount];
             serialRequestBytes = new List<byte>[EscCount];
+            directRequestBytes = new List<byte>[EscCount];
+            directReplyBytes = new Queue<byte>[EscCount];
+            directReplyComplete = new bool[EscCount];
+            fastReplyPackets = new Queue<byte[]>[EscCount];
+            fastReplyReady = new AutoResetEvent[EscCount];
             lineLevels = new bool[EscCount];
             decoding = new bool[EscCount];
             replyDriving = new bool[EscCount];
@@ -67,6 +72,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 serialReplyBytes[index] = new Queue<byte>();
                 serialReplyReady[index] = new AutoResetEvent(false);
                 serialRequestBytes[index] = new List<byte>();
+                directRequestBytes[index] = new List<byte>();
+                directReplyBytes[index] = new Queue<byte>();
+                fastReplyPackets[index] = new Queue<byte[]>();
+                fastReplyReady[index] = new AutoResetEvent(false);
                 if(ports[index] <= 0)
                 {
                     continue;
@@ -109,6 +118,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             RepliesReceived = 0;
             RepliesInjected = 0;
             LastFrame = 0;
+            Array.Clear(lastFrames, 0, lastFrames.Length);
             BidirectionalFrames = 0;
             LastDshotType = 0;
             SerialRequests = 0;
@@ -119,6 +129,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 {
                     serialReplyBytes[index].Clear();
                     serialRequestBytes[index].Clear();
+                    directRequestBytes[index].Clear();
+                    directReplyBytes[index].Clear();
+                    directReplyComplete[index] = false;
+                    fastReplyPackets[index].Clear();
                     decoding[index] = false;
                     replyDriving[index] = false;
                     serialSessions[index] = false;
@@ -140,11 +154,42 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             case 0x14: return LastDshotType;
             case 0x18: return SerialRequests;
             case 0x1C: return SerialReplies;
-            default: return 0;
+            default:
+                if(offset >= LastFrameBase &&
+                   offset < LastFrameBase + EscCount * 4)
+                {
+                    return lastFrames[(offset - LastFrameBase) / 4];
+                }
+                if(offset >= DirectReplyBase &&
+                   offset < DirectReplyBase + EscCount * 4)
+                {
+                    return ReadDirectReply((int)((offset - DirectReplyBase) / 4));
+                }
+                return 0;
             }
         }
 
-        public void WriteDoubleWord(long offset, uint value) { }
+        public void WriteDoubleWord(long offset, uint value)
+        {
+            switch(offset)
+            {
+            case DirectTransmit:
+                QueueDirectTransmit((int)((value >> 8) & 0xFF), (byte)value);
+                break;
+            case DirectFlush:
+                FlushDirectTransmit((int)value);
+                break;
+            case DirectBufferAddress:
+                directBufferAddress = value;
+                break;
+            case DirectBufferTransmit:
+                QueueDirectBuffer(
+                    (int)((value >> 8) & 0xFF),
+                    (int)(value & 0xFF),
+                    (value & DirectBufferAppendCrc) != 0);
+                break;
+            }
+        }
 
         public long Size => 0x100;
 
@@ -177,6 +222,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 }
             }
             foreach(var ready in serialReplyReady)
+            {
+                ready.Dispose();
+            }
+            foreach(var ready in fastReplyReady)
             {
                 ready.Dispose();
             }
@@ -408,6 +457,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             bool bidirectional)
         {
             LastFrame = frame;
+            lastFrames[esc] = frame;
             LastDshotType = dshotType;
             if(bidirectional)
             {
@@ -444,6 +494,22 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     var packet = sockets[esc].Receive(ref endpoint);
                     if(packet.Length < 6 || Get16(packet, 0) != Magic)
                     {
+                        continue;
+                    }
+                    if(packet[2] == FastSerialType)
+                    {
+                        var length = Get16(packet, 4);
+                        if(packet.Length != FastSerialHeaderSize + length)
+                        {
+                            continue;
+                        }
+                        var reply = new byte[length];
+                        Array.Copy(packet, FastSerialHeaderSize, reply, 0, length);
+                        lock(serialSync)
+                        {
+                            fastReplyPackets[esc].Enqueue(reply);
+                        }
+                        fastReplyReady[esc].Set();
                         continue;
                     }
                     if(packet[2] == SerialType)
@@ -644,7 +710,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                         StateReset, 0,
                     };
                     state.Send(reset, reset.Length);
-                    Thread.Sleep(100);
+                    // With five Renode processes sharing the host, 100 ms of
+                    // wall time can be less than the loader's startup path in
+                    // its own virtual clock.  Wait long enough for its serial
+                    // receive loop before sending the first probe.
+                    Thread.Sleep(400);
                     return true;
                 }
             }
@@ -655,10 +725,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             return false;
         }
 
-        private byte[] WaitForSerialReply(int esc, int wanted)
+        private byte[] WaitForSerialReply(int esc, int wanted,
+            int timeoutMs = SerialHostTimeoutMs)
         {
             var result = new List<byte>(wanted);
-            var deadline = Environment.TickCount64 + SerialHostTimeoutMs;
+            var deadline = Environment.TickCount64 + timeoutMs;
             while(result.Count < wanted)
             {
                 lock(serialSync)
@@ -708,6 +779,220 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }, name: "Betaflight 4-way reply complete");
         }
 
+        // The ELF-addressed Betaflight hooks use these registers to preserve
+        // the real AM32 UDP bootloader exchange while bypassing the FC's
+        // 19200-baud GPIO bit loops.  The ordinary pin-level implementation
+        // remains available for firmware without matching symbols.
+        private void QueueDirectTransmit(int esc, byte value)
+        {
+            if(esc < 0 || esc >= EscCount)
+            {
+                return;
+            }
+            lock(serialSync)
+            {
+                if(directRequestBytes[esc].Count == 0)
+                {
+                    // Match a serial adapter's input flush at the start of a
+                    // transaction.  In particular, don't let a late reply to
+                    // a timed-out probe satisfy the following retry.
+                    serialReplyBytes[esc].Clear();
+                    directReplyBytes[esc].Clear();
+                    directReplyComplete[esc] = false;
+                }
+                directRequestBytes[esc].Add(value);
+            }
+        }
+
+        private void QueueDirectBuffer(int esc, int encodedLength, bool appendCrc)
+        {
+            if(esc < 0 || esc >= EscCount)
+            {
+                return;
+            }
+            var length = encodedLength == 0 ? 256 : encodedLength;
+            var data = machine.SystemBus.ReadBytes(directBufferAddress, length);
+            lock(serialSync)
+            {
+                if(directRequestBytes[esc].Count == 0)
+                {
+                    serialReplyBytes[esc].Clear();
+                    directReplyBytes[esc].Clear();
+                    directReplyComplete[esc] = false;
+                }
+                directRequestBytes[esc].AddRange(data);
+                if(appendCrc)
+                {
+                    var crc = DirectBootCrc(data);
+                    directRequestBytes[esc].Add((byte)crc);
+                    directRequestBytes[esc].Add((byte)(crc >> 8));
+                }
+            }
+        }
+
+        private static ushort DirectBootCrc(byte[] data)
+        {
+            ushort crc = 0;
+            foreach(var original in data)
+            {
+                var value = original;
+                for(var bit = 0; bit < 8; bit++)
+                {
+                    crc = (ushort)(((value ^ crc) & 1) != 0
+                        ? (crc >> 1) ^ 0xA001 : crc >> 1);
+                    value >>= 1;
+                }
+            }
+            return crc;
+        }
+
+        private void FlushDirectTransmit(int esc)
+        {
+            if(esc < 0 || esc >= EscCount)
+            {
+                return;
+            }
+            byte[] request;
+            lock(serialSync)
+            {
+                if(directRequestBytes[esc].Count == 0)
+                {
+                    return;
+                }
+                request = directRequestBytes[esc].ToArray();
+                directRequestBytes[esc].Clear();
+            }
+
+            var isBootProbe = IsBootProbe(request);
+            var wanted = ExpectedSerialReply(esc, request, isBootProbe);
+            var reply = FastSerialTransaction(esc, request);
+            if(reply != null)
+            {
+                SerialRequests++;
+                if(isBootProbe)
+                {
+                    serialSessions[esc] = IsBootReply(reply);
+                }
+            }
+            else if(isBootProbe)
+            {
+                if(!serialSessions[esc])
+                {
+                    HoldEscHighAndReset(esc);
+                }
+                // The ESC can still be traversing its reset path when the
+                // first UDP request arrives.  A real FC repeatedly sends the
+                // boot pattern; resend it within one bounded window rather
+                // than spending the whole timeout waiting for a request that
+                // the loader never saw.  This also keeps Betaflight's entire
+                // DeviceInitFlash command within the configurator's timeout.
+                reply = ProbeDirectBootloader(esc, request);
+                serialSessions[esc] = IsBootReply(reply);
+            }
+            else
+            {
+                SendSerial(esc, request);
+                SerialRequests++;
+                reply = wanted > 0 ? WaitForSerialReply(esc, wanted) :
+                    new byte[0];
+            }
+            if(reply.Length > 0)
+            {
+                SerialReplies += (uint)reply.Length;
+            }
+            lock(serialSync)
+            {
+                foreach(var value in reply)
+                {
+                    directReplyBytes[esc].Enqueue(value);
+                }
+                directReplyComplete[esc] = true;
+            }
+        }
+
+        private byte[] FastSerialTransaction(int esc, byte[] request)
+        {
+            var socket = sockets[esc];
+            if(socket == null)
+            {
+                return null;
+            }
+            lock(serialSync)
+            {
+                fastReplyPackets[esc].Clear();
+            }
+            var packet = new byte[FastSerialHeaderSize + request.Length];
+            Put16(packet, 0, Magic);
+            packet[2] = FastSerialType;
+            Put16(packet, 4, (ushort)request.Length);
+            Array.Copy(request, 0, packet, FastSerialHeaderSize, request.Length);
+            try
+            {
+                socket.Send(packet, packet.Length);
+            }
+            catch(SocketException)
+            {
+                return null;
+            }
+            var deadline = Environment.TickCount64 + FastSerialTimeoutMs;
+            while(Environment.TickCount64 < deadline)
+            {
+                lock(serialSync)
+                {
+                    if(fastReplyPackets[esc].Count > 0)
+                    {
+                        return fastReplyPackets[esc].Dequeue();
+                    }
+                }
+                var remaining = deadline - Environment.TickCount64;
+                if(remaining <= 0)
+                {
+                    break;
+                }
+                fastReplyReady[esc].WaitOne((int)remaining);
+            }
+            return null;
+        }
+
+        private uint ReadDirectReply(int esc)
+        {
+            lock(serialSync)
+            {
+                if(directReplyBytes[esc].Count > 0)
+                {
+                    return DirectReplyValid | directReplyBytes[esc].Dequeue();
+                }
+                return directReplyComplete[esc] ? DirectReplyDone : 0;
+            }
+        }
+
+        private byte[] ProbeDirectBootloader(int esc, byte[] request)
+        {
+            var deadline = Environment.TickCount64 + DirectBootProbeTimeoutMs;
+            do
+            {
+                lock(serialSync)
+                {
+                    serialReplyBytes[esc].Clear();
+                }
+                SendSerial(esc, request);
+                SerialRequests++;
+                var remaining = deadline - Environment.TickCount64;
+                if(remaining <= 0)
+                {
+                    break;
+                }
+                var reply = WaitForSerialReply(esc, 9,
+                    (int)Math.Min(remaining, DirectBootProbeRetryMs));
+                if(IsBootReply(reply))
+                {
+                    return reply;
+                }
+            }
+            while(Environment.TickCount64 < deadline);
+            return new byte[0];
+        }
+
         private void ScheduleLine(int esc, bool level, ulong delay)
         {
             machine.ScheduleAction(TimeInterval.FromMicroseconds(delay),
@@ -719,6 +1004,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         {
             return request.Length >= 17 && request[8] == 13 &&
                 request[9] == (byte)'B' && request[16] == 0x7D;
+        }
+
+        private static bool IsBootReply(byte[] reply)
+        {
+            return reply.Length == 9 && reply[0] == (byte)'4' &&
+                reply[1] == (byte)'7' && reply[2] == (byte)'1' &&
+                reply[8] == BootSuccess;
         }
 
         private int ExpectedSerialReply(int esc, byte[] request, bool bootProbe)
@@ -933,17 +1225,24 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private readonly Queue<byte>[] serialReplyBytes;
         private readonly AutoResetEvent[] serialReplyReady;
         private readonly List<byte>[] serialRequestBytes;
+        private readonly List<byte>[] directRequestBytes;
+        private readonly Queue<byte>[] directReplyBytes;
+        private readonly bool[] directReplyComplete;
+        private readonly Queue<byte[]>[] fastReplyPackets;
+        private readonly AutoResetEvent[] fastReplyReady;
         private readonly bool[] lineLevels;
         private readonly bool[] decoding;
         private readonly bool[] replyDriving;
         private readonly bool[] serialSessions;
         private readonly bool[] expectingBufferData;
         private readonly uint[] serialGeneration;
+        private readonly uint[] lastFrames = new uint[EscCount];
         private readonly byte[] serialBit = new byte[EscCount];
         private readonly byte[] serialByte = new byte[EscCount];
         private readonly object sync = new object();
         private readonly object serialSync = new object();
         private volatile bool disposed;
+        private uint directBufferAddress;
 
         private static readonly uint[] GcrTable = {
             0x19, 0x1B, 0x12, 0x13, 0x1D, 0x15, 0x16, 0x17,
@@ -957,15 +1256,19 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private const byte Dshot600 = 3;
         private const byte SerialType = 4;
         private const byte LineType = 5;
+        private const byte FastSerialType = 6;
         private const ushort SerialIdleHigh = 0x0001;
         private const ushort SerialGap = 0x0004;
         private const ushort SerialTxDone = 0x0008;
         private const int SerialHeaderSize = 6;
+        private const int FastSerialHeaderSize = 6;
+        private const int FastSerialTimeoutMs = 250;
         private const ushort StateMagic = 0x5353;
         private const byte StateReset = 9;
         private const byte BootRun = 0x00;
         private const byte BootRead = 0x03;
         private const byte BootSetBuffer = 0xFE;
+        private const byte BootSuccess = 0x30;
         private const long GpioMode = 0x00;
         private const uint GpioOutput = 1;
         private const ulong SerialBitUs = 52;
@@ -974,7 +1277,21 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private const ulong SerialReplyLeadUs = 5;
         private const ulong SerialStaleUs = 2000;
         private const int SerialHostTimeoutMs = 12000;
+        // Betaflight performs its own bounded BL_Connect retries.  Keep each
+        // attempt short enough that a missed reset packet cannot consume the
+        // configurator's five-second DeviceInitFlash timeout.
+        private const int DirectBootProbeTimeoutMs = 1500;
+        private const int DirectBootProbeRetryMs = 250;
         private const int SerialMax = 200;
+        private const long DirectTransmit = 0x24;
+        private const long DirectFlush = 0x28;
+        private const long DirectBufferAddress = 0x2C;
+        private const long DirectBufferTransmit = 0x30;
+        private const uint DirectBufferAppendCrc = 1u << 16;
+        private const long DirectReplyBase = 0x40;
+        private const long LastFrameBase = 0x60;
+        private const uint DirectReplyValid = 1u << 8;
+        private const uint DirectReplyDone = 1u << 9;
         private const int EscCount = 4;
         private const int ChannelsPerTimer = 4;
         private static readonly int[] GpioPins = { 1, 0, 10, 11 };

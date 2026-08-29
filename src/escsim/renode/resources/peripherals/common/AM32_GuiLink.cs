@@ -192,7 +192,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             lock(sync)
             {
                 haveSetpoint = false;
+                pendingFastSerial.Clear();
             }
+            fastExpectingBuffer = 0;
+            fastBuffer = null;
+            fastParked = false;
             // the pace setting survives a firmware reboot, like the
             // SITL's does; only the anchor is dropped
             paceValid = false;
@@ -257,7 +261,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private void InputLoop(Socket sock)
         {
-            var buf = new byte[256];
+            var buf = new byte[1024];
             EndPoint from = new IPEndPoint(IPAddress.Any, 0);
             while(true)
             {
@@ -276,6 +280,30 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 }
                 if(n < 6 || BitConverter.ToUInt16(buf, 0) != InputMagic)
                 {
+                    continue;
+                }
+                if(buf[2] == TypeFastSerial)
+                {
+                    // A complete AM32 bootloader transaction.  This is used
+                    // by the sequence-recognized Betaflight fast path: the
+                    // FC and ESC still exchange the real command and touch
+                    // this ESC's own emulated flash, but do not spend host
+                    // seconds simulating every 19.2-kbaud GPIO sample.
+                    var len = BitConverter.ToUInt16(buf, 4);
+                    if(n < FastSerialHeaderSize + len)
+                    {
+                        continue;
+                    }
+                    var payload = new byte[len];
+                    Array.Copy(buf, FastSerialHeaderSize, payload, 0, len);
+                    lock(sync)
+                    {
+                        pendingFastSerial.Enqueue(new FastSerialRequest {
+                            Data = payload,
+                            From = from,
+                        });
+                    }
+                    Volatile.Write(ref lastInputMs, Environment.TickCount);
                     continue;
                 }
                 if(buf[2] == TypeSerial)
@@ -361,6 +389,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             switch(type)
             {
             case TypePwm:
+                ResumeFastBootloader();
                 // A configurator holds the signal wire in serial mode while
                 // talking to the bootloader. The first flight-controller
                 // setpoint hands the wire back to the throttle generator;
@@ -376,6 +405,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             case TypeDshot150:
             case TypeDshot300:
             case TypeDshot600:
+                ResumeFastBootloader();
                 generator.LeaveSerialMode();
                 // the sender composed a whole frame; the generator builds
                 // its own each time it transmits, so unpack what it needs
@@ -463,6 +493,267 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 Array.Copy(data, ofs, pkt, 6, len);
                 Send(inputSocket, pkt, pkt.Length, to);
             }
+        }
+
+        private void ServiceFastSerial()
+        {
+            while(true)
+            {
+                FastSerialRequest request;
+                lock(sync)
+                {
+                    if(pendingFastSerial.Count == 0)
+                    {
+                        return;
+                    }
+                    request = pendingFastSerial.Dequeue();
+                }
+                var reply = ProcessFastSerial(request.Data);
+                var packet = new byte[FastSerialHeaderSize + reply.Length];
+                Array.Copy(BitConverter.GetBytes(InputMagic), 0, packet, 0, 2);
+                packet[2] = TypeFastSerial;
+                Array.Copy(BitConverter.GetBytes((ushort)reply.Length), 0,
+                           packet, 4, 2);
+                Array.Copy(reply, 0, packet, FastSerialHeaderSize, reply.Length);
+                Send(inputSocket, packet, packet.Length, request.From);
+            }
+        }
+
+        private byte[] ProcessFastSerial(byte[] request)
+        {
+            if(fastExpectingBuffer > 0)
+            {
+                var expected = fastExpectingBuffer;
+                fastExpectingBuffer = 0;
+                if(request.Length != expected + 2 || !ValidBootCrc(request))
+                {
+                    fastBuffer = null;
+                    return new byte[] { BootBadCrc };
+                }
+                fastBuffer = new byte[expected];
+                Array.Copy(request, fastBuffer, expected);
+                return new byte[] { BootSuccess };
+            }
+
+            if(IsBootProbe(request))
+            {
+                // Modern AM32 loaders place their v3 devinfo block in the
+                // final 32 bytes before the application.  Its embedded
+                // nine-byte legacy deviceInfo is the exact probe response.
+                var info = BootloaderInfo();
+                ParkFastBootloader();
+                return info;
+            }
+            if(request.Length < 4 || !ValidBootCrc(request))
+            {
+                return new byte[] { BootBadCrc };
+            }
+
+            switch(request[0])
+            {
+            case BootRun:
+                JumpToVector(AppBase);
+                return new byte[0];
+            case BootSetAddress:
+                if(request.Length != 6)
+                {
+                    return new byte[] { BootBadCommand };
+                }
+                SetFastAddress((ushort)(request[2] << 8 | request[3]));
+                return new byte[] { BootSuccess };
+            case BootSetBuffer:
+                if(request.Length != 6)
+                {
+                    return new byte[] { BootBadCommand };
+                }
+                fastExpectingBuffer = request[2] != 0 ? 256 : request[3];
+                fastBuffer = null;
+                return new byte[0];
+            case BootProgram:
+                if(fastBuffer == null)
+                {
+                    return new byte[] { BootBadCommand };
+                }
+                WriteFastFlash(fastBuffer);
+                fastBuffer = null;
+                return new byte[] { BootSuccess };
+            case BootErase:
+                // The Renode flash backends are mapped memory; programming
+                // replaces bytes directly, as their existing flash models
+                // already do for the guest bootloader.
+                return new byte[] { BootSuccess };
+            case BootRead:
+                if(request.Length != 4)
+                {
+                    return new byte[] { BootBadCommand };
+                }
+                var count = request[1] == 0 ? 256 : request[1];
+                var data = machine.SystemBus.ReadBytes(fastAddress, count);
+                var response = new byte[count + 3];
+                Array.Copy(data, response, count);
+                var crc = BootCrc(data, data.Length);
+                response[count] = (byte)crc;
+                response[count + 1] = (byte)(crc >> 8);
+                response[count + 2] = BootSuccess;
+                return response;
+            case BootKeepAlive:
+                return new byte[] { BootBadCommand };
+            default:
+                return new byte[] { BootBadCommand };
+            }
+        }
+
+        private byte[] BootloaderInfo()
+        {
+            var block = machine.SystemBus.ReadBytes(AppBase - DevinfoTailSize,
+                                                    DevinfoTailSize);
+            var result = new byte[LegacyDeviceInfoSize];
+            Array.Copy(block, DevinfoLegacyOffset, result, 0, result.Length);
+            // Fail closed if an old or unknown loader does not use the v3
+            // tail layout. The FC then falls back to its wire-level path.
+            if(result[0] != (byte)'4' || result[1] != (byte)'7'
+               || result[2] != (byte)'1')
+            {
+                return new byte[0];
+            }
+            return result;
+        }
+
+        private void SetFastAddress(ushort address)
+        {
+            switch(address)
+            {
+            case AddressMagicEeprom:
+                fastAddress = eepromAddress;
+                return;
+            case AddressMagicFilename:
+                fastAddress = FirmwareNameAddress;
+                return;
+            case AddressMagicContinue:
+                return;
+            case AddressMagicDevinfo:
+                fastAddress = AppBase - DevinfoTailSize;
+                return;
+            }
+            var block = machine.SystemBus.ReadBytes(AppBase - DevinfoTailSize,
+                                                    DevinfoTailSize);
+            var shift = block.Length > DevinfoAddressShiftOffset
+                && block[DevinfoAddressShiftOffset] <= 4
+                ? block[DevinfoAddressShiftOffset] : 0;
+            fastAddress = FlashBase + ((ulong)address << shift);
+        }
+
+        private void WriteFastFlash(byte[] data)
+        {
+            machine.SystemBus.WriteBytes(data, fastAddress);
+            if(EepromBufferAddress != 0 && eepromSize > 0)
+            {
+                var first = Math.Max(fastAddress, eepromAddress);
+                var last = Math.Min(fastAddress + (ulong)data.Length,
+                                    eepromAddress + eepromSize);
+                if(first < last)
+                {
+                    var offset = (int)(first - fastAddress);
+                    var length = (int)(last - first);
+                    var overlap = new byte[length];
+                    Array.Copy(data, offset, overlap, 0, length);
+                    machine.SystemBus.WriteBytes(
+                        overlap, EepromBufferAddress + first - eepromAddress);
+                }
+            }
+        }
+
+        private void JumpToVector(ulong vector)
+        {
+            var cpu = machine.SystemBus.GetCPUs().FirstOrDefault() as CortexM;
+            if(cpu == null || vector > uint.MaxValue)
+            {
+                return;
+            }
+            var sp = machine.SystemBus.ReadDoubleWord(vector);
+            var pc = machine.SystemBus.ReadDoubleWord(vector + 4);
+            if(sp == 0 || pc == 0 || pc == uint.MaxValue)
+            {
+                return;
+            }
+            // The bootloader enters its command loop with interrupts masked.
+            // Merely replacing SP/PC preserves that architectural state, so
+            // an application reached through the fast transaction path can
+            // sit forever waiting for interrupts that can no longer arrive.
+            // Reset the core first, as the real bootloader's RUN transition
+            // effectively does, then select the application's vector table.
+            cpu.Reset();
+            cpu.VectorTableOffset = (uint)vector;
+            cpu.SP = sp;
+            cpu.PC = pc;
+            // Reset() deliberately leaves a Renode CPU in its reset state;
+            // a whole-machine reset normally performs this transition.
+            // This is a local core reset, so explicitly release it here.
+            cpu.Resume();
+            fastParked = false;
+        }
+
+        private void ParkFastBootloader()
+        {
+            var cpu = machine.SystemBus.GetCPUs().FirstOrDefault() as CortexM;
+            if(cpu == null)
+            {
+                return;
+            }
+            // Once the transaction engine has accepted a loader probe, the
+            // guest's GPIO polling loop no longer participates in this
+            // session.  Park it in `wfi; b .-4` so virtual time and the
+            // GuiLink timer can advance rapidly.  BootRun restores the real
+            // application's vector, SP and PC through JumpToVector().
+            machine.SystemBus.WriteBytes(
+                new byte[] { 0x30, 0xBF, 0xFD, 0xE7 }, FastBootParkAddress);
+            cpu.PC = FastBootParkAddress;
+            fastParked = true;
+        }
+
+        private void ResumeFastBootloader()
+        {
+            if(fastParked)
+            {
+                // InterfaceExit does not issue BootRun to every selected ESC.
+                // A real loader returns to normal operation when the FC takes
+                // the line back; use its first PWM/DShot frame as that same
+                // transition for a CPU parked by the fast path.
+                JumpToVector(AppBase);
+            }
+        }
+
+        private static bool IsBootProbe(byte[] request)
+        {
+            return request.Length >= 17 && request[8] == 13
+                && request[9] == (byte)'B' && request[16] == 0x7D;
+        }
+
+        private static bool ValidBootCrc(byte[] data)
+        {
+            if(data.Length < 2)
+            {
+                return false;
+            }
+            var expected = (ushort)(data[data.Length - 2]
+                                    | data[data.Length - 1] << 8);
+            return expected == BootCrc(data, data.Length - 2);
+        }
+
+        private static ushort BootCrc(byte[] data, int length)
+        {
+            ushort crc = 0;
+            for(var i = 0; i < length; i++)
+            {
+                var value = data[i];
+                for(var bit = 0; bit < 8; bit++)
+                {
+                    crc = (ushort)(((value ^ crc) & 1) != 0
+                        ? (crc >> 1) ^ 0xA001 : crc >> 1);
+                    value >>= 1;
+                }
+            }
+            return crc;
         }
 
         private void PumpReplies()
@@ -1161,6 +1452,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 silenced = true;
             }
             ServiceCommands();
+            ServiceFastSerial();
             ApplySetpoint();
             PumpReplies();
             PumpSerial();
@@ -1236,6 +1528,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             public EndPoint From;
         }
 
+        private struct FastSerialRequest
+        {
+            public byte[] Data;
+            public EndPoint From;
+        }
+
         private const ushort InputMagic = 0x4453;
         private const byte TypePwm = 0;
         private const byte TypeDshot150 = 1;
@@ -1244,6 +1542,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private const int SerialMax = 200;
         private const byte TypeSerial = 4;
         private const byte TypeLine = 5;
+        private const byte TypeFastSerial = 6;
+        private const int FastSerialHeaderSize = 6;
+        private const uint FastBootParkAddress = 0x20000000;
         private const ushort FlagIdleHigh = 0x0001;
         private const ushort FlagFloating = 0x0002;
         private const ushort FlagGap = 0x0004;
@@ -1255,6 +1556,25 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private const ushort StateMagicReply = 0x5355;
         private const ushort StateMagicEeprom = 0x5358;
         private const ushort StateMagicInfo = 0x5359;
+
+        private const byte BootRun = 0x00;
+        private const byte BootProgram = 0x01;
+        private const byte BootErase = 0x02;
+        private const byte BootRead = 0x03;
+        private const byte BootKeepAlive = 0xFD;
+        private const byte BootSetBuffer = 0xFE;
+        private const byte BootSetAddress = 0xFF;
+        private const byte BootSuccess = 0x30;
+        private const byte BootBadCommand = 0xC1;
+        private const byte BootBadCrc = 0xC2;
+        private const ushort AddressMagicEeprom = 0x20;
+        private const ushort AddressMagicFilename = 0x21;
+        private const ushort AddressMagicContinue = 0x22;
+        private const ushort AddressMagicDevinfo = 0x23;
+        private const int DevinfoTailSize = 32;
+        private const int DevinfoLegacyOffset = 8;
+        private const int LegacyDeviceInfoSize = 9;
+        private const int DevinfoAddressShiftOffset = 18;
         // shared with the info reply magic, as the SITL does: a watch
         // reply has version 1 in byte 2 where the info packet has 9
         private const ushort StateMagicWatchReply = 0x5359;
@@ -1335,7 +1655,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private EndPoint serialFrom;
         private readonly Queue<KeyValuePair<byte[], bool>> pendingSerial =
             new Queue<KeyValuePair<byte[], bool>>();
+        private readonly Queue<FastSerialRequest> pendingFastSerial =
+            new Queue<FastSerialRequest>();
         private int pendingLine;   // bit0 level, bit1 floating, bit2 set
+        private ulong fastAddress;
+        private int fastExpectingBuffer;
+        private byte[] fastBuffer;
+        private bool fastParked;
+
+        private ulong FlashBase => AppBase & 0xFFFF0000UL;
 
         private bool ownsWire;
         private bool silenced;

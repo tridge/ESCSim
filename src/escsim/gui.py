@@ -120,7 +120,11 @@ FC_METRICS_COMMAND = (
     "sysbus.motorBridge ReadDoubleWord 0x10; "
     "sysbus.motorBridge ReadDoubleWord 0x14; "
     "sysbus.motorBridge ReadDoubleWord 0x18; "
-    "sysbus.motorBridge ReadDoubleWord 0x1c"
+    "sysbus.motorBridge ReadDoubleWord 0x1c; "
+    "sysbus.motorBridge ReadDoubleWord 0x60; "
+    "sysbus.motorBridge ReadDoubleWord 0x64; "
+    "sysbus.motorBridge ReadDoubleWord 0x68; "
+    "sysbus.motorBridge ReadDoubleWord 0x6c"
 )
 
 
@@ -553,6 +557,11 @@ class Lab(object):
                     monitor_port=self.fc_monitor_port(),
                     usbip_port=self.fc_usbip_port(),
                     renode=self.args.renode,
+                    symbols=(
+                        Path(getattr(self.args, "fc_symbols", "")).expanduser()
+                        if getattr(self.args, "fc_symbols", None)
+                        else None
+                    ),
                 ).command()
             except (OSError, RuntimeError, ValueError) as error:
                 self.launch_work.cleanup()
@@ -859,6 +868,11 @@ class Lab(object):
                 parts.append(
                     "4-way %u requests/%u reply bytes"
                     % (m["serial_requests"], m["serial_replies"])
+                )
+            if "dshot_motor_frames" in m:
+                parts.append(
+                    "motors="
+                    + ",".join("0x%04X" % frame for frame in m["dshot_motor_frames"])
                 )
         return "%s: %s" % (label, " | ".join(parts))
 
@@ -1363,6 +1377,10 @@ def main(argv=None):
     )
     ap.add_argument(
         "--renode", default=None, help="renode binary, passed through to gen_target"
+    )
+    ap.add_argument(
+        "--fc-symbols",
+        help="optional matching Betaflight ELF; cross-checks recognized hot patches",
     )
     ap.add_argument(
         "--renode-cache", help="download cache (default: ~/.cache/ardupilot/renode)"
