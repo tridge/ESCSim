@@ -45,6 +45,13 @@ def test_launcher_preferences_round_trip(tmp_path):
     assert store.load().launcher == expected
 
 
+def test_custom_fc_firmware_preference_round_trip(tmp_path):
+    store = SettingsStore(tmp_path)
+    expected = LauncherSettings(fc_firmware="/firmware/custom-flight-controller.elf")
+    store.save(Settings(launcher=expected))
+    assert store.load().launcher == expected
+
+
 def test_changing_targets_source_preserves_launcher_preferences(tmp_path):
     store = SettingsStore(tmp_path / "config")
     preferences = LauncherSettings(target="VIMDRONES_L431", can_bus=-1)

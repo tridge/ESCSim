@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import struct
 import threading
 from pathlib import PureWindowsPath
@@ -14,8 +15,11 @@ from escsim.renode.flight_controller import (
     FLASH_SIZE,
     FlightControllerSpec,
     betaflight_hotpatches,
+    download_flight_controller_firmware,
     ensure_flash,
     flight_controller_firmware,
+    flight_controller_firmware_bootloader,
+    flight_controller_firmware_cache_path,
     flight_controller_firmwares,
     has_betaflight_source_speedup,
     load_image,
@@ -25,6 +29,31 @@ from escsim.renode.flight_controller import (
     write_speedybee_script,
 )
 from escsim.renode.generator import renode_path
+
+
+def arm_elf(payload: bytes, address: int = FLASH_BASE) -> bytes:
+    ident = b"\x7fELF\x01\x01\x01" + b"\x00" * 9
+    header = struct.pack(
+        "<16sHHIIIIIHHHHHH",
+        ident,
+        2,
+        40,
+        1,
+        address,
+        52,
+        0,
+        0x5000400,
+        52,
+        32,
+        1,
+        0,
+        0,
+        0,
+    )
+    segment = struct.pack(
+        "<IIIIIIII", 1, 0x100, address, address, len(payload), len(payload), 5, 4
+    )
+    return header + segment + b"\x00" * (0x100 - len(header) - len(segment)) + payload
 
 
 def test_speedybee_platform_wires_four_escs_and_fixed_sensors(tmp_path):
@@ -420,6 +449,64 @@ def test_bundled_fc_images_are_valid_and_selectable(tmp_path, firmware, vectors)
     assert flash.read_bytes()[0xF0000:0xF000A] == b"configured"
 
 
+def test_elf_fc_image_is_selectable(tmp_path):
+    image = tmp_path / "firmware.elf"
+    image.write_bytes(arm_elf(bytes.fromhex("0010002001010008")))
+    flash = tmp_path / "flash.bin"
+
+    assert select_firmware(flash, image)
+    assert flash.read_bytes()[:8] == bytes.fromhex("0010002001010008")
+    assert not select_firmware(flash, image)
+
+
+def test_ardupilot_app_elf_keeps_bundled_bootloader(tmp_path):
+    image = tmp_path / "arducopter.elf"
+    image.write_bytes(arm_elf(bytes.fromhex("0020002099d20008"), FLASH_BASE + 0xC000))
+    bootloader = flight_controller_firmware("ARDUPILOT_SPEEDYBEEF405MINI")
+    flash = tmp_path / "flash.bin"
+
+    assert select_firmware(flash, image, bootloader=bootloader)
+    assert flash.read_bytes()[:8] == bytes.fromhex("00060020e1010008")
+    assert flash.read_bytes()[0xC000:0xC008] == bytes.fromhex("0020002099d20008")
+    assert flight_controller_firmware_bootloader(
+        "ARDUPILOT_SPEEDYBEEF405MINI", image
+    ) == bootloader
+    assert flight_controller_firmware_bootloader(str(image), image) == bootloader
+
+
+def test_managed_fc_firmware_download_is_atomic_and_cached(tmp_path):
+    content = arm_elf(bytes.fromhex("0020002001010008"))
+    requests = []
+
+    class Response(io.BytesIO):
+        headers = {"Content-Length": str(len(content))}
+
+    def opener(request, timeout):
+        requests.append((request, timeout))
+        return Response(content)
+
+    progress = []
+    destination = download_flight_controller_firmware(
+        "ARDUPILOT_SPEEDYBEEF405MINI",
+        tmp_path,
+        progress=lambda received, total: progress.append((received, total)),
+        opener=opener,
+    )
+
+    assert destination == flight_controller_firmware_cache_path(
+        "ARDUPILOT_SPEEDYBEEF405MINI", tmp_path
+    )
+    assert destination.read_bytes() == content
+    assert flight_controller_firmware(
+        "ARDUPILOT_SPEEDYBEEF405MINI", tmp_path
+    ) == destination
+    assert requests[0][0].full_url.endswith(
+        "/Copter/latest/SpeedyBeeF405Mini/arducopter.elf"
+    )
+    assert requests[0][1] == 30
+    assert progress[-1] == (len(content), len(content))
+
+
 def test_bundled_betaflight_sequences_resolve_without_elf(tmp_path):
     flash = tmp_path / "flash.bin"
     select_firmware(flash, flight_controller_firmware("SPEEDYBEEF405V5"))
@@ -600,7 +687,7 @@ def test_flight_controller_leaves_unknown_firmware_unpatched(tmp_path):
 
 
 def test_unknown_flight_controller_firmware_is_rejected():
-    with pytest.raises(ValueError, match="unsupported flight-controller firmware"):
+    with pytest.raises(ValueError, match="firmware does not exist"):
         flight_controller_firmware("missing")
 
 

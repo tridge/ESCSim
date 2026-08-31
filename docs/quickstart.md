@@ -79,14 +79,16 @@ published images.
 
 ## Flight-controller DFU
 
-**FC Firmware** selects an image to preload for a direct, non-DFU start. The
-bundled choices are Betaflight 2026.6.1 for `SPEEDYBEEF405V5` (revision
-`6dbc4218f`) and ArduPilot Copter 4.8.0-dev for `SpeedyBeeF405Mini` (revision
-`af2a1bafc8a`). The ArduPilot image includes its bootloader, so either choice
-boots directly. Re-selecting the same image preserves its flash-backed
-configuration; selecting a different firmware replaces the emulated flash.
-Future images are reserved under
-`https://firmware.ardupilot.org/Tools/AM32-tools/ESCSim/FC_Firmware/`.
+**FC Firmware** selects an image to preload for a direct, non-DFU start.
+**Update** downloads an ELF for the selected published choice into a stable
+local cache path, replacing the previous download. ArduPilot Copter comes from
+`https://firmware.ardupilot.org/Copter/latest/SpeedyBeeF405Mini/arducopter.elf`;
+the ESCSim-speedup Betaflight build comes from
+`https://firmware.ardupilot.org/Tools/AM32-tools/ESCSim/betaflight/`.
+**Browse...** selects a custom local ELF or Intel HEX image. Until a published
+ELF is downloaded, each choice uses its bundled HEX as an offline fallback.
+Re-selecting the same image preserves its flash-backed configuration; selecting
+a different firmware replaces the emulated flash.
 
 Selecting **Boot in USB DFU** exposes the STM32 ROM-style `0483:df11` DfuSe
 device instead of starting the FC. A successful DFU manifestation disconnects

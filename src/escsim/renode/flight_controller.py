@@ -4,10 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from importlib import resources
+import io
 import json
 import os
 from pathlib import Path
 import struct
+import tempfile
+from urllib.request import Request, urlopen
 
 from elftools.common.exceptions import ELFError
 from elftools.elf.elffile import ELFFile
@@ -27,6 +30,7 @@ FLASH_SIZE = 1024 * 1024
 BETAFLIGHT_POLL_TRAMPOLINE = FLASH_BASE + FLASH_SIZE - 16
 BETAFLIGHT_SCHEDULER_TRAMPOLINE = FLASH_BASE + FLASH_SIZE - 48
 BETAFLIGHT_SOURCE_SPEEDUP_MARKER = b"ESCSIM_SPEEDUP_V1\x00"
+ARDUPILOT_SPEEDYBEEF405MINI_APP_BASE = FLASH_BASE + 0xC000
 BETAFLIGHT_GYRO_RATE_ORIGINAL = bytes.fromhex(
     "122b15bf052202224ff47a704ff4487014bf4ff4fa514ff44861002384f81f21"
 )
@@ -43,14 +47,25 @@ MONITOR_PORT_OFFSET = 4
 FC_FIRMWARE_BASE_URL = (
     "https://firmware.ardupilot.org/Tools/AM32-tools/ESCSim/FC_Firmware/"
 )
+FC_FIRMWARE_DOWNLOAD_LIMIT = 16 * 1024 * 1024
 FC_FIRMWARES = {
     "SPEEDYBEEF405V5": {
         "filename": "SPEEDYBEEF405V5.hex",
-        "label": "Betaflight 2026.6.1 (SPEEDYBEEF405V5)",
+        "label": "Betaflight ESCSim-speedup (SPEEDYBEEF405V5)",
+        "url": (
+            "https://firmware.ardupilot.org/Tools/AM32-tools/ESCSim/betaflight/"
+            "betaflight_2026.12.0-alpha_STM32F405_SPEEDYBEEF405V5_"
+            "ESCSim-speedup.elf"
+        ),
     },
     "ARDUPILOT_SPEEDYBEEF405MINI": {
         "filename": "ARDUPILOT_SPEEDYBEEF405MINI.hex",
-        "label": "ArduPilot Copter 4.8.0-dev (SpeedyBeeF405Mini)",
+        "label": "ArduPilot Copter latest (SpeedyBeeF405Mini)",
+        "uses_bundled_bootloader": True,
+        "url": (
+            "https://firmware.ardupilot.org/Copter/latest/"
+            "SpeedyBeeF405Mini/arducopter.elf"
+        ),
     },
 }
 
@@ -125,12 +140,30 @@ def flight_controller_firmwares() -> tuple[str, ...]:
     return tuple(FC_FIRMWARES)
 
 
-def flight_controller_firmware(name: str) -> Path:
-    """Resolve one bundled image; future releases use FC_FIRMWARE_BASE_URL."""
-    try:
-        filename = FC_FIRMWARES[name]["filename"]
-    except KeyError as error:
-        raise ValueError(f"unsupported flight-controller firmware {name}") from error
+def flight_controller_firmware_cache_path(name: str, cache_dir: Path) -> Path:
+    """Stable destination for a server-managed FC ELF."""
+    if name not in FC_FIRMWARES:
+        raise ValueError(f"unsupported flight-controller firmware {name}")
+    return Path(cache_dir) / "flight-controllers" / "firmware" / f"{name}.elf"
+
+
+def flight_controller_firmware(name: str, cache_dir: Path | None = None) -> Path:
+    """Resolve a managed firmware ID or a custom local image.
+
+    A downloaded ELF takes precedence over the package-owned offline HEX
+    fallback. Passing no cache preserves the old bundled-image behaviour for
+    callers which explicitly need package resources.
+    """
+    if name not in FC_FIRMWARES:
+        custom = Path(name).expanduser()
+        if custom.is_file():
+            return custom
+        raise ValueError(f"flight-controller firmware does not exist: {custom}")
+    if cache_dir is not None:
+        cached = flight_controller_firmware_cache_path(name, cache_dir)
+        if cached.is_file():
+            return cached
+    filename = FC_FIRMWARES[name]["filename"]
     image = resource_root() / "FC_Firmware" / filename
     if not image.is_file():
         raise RuntimeError(f"missing bundled flight-controller firmware {image}")
@@ -142,6 +175,80 @@ def flight_controller_firmware_label(name: str) -> str:
         return FC_FIRMWARES[name]["label"]
     except KeyError as error:
         raise ValueError(f"unsupported flight-controller firmware {name}") from error
+
+
+def flight_controller_firmware_url(name: str) -> str:
+    try:
+        return FC_FIRMWARES[name]["url"]
+    except KeyError as error:
+        raise ValueError(f"unsupported flight-controller firmware {name}") from error
+
+
+def flight_controller_firmware_bootloader(name: str, image: Path) -> Path | None:
+    """Return the offline image supplying a downloaded app's bootloader prefix."""
+    firmware = FC_FIRMWARES.get(name)
+    if not firmware:
+        # A browsed ArduPilot ELF has the same application-only layout as the
+        # managed download. Recognize that exact board layout so custom Copter
+        # builds also retain a reset vector and serial bootloader.
+        chunks = _firmware_chunks(Path(image))
+        if min(address for address, _payload in chunks) != (
+            ARDUPILOT_SPEEDYBEEF405MINI_APP_BASE
+        ):
+            return None
+        return flight_controller_firmware("ARDUPILOT_SPEEDYBEEF405MINI")
+    if not firmware.get("uses_bundled_bootloader"):
+        return None
+    bundled = flight_controller_firmware(name)
+    return bundled if Path(image) != bundled else None
+
+
+def download_flight_controller_firmware(
+    name: str,
+    cache_dir: Path,
+    progress=None,
+    opener=None,
+) -> Path:
+    """Download and validate a managed FC ELF, replacing its cache atomically."""
+    destination = flight_controller_firmware_cache_path(name, cache_dir)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    request = Request(
+        flight_controller_firmware_url(name),
+        headers={"Cache-Control": "no-cache", "User-Agent": "ESCSim"},
+    )
+    opener = opener or urlopen
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+    )
+    temporary = Path(temporary_name)
+    received = 0
+    try:
+        with os.fdopen(fd, "wb") as output, opener(request, timeout=30) as response:
+            declared = response.headers.get("Content-Length")
+            total = int(declared) if declared is not None else 0
+            if total > FC_FIRMWARE_DOWNLOAD_LIMIT:
+                raise RuntimeError("flight-controller firmware download is too large")
+            while True:
+                block = response.read(128 * 1024)
+                if not block:
+                    break
+                received += len(block)
+                if received > FC_FIRMWARE_DOWNLOAD_LIMIT:
+                    raise RuntimeError("flight-controller firmware download is too large")
+                output.write(block)
+                if progress is not None:
+                    progress(received, total)
+            output.flush()
+            os.fsync(output.fileno())
+        if total and received != total:
+            raise RuntimeError(
+                f"flight-controller firmware is {received} bytes; expected {total}"
+            )
+        _firmware_chunks(temporary)
+        os.replace(temporary, destination)
+        return destination
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)
@@ -778,19 +885,89 @@ def load_image(flash: Path, image: Path, address: int = FLASH_BASE) -> None:
         os.fsync(stream.fileno())
 
 
-def select_firmware(flash: Path, image: Path) -> bool:
-    """Select an Intel HEX FC image, preserving settings on repeat starts.
+def _firmware_chunks(image: Path) -> list[tuple[int, bytes]]:
+    """Read flash-addressed chunks from an Intel HEX or 32-bit ARM ELF."""
+    try:
+        content = Path(image).read_bytes()
+    except OSError as error:
+        raise ValueError(f"cannot read FC firmware {image}: {error}") from error
+    if content.startswith(b"\x7fELF"):
+        try:
+            elf = ELFFile(io.BytesIO(content))
+            if elf.elfclass != 32 or not elf.little_endian:
+                raise ValueError("FC ELF must be 32-bit little-endian")
+            if elf.header["e_machine"] != "EM_ARM":
+                raise ValueError("FC ELF is not for ARM")
+            chunks = []
+            for segment in elf.iter_segments():
+                if segment["p_type"] != "PT_LOAD" or not segment["p_filesz"]:
+                    continue
+                for section in elf.iter_sections():
+                    if (
+                        section["sh_type"] == "SHT_NOBITS"
+                        or not section["sh_size"]
+                        or not section["sh_flags"] & 0x2
+                        or not segment.section_in_segment(section)
+                    ):
+                        continue
+                    address = int(segment["p_paddr"]) + (
+                        int(section["sh_offset"]) - int(segment["p_offset"])
+                    )
+                    payload = section.data()
+                    if (
+                        FLASH_BASE <= address
+                        and address + len(payload) <= FLASH_BASE + FLASH_SIZE
+                    ):
+                        chunks.append((address, payload))
+        except (ELFError, KeyError, TypeError, ValueError) as error:
+            raise ValueError(f"cannot read FC firmware {image}: {error}") from error
+        # Stripped ELFs can omit section headers. Fall back to whole load
+        # segments only when no allocated section data was available; normal
+        # linked images use sections so ELF/program-header padding is excluded.
+        if not chunks:
+            for segment in elf.iter_segments():
+                if segment["p_type"] != "PT_LOAD" or not segment["p_filesz"]:
+                    continue
+                address = int(segment["p_paddr"])
+                payload = segment.data()
+                if (
+                    FLASH_BASE <= address
+                    and address + len(payload) <= FLASH_BASE + FLASH_SIZE
+                ):
+                    chunks.append((address, payload))
+        if not chunks:
+            raise ValueError(f"FC firmware contains no internal-flash data: {image}")
+        return chunks
+    try:
+        return parse_ihex(content)
+    except Unsupported as error:
+        raise ValueError(f"cannot read FC firmware {image}: {error}") from error
+
+
+def select_firmware(
+    flash: Path, image: Path, bootloader: Path | None = None
+) -> bool:
+    """Select an Intel HEX or ELF FC image, preserving settings on repeat starts.
 
     Returns true when flash was replaced. The first changed immutable byte
     selects a new image; in that case erased flash is rebuilt atomically and
-    every HEX chunk is applied. If all immutable bytes already match, the
-    reserved configuration sector and bytes absent from the HEX remain intact.
+    every image chunk is applied. If all immutable bytes already match, the
+    reserved configuration sector and bytes absent from the image remain intact.
     """
     image = Path(image)
-    try:
-        chunks = parse_ihex(image.read_bytes())
-    except (OSError, Unsupported) as error:
-        raise ValueError(f"cannot read FC firmware {image}: {error}") from error
+    chunks = _firmware_chunks(image)
+    if bootloader is not None:
+        app_start = min(address for address, _payload in chunks)
+        prefix = []
+        for address, payload in _firmware_chunks(Path(bootloader)):
+            if address >= app_start:
+                continue
+            prefix.append((address, payload[: app_start - address]))
+        if not prefix:
+            raise ValueError(
+                f"FC bootloader contains no data below application at 0x{app_start:08X}"
+            )
+        chunks = prefix + chunks
     if not chunks:
         raise ValueError(f"FC firmware contains no data: {image}")
     normalized = []

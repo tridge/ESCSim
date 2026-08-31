@@ -159,11 +159,8 @@ class SettingsStore:
             raise ValueError("launcher can_bus must be -1..9")
         if launcher.flight_controller not in {"none", "SpeedyBeeF405Mini"}:
             raise ValueError("unsupported launcher flight_controller")
-        if launcher.fc_firmware not in {
-            "SPEEDYBEEF405V5",
-            "ARDUPILOT_SPEEDYBEEF405MINI",
-        }:
-            raise ValueError("unsupported launcher fc_firmware")
+        if not launcher.fc_firmware:
+            raise ValueError("launcher fc_firmware must not be empty")
         if launcher.fc_boot_mode not in {"flash", "dfu"}:
             raise ValueError("launcher fc_boot_mode must be flash or dfu")
         return Settings(

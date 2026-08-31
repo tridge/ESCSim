@@ -28,7 +28,7 @@ with --control-port N the UI can be driven over a localhost TCP
 connection (one command per line), for scripted tests:
   target NAME, bootloader auto|none|PATH, firmware auto|none|PATH,
   eeprom defaults|blank, conf off|serial|usb,
-  flightcontroller none|SpeedyBeeF405Mini, fcfirmware NAME,
+  flightcontroller none|SpeedyBeeF405Mini, fcfirmware NAME|PATH,
   fcboot flash|dfu,
   protocol 4way|direct|flightcontroller,
   escs 1..8, canbus N, download-renode, start, stop, status, quit
@@ -72,11 +72,14 @@ from escsim.renode.generator import (
 )
 from escsim.renode.process import ProcessTree
 from escsim.renode.flight_controller import (
-    FC_FIRMWARE_BASE_URL,
     FlightControllerSpec,
+    download_flight_controller_firmware,
     ensure_flash,
     flight_controller_firmware,
+    flight_controller_firmware_bootloader,
+    flight_controller_firmware_cache_path,
     flight_controller_firmware_label,
+    flight_controller_firmware_url,
     flight_controller_firmwares,
     select_firmware,
 )
@@ -586,8 +589,13 @@ class Lab(object):
             try:
                 flash = ensure_flash(self.fc_flash_path())
                 if self.fc_boot_mode == "flash":
-                    image = flight_controller_firmware(self.fc_firmware)
-                    changed = select_firmware(flash, image)
+                    image = flight_controller_firmware(
+                        self.fc_firmware, default_cache_dir()
+                    )
+                    bootloader = flight_controller_firmware_bootloader(
+                        self.fc_firmware, image
+                    )
+                    changed = select_firmware(flash, image, bootloader=bootloader)
                     self.log(
                         "%s flight-controller firmware %s"
                         % ("loaded" if changed else "using", self.fc_firmware)
@@ -1620,13 +1628,94 @@ def main(argv=None):
             flight_controller_firmware_label(firmware_name), firmware_name
         )
     selected_fc_firmware = fc_fw_combo.findData(preferences.fc_firmware)
+    if selected_fc_firmware < 0 and preferences.fc_firmware:
+        fc_fw_combo.insertItem(
+            0, os.path.basename(preferences.fc_firmware), preferences.fc_firmware
+        )
+        selected_fc_firmware = 0
     fc_fw_combo.setCurrentIndex(max(0, selected_fc_firmware))
     fc_fw_combo.setToolTip(
         "Firmware preloaded into the selected flight controller when USB DFU\n"
-        "mode is off. Reusing the same image preserves its configuration.\n"
-        "Future published images will be served from:\n%s" % FC_FIRMWARE_BASE_URL
+        "mode is off. Update downloads the selected server ELF; Browse selects\n"
+        "a custom local ELF or HEX. Reusing an image preserves configuration."
     )
-    grid.addWidget(fc_fw_combo, 3, 1, 1, 3)
+    grid.addWidget(fc_fw_combo, 3, 1)
+    fc_fw_update = QPushButton("Update")
+    grid.addWidget(fc_fw_update, 3, 2)
+    fc_fw_browse = QPushButton("Browse...")
+    grid.addWidget(fc_fw_browse, 3, 3)
+    fc_download_active = False
+
+    def refresh_fc_firmware_controls():
+        selected = fc_combo.currentData() != "none"
+        idle = not (lab.runner.running() or lab.fc_runner.running())
+        enabled = selected and idle and not fc_dfu_check.isChecked()
+        fc_fw_combo.setEnabled(enabled and not fc_download_active)
+        fc_fw_browse.setEnabled(enabled and not fc_download_active)
+        managed = fc_fw_combo.currentData() in flight_controller_firmwares()
+        fc_fw_update.setEnabled(enabled and managed and not fc_download_active)
+        if managed:
+            cached = flight_controller_firmware_cache_path(
+                fc_fw_combo.currentData(), default_cache_dir()
+            )
+            if not fc_download_active:
+                fc_fw_update.setText("Update" if cached.is_file() else "Download")
+            fc_fw_update.setToolTip(
+                "Download and use:\n%s"
+                % flight_controller_firmware_url(fc_fw_combo.currentData())
+            )
+        else:
+            if not fc_download_active:
+                fc_fw_update.setText("Update")
+            fc_fw_update.setToolTip("Update is available for published firmware")
+
+    def fc_firmware_changed():
+        refresh_fc_firmware_controls()
+
+    def browse_fc_firmware():
+        path, _ = QFileDialog.getOpenFileName(
+            win,
+            "Flight-controller firmware image",
+            REPO,
+            "Flight-controller firmware (*.elf *.hex);;All files (*)",
+        )
+        if path:
+            existing = fc_fw_combo.findData(path)
+            if existing < 0:
+                fc_fw_combo.insertItem(0, os.path.basename(path), path)
+                existing = 0
+            fc_fw_combo.setCurrentIndex(existing)
+
+    def update_fc_firmware():
+        nonlocal fc_download_active
+        name = fc_fw_combo.currentData()
+        if fc_download_active or name not in flight_controller_firmwares():
+            return False
+        fc_download_active = True
+        fc_fw_update.setText("Downloading...")
+        start_btn.setEnabled(False)
+        fc_combo.setEnabled(False)
+        fc_dfu_check.setEnabled(False)
+        refresh_fc_firmware_controls()
+
+        def progress(received, total):
+            lab.log_q.put(("__fc_firmware_download_progress__", received, total))
+
+        def worker():
+            try:
+                path = download_flight_controller_firmware(
+                    name, default_cache_dir(), progress=progress
+                )
+                lab.log_q.put(("__fc_firmware_download_done__", name, path))
+            except (OSError, RuntimeError, ValueError) as error:
+                lab.log_q.put(("__fc_firmware_download_error__", str(error)))
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
+    fc_fw_combo.currentIndexChanged.connect(lambda _index: fc_firmware_changed())
+    fc_fw_update.clicked.connect(update_fc_firmware)
+    fc_fw_browse.clicked.connect(browse_fc_firmware)
 
     target_names = []
     initial_target = [preferences.target]
@@ -1939,10 +2028,7 @@ def main(argv=None):
             esc_count_spin.setEnabled(
                 not (lab.runner.running() or lab.fc_runner.running())
             )
-            fc_fw_combo.setEnabled(
-                not fc_dfu_check.isChecked()
-                and not (lab.runner.running() or lab.fc_runner.running())
-            )
+            refresh_fc_firmware_controls()
             fc_dfu_check.setEnabled(True)
             if conf_combo.currentData() == "serial":
                 usb_index = conf_combo.findData("usb")
@@ -1958,7 +2044,7 @@ def main(argv=None):
                 last_bridge_protocol[0] = current
             proto_combo.setEnabled(not lab.runner.running())
             esc_count_spin.setEnabled(current == "4way" and not lab.runner.running())
-            fc_fw_combo.setEnabled(False)
+            refresh_fc_firmware_controls()
             fc_dfu_check.setEnabled(False)
 
     def flight_controller_changed():
@@ -2168,6 +2254,8 @@ def main(argv=None):
         esc_count_spin.setEnabled(False)
         fc_combo.setEnabled(False)
         fc_fw_combo.setEnabled(False)
+        fc_fw_update.setEnabled(False)
+        fc_fw_browse.setEnabled(False)
         fc_dfu_check.setEnabled(False)
 
     def do_start():
@@ -2260,13 +2348,41 @@ def main(argv=None):
     stop_btn.clicked.connect(do_stop)
 
     def drain_log():
-        nonlocal download_active
+        nonlocal download_active, fc_download_active
         lines = []
         while True:
             try:
                 item = lab.log_q.get_nowait()
             except queue.Empty:
                 break
+            if isinstance(item, tuple) and item[0].startswith(
+                "__fc_firmware_download"
+            ):
+                tag = item[0]
+                if tag == "__fc_firmware_download_progress__":
+                    _tag, received, total = item
+                    if total:
+                        fc_fw_update.setText(
+                            "Downloading %u%%" % min(100, received * 100 // total)
+                        )
+                elif tag == "__fc_firmware_download_done__":
+                    _tag, name, path = item
+                    fc_download_active = False
+                    lines.append(
+                        "[FC firmware] downloaded %s to %s" % (name, path)
+                    )
+                    start_btn.setEnabled(True)
+                    fc_combo.setEnabled(True)
+                    protocol_changed()
+                    refresh_fc_firmware_controls()
+                elif tag == "__fc_firmware_download_error__":
+                    fc_download_active = False
+                    lines.append("[FC firmware] download failed: %s" % item[1])
+                    start_btn.setEnabled(True)
+                    fc_combo.setEnabled(True)
+                    protocol_changed()
+                    refresh_fc_firmware_controls()
+                continue
             if isinstance(item, tuple) and item[0].startswith("__renode_download"):
                 tag = item[0]
                 if tag == "__renode_download_progress__":
@@ -2494,7 +2610,13 @@ def main(argv=None):
                 return "ERR stop before changing FC firmware"
             i = fc_fw_combo.findData(rest)
             if i < 0:
-                return "ERR fcfirmware %s" % "|".join(flight_controller_firmwares())
+                path = Path(rest).expanduser()
+                if not path.is_file():
+                    return "ERR fcfirmware %s|PATH" % "|".join(
+                        flight_controller_firmwares()
+                    )
+                fc_fw_combo.insertItem(0, path.name, str(path))
+                i = 0
             fc_fw_combo.setCurrentIndex(i)
             return "OK"
         if cmd == "fcboot":
