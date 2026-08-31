@@ -617,6 +617,27 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
 
             var isBootProbe = IsBootProbe(request);
+            var wanted = ExpectedSerialReply(esc, request, isBootProbe);
+            // The GPIO sampler has already reconstructed a complete host
+            // transaction. Use the same virtual-time-independent backend as
+            // the optional firmware hooks, then put its reply back onto the
+            // emulated pin. This keeps an unmodified FC build inside the web
+            // configurator's wall-clock timeout even when its ESC runs slowly.
+            var fastReply = FastSerialTransaction(esc, request);
+            if(fastReply != null)
+            {
+                SerialRequests++;
+                if(isBootProbe)
+                {
+                    serialSessions[esc] = IsBootReply(fastReply);
+                }
+                if(fastReply.Length > 0)
+                {
+                    SerialReplies += (uint)fastReply.Length;
+                    ReplaySerialReply(esc, fastReply);
+                }
+                return;
+            }
             if(isBootProbe && !serialSessions[esc])
             {
                 // AM32 enters its loader when the signal is held high across
@@ -628,7 +649,6 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
             SendSerial(esc, request);
             SerialRequests++;
-            var wanted = ExpectedSerialReply(esc, request, isBootProbe);
             if(wanted == 0)
             {
                 return;
@@ -1002,8 +1022,19 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private static bool IsBootProbe(byte[] request)
         {
-            return request.Length >= 17 && request[8] == 13 &&
-                request[9] == (byte)'B' && request[16] == 0x7D;
+            // Betaflight pads the legacy BLHeli token with zero bytes, and the
+            // preamble length differs between builds. The token and its CRC
+            // are the stable final nine bytes.
+            var offset = request.Length - BootProbeSize;
+            return offset >= 0 && request[offset] == 13
+                && request[offset + 1] == (byte)'B'
+                && request[offset + 2] == (byte)'L'
+                && request[offset + 3] == (byte)'H'
+                && request[offset + 4] == (byte)'e'
+                && request[offset + 5] == (byte)'l'
+                && request[offset + 6] == (byte)'i'
+                && request[offset + 7] == 0xF4
+                && request[offset + 8] == 0x7D;
         }
 
         private static bool IsBootReply(byte[] reply)
@@ -1263,6 +1294,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private const int SerialHeaderSize = 6;
         private const int FastSerialHeaderSize = 6;
         private const int FastSerialTimeoutMs = 250;
+        private const int BootProbeSize = 9;
         private const ushort StateMagic = 0x5353;
         private const byte StateReset = 9;
         private const byte BootRun = 0x00;

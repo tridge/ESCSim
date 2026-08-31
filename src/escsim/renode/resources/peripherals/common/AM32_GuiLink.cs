@@ -145,6 +145,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // from the motor turning
         public ulong ArmedAddress { get; set; }
 
+        // Hold only actual DShot throttle values at zero until the emulated
+        // firmware itself reports armed. Commands and telemetry requests pass
+        // unchanged, so this is a startup safety interlock rather than a wire
+        // or protocol shortcut.
+        public bool GateThrottleUntilArmed { get; set; }
+
         // the firmware's in-RAM eepromBuffer. Settings writes land in
         // the flash page AND here, which is what changing a setting at
         // runtime over DroneCAN does - the firmware acts on the RAM
@@ -371,7 +377,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 // signal loss path. Subtraction rather than a comparison
                 // so a TickCount wrap cannot look like an eternity of
                 // silence.
-                if(driving && Environment.TickCount
+                if(driving && SignalTimeoutMs > 0 && Environment.TickCount
                    - Volatile.Read(ref lastInputMs) > SignalTimeoutMs)
                 {
                     generator.Enabled = false;
@@ -415,7 +421,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     generator.Bidirectional = bidir;
                 }
                 generator.TelemetryBit = ((data >> 4) & 1) != 0;
-                generator.DshotValue = (uint)((data >> 5) & 0x7FF);
+                var dshotValue = (uint)((data >> 5) & 0x7FF);
+                if(GateThrottleUntilArmed && dshotValue > DshotCommandMax &&
+                   ArmedAddress != 0 &&
+                   machine.SystemBus.ReadByte(ArmedAddress) == 0)
+                {
+                    dshotValue = 0;
+                }
+                generator.DshotValue = dshotValue;
                 var proto = type == TypeDshot150 ? 150u
                     : (type == TypeDshot300 ? 300u : 600u);
                 if(generator.Protocol != proto)
@@ -702,11 +715,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
             // Once the transaction engine has accepted a loader probe, the
             // guest's GPIO polling loop no longer participates in this
-            // session.  Park it in `wfi; b .-4` so virtual time and the
-            // GuiLink timer can advance rapidly.  BootRun restores the real
-            // application's vector, SP and PC through JumpToVector().
+            // session. Mask interrupts before parking in `wfi; b .-4`:
+            // programming replaces the application's vector table first, and
+            // an interrupt taken halfway through the update would otherwise
+            // run the new handler against the old application's live state.
+            // BootRun resets the core and restores the new vector, SP and PC.
             machine.SystemBus.WriteBytes(
-                new byte[] { 0x30, 0xBF, 0xFD, 0xE7 }, FastBootParkAddress);
+                new byte[] { 0x72, 0xB6, 0x30, 0xBF, 0xFD, 0xE7 },
+                FastBootParkAddress);
             cpu.PC = FastBootParkAddress;
             fastParked = true;
         }
@@ -725,8 +741,19 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private static bool IsBootProbe(byte[] request)
         {
-            return request.Length >= 17 && request[8] == 13
-                && request[9] == (byte)'B' && request[16] == 0x7D;
+            // Betaflight pads the legacy BLHeli token with zero bytes, and the
+            // preamble length differs between builds. The token and its CRC
+            // are the stable final nine bytes.
+            var offset = request.Length - BootProbeSize;
+            return offset >= 0 && request[offset] == 13
+                && request[offset + 1] == (byte)'B'
+                && request[offset + 2] == (byte)'L'
+                && request[offset + 3] == (byte)'H'
+                && request[offset + 4] == (byte)'e'
+                && request[offset + 5] == (byte)'l'
+                && request[offset + 6] == (byte)'i'
+                && request[offset + 7] == 0xF4
+                && request[offset + 8] == 0x7D;
         }
 
         private static bool ValidBootCrc(byte[] data)
@@ -1545,8 +1572,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private const byte TypeFastSerial = 6;
         private const int FastSerialHeaderSize = 6;
         private const uint FastBootParkAddress = 0x20000000;
+        private const int BootProbeSize = 9;
         private const ushort FlagIdleHigh = 0x0001;
         private const ushort FlagFloating = 0x0002;
+        private const uint DshotCommandMax = 47;
         private const ushort FlagGap = 0x0004;
         private const ushort FlagTxDone = 0x0008;
 

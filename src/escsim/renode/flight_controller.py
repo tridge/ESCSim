@@ -51,10 +51,10 @@ FC_FIRMWARE_DOWNLOAD_LIMIT = 16 * 1024 * 1024
 FC_FIRMWARES = {
     "SPEEDYBEEF405V5": {
         "filename": "SPEEDYBEEF405V5.hex",
-        "label": "Betaflight ESCSim-speedup (SPEEDYBEEF405V5)",
+        "label": "Betaflight 2026.6 ESCSim-speedup (SPEEDYBEEF405V5)",
         "url": (
             "https://firmware.ardupilot.org/Tools/AM32-tools/ESCSim/betaflight/"
-            "betaflight_2026.12.0-alpha_STM32F405_SPEEDYBEEF405V5_"
+            "betaflight_2026.6.2_STM32F405_SPEEDYBEEF405V5_"
             "ESCSim-speedup.elf"
         ),
     },
@@ -87,13 +87,14 @@ class FlightControllerSpec:
     def command(self) -> list[str]:
         if self.model != "SpeedyBeeF405Mini":
             raise ValueError(f"unsupported flight controller {self.model}")
+        source_speedup = has_betaflight_source_speedup(self.flash)
         platform = write_speedybee_platform(
             self.outdir,
             self.esc_ports,
             self.flash,
             self.esc_state_ports,
+            gyro_startup_samples=1024 if source_speedup else 0,
         )
-        source_speedup = has_betaflight_source_speedup(self.flash)
         if source_speedup:
             hotpatches = None
         elif self.symbols is not None:
@@ -1018,10 +1019,13 @@ def write_speedybee_platform(
     esc_ports: tuple[int, ...],
     flash: Path,
     esc_state_ports: tuple[int, ...] = (),
+    gyro_startup_samples: int = 0,
 ) -> Path:
     """Generate the small board overlay; port values are launch-specific."""
     if not 1 <= len(esc_ports) <= 8:
         raise ValueError("flight controller requires 1..8 ESC ports")
+    if gyro_startup_samples < 0:
+        raise ValueError("gyro startup samples must not be negative")
     root = resource_root()
     base = root / "flight_controllers" / "stm32f405_base.repl"
     outdir = Path(outdir)
@@ -1061,6 +1065,7 @@ spi1Mux: Miscellaneous.AP_SPIMultiplexer @ spi1
 imu0: Sensors.AP_ICM42688 @ spi1Mux 0
     rotation: 26
     samplePeriodUs: 125
+    startupSampleCount: {gyro_startup_samples}
     IRQ -> gpioPortC@4
 
 adc1: Analog.AP_STM32_ADC @ sysbus 0x40012000

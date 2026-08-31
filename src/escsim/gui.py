@@ -113,12 +113,13 @@ DEFAULT_STATE_PORT = 47834
 DEFAULT_MONITOR_PORT = 47835
 
 
-METRICS_COMMAND = (
+BASE_METRICS_COMMAND = (
     "cpu PC; cpu PerformanceInMips; cpu ExecutedInstructions; "
     "emulation GetTimeSourceInfo"
 )
+METRICS_COMMAND = BASE_METRICS_COMMAND + "; sysbus.bridge ReadDoubleWord 0"
 FC_METRICS_COMMAND = (
-    METRICS_COMMAND + "; sysbus.motorBridge ReadDoubleWord 0; "
+    BASE_METRICS_COMMAND + "; sysbus.motorBridge ReadDoubleWord 0; "
     "sysbus.motorBridge ReadDoubleWord 4; "
     "sysbus.motorBridge ReadDoubleWord 8; "
     "sysbus.motorBridge ReadDoubleWord 0x0c; "
@@ -575,6 +576,24 @@ class Lab(object):
                 "--monitor-port",
                 str(monitor_port),
             ]
+            if fc_selected:
+                # The FC and each ESC are independent Renode processes. Host
+                # scheduling and WebSerial/MSP bursts can pause FC-to-ESC UDP
+                # refresh even though the firmware is still generating DShot.
+                # The flight controller and AM32 implement the real signal-loss
+                # behavior, so disable GuiLink's wall-clock interactive timeout.
+                # Stopping the lab still tears down the process tree immediately.
+                command += [
+                    # Betaflight's ESCSim build updates motors at 210 Hz. A
+                    # 1 kHz inter-frame rate preserves genuine DShot300 and
+                    # BDShot/EDT transactions without making each ESC emulate
+                    # four thousand redundant frames per virtual second.
+                    "--gui-dshot-us",
+                    "1000",
+                    "--gui-signal-timeout-ms",
+                    "0",
+                    "--gate-throttle-until-armed",
+                ]
             if self.info["dronecan"]:
                 command += [
                     "--can-node",
@@ -909,7 +928,10 @@ class Lab(object):
             flash_base = 0x08000000 if app_base >= 0x08000000 else 0
             if flash_base <= m["pc"] < app_base:
                 where = " (bootloader)"
-        parts = ["PC 0x%08X%s" % (m["pc"], where)]
+        parts = []
+        if label != "FC" and "rpm" in m:
+            parts.append("RPM %u" % m["rpm"])
+        parts.append("PC 0x%08X%s" % (m["pc"], where))
         if m.get("speedup") is not None:
             parts.append("%.2fx realtime" % m["speedup"])
         if m.get("executed_mips") is not None:
@@ -2540,7 +2562,11 @@ def main(argv=None):
         done = queue.Queue()
         pending.put((line, done))
         try:
-            return done.get(timeout=30)
+            # `target` deliberately allows up to 60 seconds for its
+            # background resolver.  Keep the control-server handoff longer
+            # than that operation so automation receives the real result
+            # instead of an unrelated 30-second ERR timeout.
+            return done.get(timeout=70)
         except queue.Empty:
             return "ERR timeout"
 

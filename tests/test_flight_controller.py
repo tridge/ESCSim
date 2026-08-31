@@ -20,6 +20,7 @@ from escsim.renode.flight_controller import (
     flight_controller_firmware,
     flight_controller_firmware_bootloader,
     flight_controller_firmware_cache_path,
+    flight_controller_firmware_url,
     flight_controller_firmwares,
     has_betaflight_source_speedup,
     load_image,
@@ -87,6 +88,7 @@ def test_speedybee_platform_wires_four_escs_and_fixed_sensors(tmp_path):
     assert "timer4: timer4" in platform_text
     assert "AP_ICM42688" in platform_text
     assert "samplePeriodUs: 125" in platform_text
+    assert "startupSampleCount: 0" in platform_text
     assert "IRQ -> gpioPortC@4" in platform_text
     assert "AP_DPS310" in platform_text
     assert "AP_PersistentMemory" in platform_text
@@ -107,7 +109,7 @@ def test_speedybee_platform_wires_four_escs_and_fixed_sensors(tmp_path):
         / "AP_ICM42688.cs"
     ).read_text(encoding="utf-8")
     assert "register == GyroConfig0" in imu
-    assert "case 3: sampleTimer.Limit = 125" in imu
+    assert "case 3: requestedSamplePeriodUs = 125" in imu
     assert "IRQ.Blink();" in imu
 
 
@@ -129,6 +131,30 @@ def test_source_speedup_marker_selects_coalesced_usb_sof(tmp_path):
     ).read_text()
     assert "# Betaflight source-level ESCSim speed profile" in script
     assert "sysbus.usbOtg SetSOFInterval 80" in script
+
+
+def test_source_speedup_bootstraps_gyro_interrupt_detection(tmp_path):
+    flash = ensure_flash(tmp_path / "flash.bin")
+    marker = flight_controller.BETAFLIGHT_SOURCE_SPEEDUP_MARKER
+    data = bytearray(flash.read_bytes())
+    data[0x200 : 0x200 + len(marker)] = marker
+    flash.write_bytes(data)
+
+    outdir = tmp_path / "run"
+    FlightControllerSpec(
+        model="SpeedyBeeF405Mini",
+        outdir=outdir,
+        flash=flash,
+        esc_ports=(57833,),
+        esc_state_ports=(57834,),
+        monitor_port=57915,
+        usbip_port=57916,
+        renode="/bin/true",
+    ).command()
+
+    platform = (outdir / "SpeedyBeeF405Mini.repl").read_text()
+    assert "samplePeriodUs: 125" in platform
+    assert "startupSampleCount: 1024" in platform
 
 
 def test_speedybee_script_installs_verified_elf_hotpatches(tmp_path):
@@ -313,11 +339,27 @@ def test_speedybee_dshot_bridge_supports_betaflight_channel_dma():
     assert "FlushDirectTransmit" in bridge
     assert "ReadDirectReply" in bridge
     assert "ProbeDirectBootloader" in bridge
+    assert "var fastReply = FastSerialTransaction(esc, request)" in bridge
+    assert "var offset = request.Length - BootProbeSize" in bridge
+    assert "var offset = request.Length - BootProbeSize" in gui_link
+    assert "request[offset + 7] == 0xF4" in bridge
+    assert "request[offset + 7] == 0xF4" in gui_link
     assert "ParkFastBootloader" in gui_link
     assert "ResumeFastBootloader" in gui_link
+    assert "0x72, 0xB6, 0x30, 0xBF, 0xFD, 0xE7" in gui_link
+    assert "SignalTimeoutMs > 0" in gui_link
+    assert "GateThrottleUntilArmed" in gui_link
+    assert "dshotValue > DshotCommandMax" in gui_link
     assert "FastBootParkAddress = 0x20000000" in gui_link
     assert "DirectBootProbeTimeoutMs = 1500" in bridge
     assert "DirectBootProbeRetryMs = 250" in bridge
+    generator = (resource_root.parent / "generator.py").read_text(
+        encoding="utf-8"
+    )
+    assert '"--gui-signal-timeout-ms"' in generator
+    assert "guilink SignalTimeoutMs %d" in generator
+    assert '"--gate-throttle-until-armed"' in generator
+    assert "guilink GateThrottleUntilArmed true" in generator
 
     uart_pump = (
         flight_controller_firmware("SPEEDYBEEF405V5").parents[1]
@@ -505,6 +547,12 @@ def test_managed_fc_firmware_download_is_atomic_and_cached(tmp_path):
     )
     assert requests[0][1] == 30
     assert progress[-1] == (len(content), len(content))
+
+
+def test_betaflight_download_matches_deployed_web_app_api_cycle():
+    assert flight_controller_firmware_url("SPEEDYBEEF405V5").endswith(
+        "/betaflight_2026.6.2_STM32F405_SPEEDYBEEF405V5_ESCSim-speedup.elf"
+    )
 
 
 def test_bundled_betaflight_sequences_resolve_without_elf(tmp_path):

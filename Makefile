@@ -20,6 +20,7 @@ PARITY_OUTPUT ?= $(BUILD_DIR)/parity-all-mcus.json
 WIN11_HOST ?= win11
 WIN11_DIR ?= ESCSim-win11-build
 WIN11_PYTHON ?= ../ESCSim/.venv-win/Scripts/python.exe
+XEPHYR_WEBSERIAL_ARGS ?=
 
 ifeq ($(OS),Windows_NT)
 NATIVE_NAME := am32sim.dll
@@ -33,7 +34,7 @@ NATIVE_LIBRARY := $(NATIVE_BUILD_DIR)/$(NATIVE_NAME)
 
 .DEFAULT_GOAL := all
 .PHONY: all native wheel test native-test python-test package windows-installer install \
-	parity-all-mcus windows-usbip-test win11 publish clean
+	parity-all-mcus windows-usbip-test xephyr xephyr-webserial win11 publish clean
 
 all: native wheel
 
@@ -69,6 +70,11 @@ parity-all-mcus:
 
 windows-usbip-test:
 	$(PYTHON) scripts/run-windows-usbip-test.py
+
+xephyr: xephyr-webserial
+
+xephyr-webserial:
+	$(PYTHON) scripts/run-xephyr-webserial-test.py $(XEPHYR_WEBSERIAL_ARGS)
 
 # Synchronize the current working tree into a disposable directory on the
 # Windows lab host. Keep its build/dist caches between runs, but delete stale

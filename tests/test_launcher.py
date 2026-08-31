@@ -82,6 +82,7 @@ def test_metrics_are_formatted_on_one_line_per_renode_instance():
         "host_seconds": 10.0,
         "speedup": 0.75,
         "executed_mips": 20.0,
+        "rpm": 4321,
     }
     lab.metrics = {
         "FC": dict(sample, pc=0x08010000),
@@ -90,7 +91,7 @@ def test_metrics_are_formatted_on_one_line_per_renode_instance():
 
     assert lab.format_metrics_lines() == [
         "FC: PC 0x08010000 | 0.75x realtime | 20 of 125 MIPS | vt 12.5s",
-        "ESC 1: PC 0x08001234 | 0.75x realtime | 20 of 125 MIPS | vt 12.5s",
+        "ESC 1: RPM 4321 | PC 0x08001234 | 0.75x realtime | 20 of 125 MIPS | vt 12.5s",
         "ESC 2: waiting for PC and speedup...",
     ]
 
@@ -237,6 +238,9 @@ def test_flight_controller_starts_selected_esc_count_with_loader(tmp_path, monke
             assert str(firmware) in command
             assert "--bootloader-elf" in command
             assert str(bootloader) in command
+            assert command[command.index("--gui-signal-timeout-ms") + 1] == "0"
+            assert command[command.index("--gui-dshot-us") + 1] == "1000"
+            assert "--gate-throttle-until-armed" in command
         assert lab.fc_command is not None
     finally:
         lab.stop()

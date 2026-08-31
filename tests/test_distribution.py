@@ -99,3 +99,30 @@ def test_win11_target_builds_remote_installer_from_current_tree():
     assert "make windows-installer" in makefile
     assert "dist/ESCSim/ESCSim.exe targets status" in makefile
     assert "ESCSim-installer.exe" in makefile
+
+
+def test_xephyr_webserial_target_is_repeatable_and_cleans_up():
+    root = Path(__file__).parents[1]
+    makefile = (root / "Makefile").read_text()
+    script = (root / "scripts" / "run-xephyr-webserial-test.py").read_text()
+
+    assert "xephyr: xephyr-webserial" in makefile
+    assert "xephyr-webserial:" in makefile
+    assert "scripts/run-xephyr-webserial-test.py" in makefile
+    assert 'default=REPO / "build" / "xephyr-webserial"' in script
+    assert 'f"{name}.log").open("w", buffering=1)' in script
+    assert 'source_path = str(REPO / "src")' in script
+    assert 'nested_env["PYTHONPATH"]' in script
+    assert '"-extension",\n                    "GLX"' in script
+    assert '"https://app.betaflight.com/"' in script
+    assert '"--url"' in script
+    assert "args.url" in script
+    assert 'control(args.control_port, "quit"' in script
+    assert 'for name in ("chrome", "escsim", "xephyr")' in script
+
+
+def test_control_port_waits_for_target_resolution():
+    root = Path(__file__).resolve().parents[1]
+    gui = (root / "src" / "escsim" / "gui.py").read_text()
+    assert "done.get(timeout=70)" in gui
+    assert "deadline = time.time() + 60" in gui

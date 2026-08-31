@@ -77,6 +77,24 @@ published images.
   SHA-256-verified usbip-win2 0.9.7.7 client when it is missing and warns before
   starting its elevated driver setup.
 
+## Linux WebSerial test lab
+
+To test Chrome without disturbing the normal desktop or browser profile, run:
+
+```sh
+make xephyr
+```
+
+This starts ESCSim and Chrome inside Xephyr, selects a four-ESC
+SpeedyBeeF405Mini setup, updates the compatible Betaflight firmware, and opens
+`app.betaflight.com`. Select **Betaflight STM Electronics** if Chrome asks for
+permission, then connect normally. Ctrl-C stops the emulators and detaches the
+virtual USB device. The Chrome profile is reused, while `xephyr.log`,
+`escsim.log`, and `chrome.log` are overwritten on each run under
+`build/xephyr-webserial/`. Xephyr, Chrome/Chromium, `vhci_hcd`, and the Linux
+USB/IP client must be installed. Override defaults with, for example,
+`XEPHYR_WEBSERIAL_ARGS="--display :92 --target FOXEER_F421"`.
+
 ## Flight-controller DFU
 
 **FC Firmware** selects an image to preload for a direct, non-DFU start.

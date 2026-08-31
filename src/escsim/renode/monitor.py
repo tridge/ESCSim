@@ -39,7 +39,7 @@ def parse_metrics(text: str) -> dict[str, float | int]:
     values = re.findall(r"(?m)^\s*(0x[0-9A-Fa-f]+)\s*$", text)
     virtual = re.search(r"(?m)^Elapsed Virtual Time:\s*(\S+)\s*$", text)
     host = re.search(r"(?m)^Elapsed Host Time:\s*(\S+)\s*$", text)
-    if len(values) not in (3, 6, 9, 11, 15) or virtual is None or host is None:
+    if len(values) not in (3, 4, 6, 9, 11, 15) or virtual is None or host is None:
         raise ValueError("incomplete Renode monitor metrics")
     result = {
         "pc": int(values[0], 16),
@@ -48,6 +48,8 @@ def parse_metrics(text: str) -> dict[str, float | int]:
         "virtual_seconds": parse_elapsed(virtual.group(1)),
         "host_seconds": parse_elapsed(host.group(1)),
     }
+    if len(values) == 4:
+        result["rpm"] = int(values[3], 16)
     if len(values) >= 6:
         result.update(
             dshot_frames=int(values[3], 16),

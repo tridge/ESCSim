@@ -3135,6 +3135,21 @@ def main(argv=None):
         "4kHz)",
     )
     ap.add_argument(
+        "--gui-signal-timeout-ms",
+        type=int,
+        default=250,
+        help="wall-clock silence before the emulated throttle wire is "
+        "released (default 250ms; 0 disables it). A separately emulated "
+        "flight controller should disable this extra watchdog because the "
+        "firmware owns physical DShot signal-loss handling",
+    )
+    ap.add_argument(
+        "--gate-throttle-until-armed",
+        action="store_true",
+        help="hold DShot throttle (but not commands) at zero until the AM32 "
+        "firmware's armed flag is set",
+    )
+    ap.add_argument(
         "--can-lan",
         action="store_true",
         help="join the multicast CAN bus on the LAN interface "
@@ -3580,6 +3595,9 @@ def main(argv=None):
     gui_proc = None
     if args.gui or args.link:
         setup += "; guilink DshotFrameUs %d" % args.gui_dshot_us
+        setup += "; guilink SignalTimeoutMs %d" % args.gui_signal_timeout_ms
+        if args.gate_throttle_until_armed:
+            setup += "; guilink GateThrottleUntilArmed true"
         setup += "; guilink AppBase 0x%08X" % cfg["app_base"]
         setup += "; guilink LoopHz %d" % cfg["loop_hz"]
         # so a client can say what firmware is running and how far

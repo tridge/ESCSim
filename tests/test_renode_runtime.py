@@ -43,6 +43,19 @@ Elapsed Host Time: 00:00:10.000
     assert metrics["dshot_injected"] == 64
 
 
+def test_metrics_parser_reads_motor_rpm():
+    text = """
+0x08001234
+0x00000030
+0x00123456
+Elapsed Virtual Time: 00:00:12.500
+Elapsed Host Time: 00:00:10.000
+0x00000001
+"""
+    metrics = parse_metrics(text)
+    assert metrics["rpm"] == 1
+
+
 def test_metrics_parser_rejects_ambiguous_extra_hex_values():
     text = """
 0x08001234
@@ -51,6 +64,7 @@ def test_metrics_parser_rejects_ambiguous_extra_hex_values():
 Elapsed Virtual Time: 00:00:12.500
 Elapsed Host Time: 00:00:10.000
 0x00000001
+0x00000002
 """
     with pytest.raises(ValueError, match="incomplete Renode monitor metrics"):
         parse_metrics(text)

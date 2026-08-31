@@ -24,16 +24,19 @@ namespace Antmicro.Renode.Peripherals.Sensors
     public class AP_ICM42688 : ISPIPeripheral, IGPIOReceiver
     {
         public AP_ICM42688(IMachine machine, byte whoAmI = DefaultWhoAmI,
-            byte rotation = 8, int samplePeriodUs = SamplePeriodUs)
+            byte rotation = 8, int samplePeriodUs = SamplePeriodUs,
+            uint startupSampleCount = 0)
         {
             this.whoAmI = whoAmI;
             this.rotation = rotation;
+            this.initialSamplePeriodUs = (ulong)Math.Max(1, samplePeriodUs);
+            this.startupSampleCount = startupSampleCount;
             IRQ = new GPIO();
             physics = AP_PhysicsState.ForMachine(machine);
             fifo = new Queue<byte>();
             registers = new byte[BankCount, RegisterCount];
             sampleTimer = new LimitTimer(machine.ClockSource, 1000000, this, "icm42688 odr",
-                                         limit: (ulong)Math.Max(1, samplePeriodUs), direction: Direction.Ascending,
+                                         limit: initialSamplePeriodUs, direction: Direction.Ascending,
                                          enabled: true, workMode: WorkMode.Periodic, eventEnabled: true);
             sampleTimer.LimitReached += OnSampleTick;
             Reset();
@@ -48,6 +51,10 @@ namespace Antmicro.Renode.Peripherals.Sensors
             currentRegister = 0;
             reading = false;
             timestamp = 0;
+            poweredSampleCount = 0;
+            requestedSamplePeriodUs = initialSamplePeriodUs;
+            sampleTimer.Limit = initialSamplePeriodUs;
+            sampleTimer.ResetValue();
             IRQ.Unset();
             registers[0, WhoAmI] = whoAmI;
             registers[0, Icm45686WhoAmI] = whoAmI;
@@ -148,17 +155,22 @@ namespace Antmicro.Renode.Peripherals.Sensors
             // a Cortex-M in WFI an exact scheduling boundary to wake on.
             switch(outputDataRate)
             {
-            case 3: sampleTimer.Limit = 125; break;  // 8 kHz
-            case 4: sampleTimer.Limit = 250; break;  // 4 kHz
-            case 5: sampleTimer.Limit = 500; break;  // 2 kHz
-            case 6: sampleTimer.Limit = 1000; break; // 1 kHz
-            case 7: sampleTimer.Limit = 5000; break; // 200 Hz
-            case 8: sampleTimer.Limit = 10000; break; // 100 Hz
-            case 9: sampleTimer.Limit = 20000; break; // 50 Hz
-            case 10: sampleTimer.Limit = 40000; break; // 25 Hz
-            case 11: sampleTimer.Limit = 80000; break; // 12.5 Hz
-            case 13: sampleTimer.Limit = 320000; break; // 3.125 Hz
-            case 15: sampleTimer.Limit = 2000; break; // 500 Hz
+            case 3: requestedSamplePeriodUs = 125; break;  // 8 kHz
+            case 4: requestedSamplePeriodUs = 250; break;  // 4 kHz
+            case 5: requestedSamplePeriodUs = 500; break;  // 2 kHz
+            case 6: requestedSamplePeriodUs = 1000; break; // 1 kHz
+            case 7: requestedSamplePeriodUs = 5000; break; // 200 Hz
+            case 8: requestedSamplePeriodUs = 10000; break; // 100 Hz
+            case 9: requestedSamplePeriodUs = 20000; break; // 50 Hz
+            case 10: requestedSamplePeriodUs = 40000; break; // 25 Hz
+            case 11: requestedSamplePeriodUs = 80000; break; // 12.5 Hz
+            case 13: requestedSamplePeriodUs = 320000; break; // 3.125 Hz
+            case 15: requestedSamplePeriodUs = 2000; break; // 500 Hz
+            default: return;
+            }
+            if(poweredSampleCount >= startupSampleCount)
+            {
+                sampleTimer.Limit = requestedSamplePeriodUs;
             }
         }
 
@@ -168,6 +180,16 @@ namespace Antmicro.Renode.Peripherals.Sensors
             if((registers[0, PowerManagement] & SensorsLowNoise) != SensorsLowNoise)
             {
                 return;
+            }
+            poweredSampleCount++;
+            if(poweredSampleCount == startupSampleCount &&
+               sampleTimer.Limit != requestedSamplePeriodUs)
+            {
+                // Betaflight validates a SPI gyro by counting 1000 native-rate
+                // data-ready interrupts before selecting interrupt/DMA mode.
+                // Its ESCSim profile then requests 200Hz, so preserve the
+                // model's 8kHz reset cadence only for that validation window.
+                sampleTimer.Limit = requestedSamplePeriodUs;
             }
             // SPEEDYBEEF405V5 wires the gyro data-ready signal to PC4/EXTI4.
             // Pulsing it at the programmed ODR mirrors the hardware and wakes
@@ -252,6 +274,8 @@ namespace Antmicro.Renode.Peripherals.Sensors
         private readonly LimitTimer sampleTimer;
         private readonly byte whoAmI;
         private readonly byte rotation;
+        private readonly ulong initialSamplePeriodUs;
+        private readonly uint startupSampleCount;
         private readonly AP_PhysicsState physics;
         public GPIO IRQ { get; }
         private int transferByte;
@@ -259,6 +283,8 @@ namespace Antmicro.Renode.Peripherals.Sensors
         private byte currentRegister;
         private bool reading;
         private ushort timestamp;
+        private uint poweredSampleCount;
+        private ulong requestedSamplePeriodUs;
 
         private const int BankCount = 5;
         private const int RegisterCount = 128;
