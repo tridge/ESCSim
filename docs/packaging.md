@@ -112,8 +112,19 @@ The interactive ESCSim installer bundles the verified usbip-win2 0.9.7.7
 installer. When the driver is absent it offers to run that installer with an
 explicit warning that USB hubs are temporarily restarted and Windows may need
 a reboot. ESCSim itself remains a per-user install; only the optional driver
-step asks for administrator approval. Version 0.9.7.8 is explicitly rejected
-because it is unsafe.
+step asks for administrator approval. The prerequisite is launched separately
+so a stalled driver upgrade cannot hold the ESCSim installer open. Installed
+versions are read from usbip-win2's machine-wide uninstall entry because its
+executable does not provide a Windows file-version resource. Version 0.9.7.8
+is explicitly rejected because it is unsafe.
+
+The installed GUI starts every generator and Renode instance with its Windows
+console hidden, so emulator processes do not flash windows into the foreground. Their
+combined stdout/stderr is still shown in the GUI and is also flushed line by
+line to stable per-process files under
+`%LOCALAPPDATA%\\AM32\\ESCSim\\Cache\\logs` (`esc1.log` through `esc8.log` and
+`flight-controller.log`). A new Start overwrites the corresponding latest-run
+log instead of creating another directory.
 
 With usbip-win2 installed, the real attach/enumerate/serial-echo/detach
 integration check is:
@@ -136,6 +147,21 @@ make windows-installer PYTHON=.venv-win/Scripts/python.exe
 Silent installs intentionally skip the optional driver prompt, making package
 smoke tests non-disruptive. A normal interactive install offers the bundled
 driver when `usbip.exe` is not present.
+
+From the Linux development host, the complete lab build can be run remotely:
+
+```sh
+make win11
+```
+
+This synchronizes the current working tree to the disposable
+`~/ESCSim-win11-build` directory on the `win11` SSH host, reuses the native
+Python environment in `~/ESCSim/.venv-win`, builds the application and
+installer, and smoke-tests the packaged CLI. It leaves the existing remote
+checkout and installed application untouched, then prints the Windows path of
+the installer to run interactively. `WIN11_HOST`, `WIN11_DIR`, and
+`WIN11_PYTHON` can override the defaults; for safety, `WIN11_DIR` must begin
+with `ESCSim-win11-`.
 
 The release gate specifically prevents regressions in non-CAN
 VIMDRONES_L431 DShot600 and TEKKO32_F415 PWM/DShot/BDShot. A representative

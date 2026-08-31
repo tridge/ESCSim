@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from types import SimpleNamespace
 
 from escsim import gui
@@ -41,6 +42,17 @@ def make_lab():
     lab = gui.Lab(args)
     lab.runner = FakeRunner()
     return lab
+
+
+def test_flight_controller_metrics_do_not_claim_a_bootloader():
+    lab = make_lab()
+    metrics = {
+        "pc": 0x08001000,
+        "mips": 200,
+        "virtual_seconds": 1.0,
+    }
+
+    assert "bootloader" not in lab._format_instance_metrics("FC", metrics)
 
 
 def test_process_group_stop_is_serialized():
@@ -101,6 +113,40 @@ def test_process_runner_stop_is_serialized():
     assert not first.is_alive()
     assert not second.is_alive()
     assert runner.tree is None
+
+
+def test_process_runner_writes_line_buffered_process_log(tmp_path, monkeypatch):
+    class FakeProcess:
+        stdout = iter(("first line\n", "last line\n"))
+
+        @staticmethod
+        def wait():
+            return 7
+
+    class FakeTree:
+        def __init__(self, *_args, **kwargs):
+            assert kwargs["bufsize"] == 1
+            assert kwargs["stderr"] == gui.subprocess.STDOUT
+            self.process = FakeProcess()
+
+    monkeypatch.setattr(gui, "ProcessTree", FakeTree)
+    output = queue.Queue()
+    log_path = tmp_path / "logs" / "esc1.log"
+    runner = gui.ProcRunner(output)
+    runner.start(["renode"], log_path=log_path)
+
+    deadline = time.monotonic() + 2
+    while output.qsize() < 3 and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert [output.get_nowait() for _index in range(3)] == [
+        "first line",
+        "last line",
+        "[emulator exited, status 7]",
+    ]
+    assert log_path.read_text() == (
+        "first line\nlast line\n[emulator exited, status 7]\n"
+    )
 
 
 def test_stop_interrupts_metrics_and_pauses_on_fresh_monitor(monkeypatch):
@@ -329,6 +375,7 @@ def test_cancelled_firmware_usb_attach_is_detached(monkeypatch):
         lab.generation = 4
         return 6
 
+    monkeypatch.setattr(lab, "_wait_fc_usb_ready", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(gui.sitl_usbip, "attach", attach)
     monkeypatch.setattr(lab, "_find_fc_tty", lambda **_kwargs: None)
     monkeypatch.setattr(
@@ -340,6 +387,70 @@ def test_cancelled_firmware_usb_attach_is_detached(monkeypatch):
 
     assert detached == [6]
     assert lab.usb_ports == set()
+
+
+def test_firmware_usb_waits_for_connected_device_before_attach(monkeypatch):
+    lab = make_lab()
+    lab.fc_runner = FakeRunner(running=True)
+    lab.generation = 3
+    events = []
+    responses = iter(("0x00000000\n(monitor)", "0x00000001\n(monitor)"))
+
+    class FakeMonitor:
+        def __init__(self, host, port):
+            events.append(("monitor", host, port))
+
+        def connect(self, timeout):
+            events.append(("connect", timeout))
+
+        def command(self, command, timeout):
+            events.append(("command", command, timeout))
+            return next(responses)
+
+        def close(self):
+            events.append(("close",))
+
+    def attach(**_kwargs):
+        events.append(("attach",))
+        lab.generation = 4
+        return 6
+
+    monkeypatch.setattr(gui.time, "sleep", lambda _delay: None)
+    monkeypatch.setattr(gui.sitl_usbip, "attach", attach)
+    monkeypatch.setattr(lab, "_find_fc_tty", lambda **_kwargs: None)
+    monkeypatch.setattr(gui.sitl_usbip, "detach", lambda _port: True)
+    monkeypatch.setattr(gui.sitl_usbip, "port_attached", lambda _port: True)
+
+    monitor = FakeMonitor("127.0.0.1", lab.fc_monitor_port())
+    lab._attach_firmware_usb(3, monitor=monitor)
+
+    commands = [event for event in events if event[0] == "command"]
+    assert commands == [
+        ("command", gui.FC_USB_STATE_COMMAND, 10),
+        ("command", gui.FC_USB_STATE_COMMAND, 10),
+    ]
+    assert events.index(("attach",)) > events.index(commands[-1])
+
+
+def test_flight_controller_finds_windows_com_port(monkeypatch):
+    calls = []
+
+    def find_new_tty(previous, **kwargs):
+        calls.append((previous, kwargs))
+        return "COM26"
+
+    monkeypatch.setattr(gui.os, "name", "nt")
+    monkeypatch.setattr(gui.sitl_usbip, "find_new_tty", find_new_tty)
+
+    assert (
+        gui.Lab._find_fc_tty(
+            timeout=7, usb_port=1, previous_ttys={"COM5", "COM9"}
+        )
+        == "COM26"
+    )
+    assert calls == [
+        ({"COM5", "COM9"}, {"timeout": 7}),
+    ]
 
 
 def test_fc_dfu_requires_usb_configurator(tmp_path, monkeypatch):

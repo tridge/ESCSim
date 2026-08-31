@@ -15,6 +15,7 @@ from elftools.elf.elffile import ELFFile
 from escsim.renode.generator import (
     Unsupported,
     find_renode,
+    isolated_renode_config,
     parse_ihex,
     renode_execfile,
     renode_path,
@@ -25,6 +26,13 @@ FLASH_BASE = 0x08000000
 FLASH_SIZE = 1024 * 1024
 BETAFLIGHT_POLL_TRAMPOLINE = FLASH_BASE + FLASH_SIZE - 16
 BETAFLIGHT_SCHEDULER_TRAMPOLINE = FLASH_BASE + FLASH_SIZE - 48
+BETAFLIGHT_SOURCE_SPEEDUP_MARKER = b"ESCSIM_SPEEDUP_V1\x00"
+BETAFLIGHT_GYRO_RATE_ORIGINAL = bytes.fromhex(
+    "122b15bf052202224ff47a704ff4487014bf4ff4fa514ff44861002384f81f21"
+)
+BETAFLIGHT_GYRO_RATE_1KHZ = bytes.fromhex(
+    "122b15bf002202224ff47a704ff4487014bf4ff47a714ff44861002384f81f21"
+)
 # Both bundled F405 firmwares reserve flash sector 1 for configuration
 # (ArduPilot uses STORAGE_FLASH_PAGE 1). Their HEX files are dense and contain
 # erased bytes over this sector, so repeat-start matching must ignore settings
@@ -70,7 +78,10 @@ class FlightControllerSpec:
             self.flash,
             self.esc_state_ports,
         )
-        if self.symbols is not None:
+        source_speedup = has_betaflight_source_speedup(self.flash)
+        if source_speedup:
+            hotpatches = None
+        elif self.symbols is not None:
             hotpatches = betaflight_hotpatches(self.symbols, self.flash)
         else:
             try:
@@ -85,12 +96,16 @@ class FlightControllerSpec:
             self.flash,
             self.usbip_port,
             hotpatches=hotpatches,
+            source_speedup=source_speedup,
         )
+        config = isolated_renode_config(self.outdir / "renode-config")
         return [
             find_renode(self.renode),
             "--disable-xwt",
+            "--config",
+            str(config),
             "-e",
-            f"include @{script}",
+            f"include @{renode_path(script)}",
             "--port",
             str(self.monitor_port),
         ]
@@ -98,6 +113,11 @@ class FlightControllerSpec:
 
 def resource_root() -> Path:
     return Path(os.fspath(resources.files("escsim.renode").joinpath("resources")))
+
+
+def has_betaflight_source_speedup(flash: Path) -> bool:
+    """Return whether a flash image contains the opt-in source profile."""
+    return BETAFLIGHT_SOURCE_SPEEDUP_MARKER in flash.read_bytes()
 
 
 def flight_controller_firmwares() -> tuple[str, ...]:
@@ -132,6 +152,9 @@ class BetaflightHotPatches:
     delay: int | None
     scheduler: int | None
     scheduler_wait_poll: int
+    gyro_sample_rate_setup: int
+    serial_task_period: int
+    usb_sof_interval_compares: tuple[int, ...]
     system_state: int | None
     systick_uptime: int | None
     read_byte_crc_poll: int
@@ -243,6 +266,42 @@ def _scheduler_wfi_patch(poll: int) -> tuple[tuple[int, int], ...]:
 
 def _restore_existing_instruction_patches(data: bytearray) -> None:
     """Normalize exact persisted patches back to their recognized sequences."""
+    # The emulation-only gyro-rate patch changes two immediates in one exact,
+    # contextualized gyroSetSampleRate sequence. Renode's flash controller
+    # persists guest writes, so normalize a previous run before identity and
+    # signature checks just as for the WFI and USB patches below.
+    original_gyro_count = data.count(BETAFLIGHT_GYRO_RATE_ORIGINAL)
+    patched_gyro_count = data.count(BETAFLIGHT_GYRO_RATE_1KHZ)
+    if patched_gyro_count:
+        if patched_gyro_count != 1 or original_gyro_count:
+            raise ValueError(
+                "flight-controller firmware has an invalid gyro-rate patch"
+            )
+        offset = data.find(BETAFLIGHT_GYRO_RATE_1KHZ)
+        data[offset : offset + len(BETAFLIGHT_GYRO_RATE_ORIGINAL)] = (
+            BETAFLIGHT_GYRO_RATE_ORIGINAL
+        )
+
+    # Betaflight's legacy F4 CDC implementation normally drains its transmit
+    # ring every 16 one-millisecond SOF interrupts. ESCSim changes this
+    # compare from 15 to 0 so a slow guest drains it on every USB frame.
+    # Normalize that exact contextualized change before matching persisted
+    # flash.
+    original_sof = bytes.fromhex("54f83c3c0f2b04d0")
+    coalesced_sof = bytes.fromhex("54f83c3c002b04d0")
+    original_count = data.count(original_sof)
+    coalesced_count = data.count(coalesced_sof)
+    if coalesced_count:
+        if coalesced_count != 2 or original_count:
+            raise ValueError(
+                "flight-controller firmware has an invalid USB SOF interval patch"
+            )
+        start = 0
+        for _ in range(coalesced_count):
+            offset = data.find(coalesced_sof, start)
+            data[offset + 4 : offset + 6] = b"\x0f\x2b"
+            start = offset + len(coalesced_sof)
+
     poll_cave = BETAFLIGHT_POLL_TRAMPOLINE - FLASH_BASE
     if data[poll_cave : poll_cave + 16] != b"\xff" * 16:
         words = struct.unpack_from("<8H", data, poll_cave)
@@ -448,6 +507,53 @@ def recognize_betaflight_hotpatches(flash: Path) -> BetaflightHotPatches:
     if not _thumb_bl(data, scheduler_wait_poll + 8):
         raise ValueError("flight-controller firmware has an invalid scheduler wait")
 
+    # gyroSetSampleRate is LTO-inlined into gyroInit. This target's ICM42688
+    # takes the default 8kHz branch. Replacing its enum and sample-rate
+    # immediates with GYRO_RATE_1_kHz/1000 makes both the Betaflight scheduler
+    # and the ICM's programmed ODR 1kHz, avoiding seven redundant SPI/DMA/IRQ
+    # cycles out of every eight while preserving the real sensor path.
+    gyro_sample_rate_setup = _unique_sequence(
+        data, BETAFLIGHT_GYRO_RATE_ORIGINAL, "gyro sample-rate setup"
+    )
+
+    # Recover task_attributes from tasksInitData rather than embedding its
+    # RAM address. TASK_SERIAL is index 8 in this exact task table and its
+    # desiredPeriodUs member is 16 bytes into the 24-byte attribute record.
+    tasks_init_data = _unique_sequence(
+        data,
+        bytes.fromhex("064b074803f52271002240f8223018338b4202f11202f8d1"),
+        "tasksInitData",
+    )
+    if data[tasks_init_data + 0x18 : tasks_init_data + 0x1C] != bytes.fromhex(
+        "704700bf"
+    ):
+        raise ValueError("flight-controller firmware has an invalid tasksInitData")
+    task_attributes = _thumb_literal16(data, tasks_init_data, 3)
+    tasks = _thumb_literal16(data, tasks_init_data + 2, 0)
+    if not _is_sram(task_attributes) or not _is_sram(tasks):
+        raise ValueError("flight-controller task tables are outside SRAM")
+    serial_task_period = task_attributes + 8 * 24 + 16
+
+    # The legacy STM32F4 CDC class sends queued serial data after every 16th
+    # SOF.  Locate the counter compare with enough surrounding instructions
+    # to make the on-launch patch safe and firmware-specific.
+    usb_sof_sequence = bytes.fromhex("54f83c3c0f2b04d0")
+    usb_sof_anchors = []
+    start = 0
+    while True:
+        offset = data.find(usb_sof_sequence, start)
+        if offset < 0:
+            break
+        usb_sof_anchors.append(offset)
+        start = offset + 1
+    # Betaflight builds both the plain CDC and HID/CDC wrapper callbacks.
+    # Either can be selected by the target's runtime USB class table.
+    if len(usb_sof_anchors) != 2:
+        raise ValueError(
+            f"flight-controller firmware has {len(usb_sof_anchors)} USB SOF interval sequences"
+        )
+    usb_sof_interval_compares = tuple(offset + 4 for offset in usb_sof_anchors)
+
     # setEscInput is also BL_SendBuf's tail-call target.  Validate that edge so
     # the flush hook cannot be confused with another GPIO configuration call.
     set_esc_input = _unique_sequence(
@@ -521,6 +627,11 @@ def recognize_betaflight_hotpatches(flash: Path) -> BetaflightHotPatches:
         delay=FLASH_BASE + delay if delay is not None else None,
         scheduler=FLASH_BASE + scheduler if scheduler is not None else None,
         scheduler_wait_poll=FLASH_BASE + scheduler_wait_poll,
+        gyro_sample_rate_setup=FLASH_BASE + gyro_sample_rate_setup,
+        serial_task_period=serial_task_period,
+        usb_sof_interval_compares=tuple(
+            FLASH_BASE + offset for offset in usb_sof_interval_compares
+        ),
         system_state=system_state,
         systick_uptime=systick_uptime,
         read_byte_crc_poll=FLASH_BASE + poll_anchor,
@@ -612,6 +723,10 @@ def betaflight_hotpatches(symbol_elf: Path, flash: Path) -> BetaflightHotPatches
             for name, address in resolved_4way.items()
         )
         or sequence_patches.scheduler_wait_poll != scheduler_address + 0x31C
+        or sequence_patches.gyro_sample_rate_setup
+        != (_symbol_address(symbols, "gyroInit") & ~1) + 0x210
+        or sequence_patches.serial_task_period
+        != _symbol_address(symbols, "task_attributes") + 8 * 24 + 16
     ):
         raise ValueError(
             "flight-controller ELF symbols disagree with recognized sequences"
@@ -623,6 +738,9 @@ def betaflight_hotpatches(symbol_elf: Path, flash: Path) -> BetaflightHotPatches
         delay=_symbol_address(symbols, "delay") & ~1,
         scheduler=scheduler_address,
         scheduler_wait_poll=sequence_patches.scheduler_wait_poll,
+        gyro_sample_rate_setup=sequence_patches.gyro_sample_rate_setup,
+        serial_task_period=sequence_patches.serial_task_period,
+        usb_sof_interval_compares=sequence_patches.usb_sof_interval_compares,
         system_state=_symbol_address(symbols, "systemState"),
         systick_uptime=_symbol_address(symbols, "sysTickUptime"),
         **resolved_4way,
@@ -749,13 +867,13 @@ def write_speedybee_platform(
         for index, port in enumerate(connected_state_ports)
     )
     path.write_text(
-        f"""using "{base}"
+        f"""using "{renode_path(base)}"
 
 rcc:
     hseFrequency: 8000000
 
 persistentFlash: Miscellaneous.AP_PersistentMemory @ none
-    fileName: {json.dumps(str(Path(flash).resolve()))}
+    fileName: {json.dumps(renode_path(flash))}
     address: 0x08000000
     size: 0x100000
 
@@ -851,6 +969,7 @@ def write_speedybee_script(
     flash: Path,
     usbip_port: int,
     hotpatches: BetaflightHotPatches | None = None,
+    source_speedup: bool = False,
 ) -> Path:
     """Write a self-contained Renode script using the vendored models."""
     root = resource_root()
@@ -876,12 +995,14 @@ def write_speedybee_script(
         "apm_sensors/AP_DPS310.cs",
         "apm_sensors/AP_ICM42688.cs",
     ]
-    lines = [f"include @{root / 'peripherals' / item}" for item in includes]
+    lines = [
+        f"include @{renode_path(root / 'peripherals' / item)}" for item in includes
+    ]
     lines += [
         'mach create "SpeedyBeeF405Mini"',
-        f"machine LoadPlatformDescription @{platform}",
+        f"machine LoadPlatformDescription @{renode_path(platform)}",
         "flash ResetByte 0xFF",
-        f"sysbus LoadBinary @{flash} 0x{FLASH_BASE:08X}",
+        f"sysbus LoadBinary @{renode_path(flash)} 0x{FLASH_BASE:08X}",
         # Stable non-erased UID: ArduPilot derives USB serial and board ID
         # material from this factory region.
         "sysbus WriteDoubleWord 0x1FFF7A10 0xF96D5489",
@@ -902,7 +1023,7 @@ def write_speedybee_script(
         "adc1 FeedSample 980 16 -1",
         "adc1 FeedSample 1500 17 -1",
         f'emulation CreateUSBIPServer {usbip_port} "usb"',
-        "host.usb Register sysbus.usbOtg",
+        "sysbus.usbOtg RegisterUSBIP",
         f"cpu VectorTableOffset 0x{FLASH_BASE:08X}",
         # Renode restores VTOR to zero on SYSRESETREQ. The STM32 flash is
         # mapped at 0x08000000, so restore the hardware reset value here.
@@ -932,6 +1053,11 @@ def write_speedybee_script(
         "logLevel 3 sysbus.timer3",
         "logLevel 3 sysbus.timer4",
     ]
+    if source_speedup:
+        lines += [
+            "# Betaflight source-level ESCSim speed profile",
+            "sysbus.usbOtg SetSOFInterval 80",
+        ]
     if hotpatches is not None:
         lines.append(
             "# Betaflight hot patches: "
@@ -965,10 +1091,32 @@ def write_speedybee_script(
                     f'cpu AddHook 0x{hotpatches.scheduler:08X} "'
                     f"system_state_address=0x{hotpatches.system_state:08X}; "
                     f"delay_address=0x{hotpatches.delay:08X}; "
+                    f"serial_task_period_address=0x{hotpatches.serial_task_period:08X}; "
                     f'scheduler_address=0x{hotpatches.scheduler:08X}; {finish}"'
                 ),
             ]
         lines += [
+            # Betaflight's legacy F4 CDC transmitter normally drains its ring
+            # every 16th SOF.  A flight controller running slower than wall
+            # time then takes hundreds of milliseconds to return each MSP
+            # response, while Configurator continues to queue 20ms polls.
+            # Make the recognised compare fire on every ordinary 1ms SOF so
+            # serial latency follows host time closely enough to avoid that
+            # self-sustaining backlog.
+            "sysbus.usbOtg SetSOFInterval 1",
+            # The exact bundled target samples its ICM42688 at 8kHz even
+            # when pid_process_denom reduces the downstream PID rate. Run
+            # the real gyro path at 1kHz, a supported sensor ODR that is
+            # ample for an interactive firmware simulator.
+            "# Run the ICM42688 and gyro scheduler at 1kHz",
+            f"sysbus WriteWord 0x{hotpatches.gyro_sample_rate_setup + 4:08X} 0x2200",
+            f"sysbus WriteWord 0x{hotpatches.gyro_sample_rate_setup + 0x12:08X} 0xF44F",
+            f"sysbus WriteWord 0x{hotpatches.gyro_sample_rate_setup + 0x14:08X} 0x717A",
+            "# Drain legacy F4 CDC output on every USB frame",
+            *(
+                f"sysbus WriteWord 0x{address:08X} 0x2B00"
+                for address in hotpatches.usb_sof_interval_compares
+            ),
             "# WFI-patch scheduler's sequence-recognized cycle-counter poll",
             *(
                 f"sysbus WriteWord 0x{address:08X} 0x{value:04X}"

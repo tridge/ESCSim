@@ -101,6 +101,11 @@ IS_WINDOWS = os.name == "nt"
 WINDOWS_USBIP_TIMEOUT = 15
 
 
+def _windows_creationflags():
+    """Keep short-lived usbip.exe helpers invisible from the GUI process."""
+    return getattr(subprocess, "CREATE_NO_WINDOW", 0) if IS_WINDOWS else 0
+
+
 def device_descriptor(vid, pid):
     return struct.pack(
         "<BBHBBBBHHHBBBB",
@@ -204,6 +209,38 @@ def find_tty(serial=DEFAULT_SERIAL, timeout=10.0, vid=VENDOR_ID, pid=PRODUCT_ID)
                     )
         else:
             hits = sorted(glob.glob(tty_glob(serial)))
+        if hits:
+            return hits[0]
+        if time.time() >= deadline:
+            return None
+        time.sleep(0.2)
+
+
+def serial_devices():
+    """Return the currently enumerated Windows serial device names."""
+    if not IS_WINDOWS:
+        return set()
+    try:
+        from serial.tools import list_ports
+    except ImportError as ex:
+        raise RuntimeError("pyserial is required to discover Windows COM ports") from ex
+    return {port.device for port in list_ports.comports()}
+
+
+def find_new_tty(previous=(), timeout=10.0):
+    """Wait for a Windows serial device absent from a pre-attach snapshot.
+
+    Firmware-driven USB must not be identified using a simulator VID/PID:
+    Betaflight, ArduPilot, DFU and MSC modes deliberately expose different
+    descriptors.  Taking the snapshot before importing the owned USB/IP
+    connection associates its new COM device without constraining identity.
+    """
+    if not IS_WINDOWS:
+        return None
+    previous = set(previous)
+    deadline = time.time() + timeout
+    while True:
+        hits = sorted(serial_devices() - previous)
         if hits:
             return hits[0]
         if time.time() >= deadline:
@@ -857,7 +894,11 @@ def windows_usbip_version(executable=None):
     """Return usbip-win2's four-part file version as a tuple."""
     executable = executable or windows_usbip_executable()
     result = subprocess.run(
-        [executable, "--version"], capture_output=True, text=True, check=False
+        [executable, "--version"],
+        capture_output=True,
+        text=True,
+        check=False,
+        creationflags=_windows_creationflags(),
     )
     output = "\n".join((result.stdout, result.stderr)).strip()
     match = re.search(r"(?<!\d)(\d+)\.(\d+)\.(\d+)\.(\d+)(?!\d)", output)
@@ -907,6 +948,7 @@ def _windows_attach(host, port, busid):
             text=True,
             check=False,
             timeout=WINDOWS_USBIP_TIMEOUT,
+            creationflags=_windows_creationflags(),
         )
     except subprocess.TimeoutExpired as ex:
         raise RuntimeError(
@@ -917,6 +959,11 @@ def _windows_attach(host, port, busid):
     # detaching an incorrectly guessed machine-wide port would be harmful.
     match = re.fullmatch(r"\s*(\d+)\s*", result.stdout)
     if result.returncode != 0 or match is None:
+        if "VHCI device not found" in output:
+            raise RuntimeError(
+                "usbip-win2 host controller is unavailable; reboot Windows "
+                "after installing or upgrading the USBIP driver"
+            )
         raise RuntimeError(
             "usbip-win2 attach failed: %s" % (output or "no diagnostic output")
         )
@@ -936,6 +983,7 @@ def _windows_detach(port):
             text=True,
             check=False,
             timeout=WINDOWS_USBIP_TIMEOUT,
+            creationflags=_windows_creationflags(),
         )
     except subprocess.TimeoutExpired as ex:
         raise RuntimeError(

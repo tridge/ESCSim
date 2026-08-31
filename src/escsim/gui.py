@@ -105,6 +105,9 @@ SITL_MAGIC = 0x4453
 STATE_MAGIC = 0x5353
 MAX_ESC_COUNT = 8
 INSTANCE_PORT_STRIDE = 10
+DEFAULT_GUI_PORT = 47833
+DEFAULT_STATE_PORT = 47834
+DEFAULT_MONITOR_PORT = 47835
 
 
 METRICS_COMMAND = (
@@ -125,6 +128,7 @@ FC_METRICS_COMMAND = (
     "sysbus.motorBridge ReadDoubleWord 0x68; "
     "sysbus.motorBridge ReadDoubleWord 0x6c"
 )
+FC_USB_STATE_COMMAND = "sysbus.usbOtg USBIPConnectionState"
 
 
 def bootloader_dirs(explicit=None):
@@ -189,29 +193,57 @@ class ProcRunner(object):
         self.tree = None
         self.lock = threading.RLock()
 
-    def start(self, cmd, cwd=None, env=None):
+    def start(self, cmd, cwd=None, env=None, log_path=None):
         # stdin must be a pipe we hold open: renode's console exits on
         # EOF, so inheriting a nohup'd or exhausted stdin kills the
         # emulator moments after it starts
         with self.lock:
-            self.tree = ProcessTree(
-                cmd,
-                cwd=cwd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                errors="replace",
-                env=env,
-            )
+            log_file = None
+            try:
+                if log_path is not None:
+                    log_path = Path(log_path)
+                    log_path.parent.mkdir(parents=True, exist_ok=True)
+                    log_file = log_path.open(
+                        "w", encoding="utf-8", errors="replace", buffering=1
+                    )
+                self.tree = ProcessTree(
+                    cmd,
+                    cwd=cwd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    errors="replace",
+                    env=env,
+                )
+            except BaseException:
+                if log_file is not None:
+                    log_file.close()
+                raise
             self.proc = self.tree.process
-            threading.Thread(target=self._pump, args=(self.proc,), daemon=True).start()
+            threading.Thread(
+                target=self._pump, args=(self.proc, log_file), daemon=True
+            ).start()
 
-    def _pump(self, proc):
-        for line in proc.stdout:
-            line = line.rstrip("\n")
-            self.out_q.put("%s%s" % (self.label, line))
-        self.out_q.put("%s[emulator exited, status %s]" % (self.label, proc.wait()))
+    def _pump(self, proc, log_file):
+        try:
+            for line in proc.stdout:
+                if log_file is not None:
+                    log_file.write(line)
+                    log_file.flush()
+                self.out_q.put("%s%s" % (self.label, line.rstrip("\n")))
+            exit_line = "%s[emulator exited, status %s]" % (
+                self.label,
+                proc.wait(),
+            )
+            if log_file is not None:
+                log_file.write(exit_line + "\n")
+                log_file.flush()
+            self.out_q.put(exit_line)
+        finally:
+            if log_file is not None:
+                log_file.close()
 
     def running(self):
         with self.lock:
@@ -234,15 +266,22 @@ class ProcGroup(object):
         self.runners = []
         self.lock = threading.RLock()
 
-    def start(self, commands, cwd=None, env=None):
+    def start(self, commands, cwd=None, env=None, log_paths=None):
         with self.lock:
             count = len(commands)
+            if log_paths is not None and len(log_paths) != count:
+                raise ValueError("one log path is required per emulator process")
             try:
                 for index, command in enumerate(commands):
                     label = "[ESC %u] " % (index + 1) if count > 1 else ""
                     runner = ProcRunner(self.out_q, label=label)
                     self.runners.append(runner)
-                    runner.start(command, cwd=cwd, env=env)
+                    runner.start(
+                        command,
+                        cwd=cwd,
+                        env=env,
+                        log_path=None if log_paths is None else log_paths[index],
+                    )
             except BaseException:
                 self.stop()
                 raise
@@ -275,6 +314,7 @@ class Lab(object):
         self.fc_runner = ProcRunner(self.log_q, label="[FC] ")
         self.fc_monitor = None
         self.fc_monitor_lock = threading.Lock()
+        self.fc_monitor_io_lock = threading.Lock()
         self.emulator_ready = False
         self.stub = None
         self.usb_attached = False
@@ -303,6 +343,7 @@ class Lab(object):
         self.status = "stopped"
         self.conf_port = ""  # the pty / tty path once up
         self.launch_work = None
+        self.log_dir = default_cache_dir() / "logs"
         self.bl_dirs = bootloader_dirs(args.bootloader_dir)
         cached_bootloaders = default_cache_dir() / "bootloaders"
         if cached_bootloaders.is_dir():
@@ -468,14 +509,14 @@ class Lab(object):
         for port in [port for ports in instance_ports for port in ports[:2]]:
             if not self.wait_port_free(port):
                 return (
-                    "udp port %u is still in use - a leftover emulator? "
-                    "try: pkill -f renode" % port
+                    "udp port %u cannot be bound (already in use, or reserved "
+                    "by Windows)" % port
                 )
         for port in [ports[2] for ports in instance_ports]:
             if not self.wait_port_free(port, tcp=True):
                 return (
-                    "monitor port %u is still in use - a leftover emulator? "
-                    "try: pkill -f renode" % port
+                    "monitor port %u cannot be bound (already in use, or "
+                    "reserved by Windows)" % port
                 )
         if fc_selected:
             for label, port in (
@@ -580,13 +621,26 @@ class Lab(object):
         self.status = "starting %s..." % (
             "emulator" if total == 1 else "%u emulators" % total
         )
+        esc_log_paths = [
+            self.log_dir / ("esc%u.log" % (index + 1)) for index in range(count)
+        ]
+        fc_log_path = self.log_dir / "flight-controller.log"
+        self.log("process logs: %s" % self.log_dir)
         for command in commands:
             self.log("$ " + " ".join(command))
         try:
-            self.runner.start(commands, env=generator_environment())
+            self.runner.start(
+                commands,
+                env=generator_environment(),
+                log_paths=esc_log_paths,
+            )
             if fc_selected and self.fc_boot_mode == "flash":
                 self.log("$ " + " ".join(self.fc_command))
-                self.fc_runner.start(self.fc_command, env=generator_environment())
+                self.fc_runner.start(
+                    self.fc_command,
+                    env=generator_environment(),
+                    log_path=fc_log_path,
+                )
                 self.fc_runner_required = True
         except Exception as error:
             self.runner.stop()
@@ -712,26 +766,30 @@ class Lab(object):
         ]
         if fc_monitor is not None:
             metric_monitors.insert(0, ("FC", fc_monitor, True))
-        for label, monitor, is_fc in metric_monitors:
-            threading.Thread(
-                target=self._metrics_loop,
-                args=(generation, label, monitor, is_fc),
-                daemon=True,
-            ).start()
         if bl is not None and self.protocol != "flightcontroller":
             self._enter_bootloader()
         if not self._generation_current(generation):
             return
         if self.conf == "off":
             self.status = "running (no configurator port)"
-            return
-        try:
-            self._start_stub(generation)
-        except Exception as ex:
-            if self._generation_current(generation):
-                self._stop_stub()
-                self.status = "configurator port failed: %s" % ex
-                self.log(self.status)
+        else:
+            try:
+                # The FC monitor is already connected here and has no other
+                # consumer yet. Use it for USB readiness before handing it to
+                # the metrics thread; Renode serializes multiple telnet
+                # monitor clients and a second client can otherwise starve.
+                self._start_stub(generation, fc_monitor=fc_monitor)
+            except Exception as ex:
+                if self._generation_current(generation):
+                    self._stop_stub()
+                    self.status = "configurator port failed: %s" % ex
+                    self.log(self.status)
+        for label, monitor, is_fc in metric_monitors:
+            threading.Thread(
+                target=self._metrics_loop,
+                args=(generation, label, monitor, is_fc),
+                daemon=True,
+            ).start()
 
     def _enter_bootloader(self):
         """hold the signal wire high and reset, so the ESC is parked in
@@ -796,9 +854,14 @@ class Lab(object):
             while generation == self.generation and self._all_emulators_running():
                 try:
                     command = FC_METRICS_COMMAND if is_fc_monitor else METRICS_COMMAND
-                    current = renode_monitor.parse_metrics(
-                        client.command(command, timeout=60 if not history else 5)
-                    )
+                    if is_fc_monitor:
+                        with self.fc_monitor_io_lock:
+                            text = client.command(
+                                command, timeout=60 if not history else 5
+                            )
+                    else:
+                        text = client.command(command, timeout=60 if not history else 5)
+                    current = renode_monitor.parse_metrics(text)
                 except (OSError, TimeoutError, ValueError) as error:
                     self.log_q.put(("__monitor_error__", generation, label, str(error)))
                     return
@@ -829,7 +892,11 @@ class Lab(object):
     def _format_instance_metrics(self, label, m):
         """Format one Renode process's PC, speed and optional FC counters."""
         where = ""
-        app_base = 0x0800C000 if label == "FC" else (self.info or {}).get("app_base")
+        # The AM32 ESC has a distinct bootloader below app_base.  The selected
+        # FC image is application firmware (including Betaflight), so applying
+        # the ESC address heuristic to it incorrectly labels normal execution
+        # as "bootloader".
+        app_base = None if label == "FC" else (self.info or {}).get("app_base")
         if app_base:
             flash_base = 0x08000000 if app_base >= 0x08000000 else 0
             if flash_base <= m["pc"] < app_base:
@@ -893,9 +960,9 @@ class Lab(object):
         """Compact all per-process metrics for the text control interface."""
         return " || ".join(self.format_metrics_lines())
 
-    def _start_stub(self, generation):
+    def _start_stub(self, generation, fc_monitor=None):
         if self.protocol == "flightcontroller":
-            return self._start_fc_endpoint(generation)
+            return self._start_fc_endpoint(generation, monitor=fc_monitor)
         if self.conf == "usb":
             with self.lifecycle_lock:
                 self.usb_starting.add(generation)
@@ -991,7 +1058,7 @@ class Lab(object):
                     with self.lifecycle_lock:
                         self.usb_starting.discard(generation)
 
-    def _start_fc_endpoint(self, generation):
+    def _start_fc_endpoint(self, generation, monitor=None):
         """Attach either factory DFU or the USB device driven by FC firmware."""
         with self.lifecycle_lock:
             self.usb_starting.add(generation)
@@ -1027,7 +1094,7 @@ class Lab(object):
                     published = True
                 self.log(self.status)
                 return
-            self._attach_firmware_usb(generation)
+            self._attach_firmware_usb(generation, monitor=monitor)
         finally:
             if endpoint is not None and not published:
                 if attached is not None and attached is not False:
@@ -1040,34 +1107,24 @@ class Lab(object):
             with self.lifecycle_lock:
                 self.usb_starting.discard(generation)
 
-    def _attach_firmware_usb(self, generation):
+    def _attach_firmware_usb(self, generation, monitor=None):
         """Attach Renode's firmware-driven USB/IP device after enumeration."""
-        deadline = time.time() + 120
-        attached = None
-        last_error = None
-        while (
-            time.time() < deadline
-            and self._generation_current(generation)
-            and self.fc_runner.running()
-        ):
-            try:
-                attached = sitl_usbip.attach(
-                    host="127.0.0.1",
-                    port=self.fc_usbip_port(),
-                    busid="1-0",
-                )
-                if attached is not None and attached is not False:
-                    break
-            except (OSError, RuntimeError) as error:
-                last_error = error
-            time.sleep(0.5)
+        if not self._wait_fc_usb_ready(generation, monitor=monitor):
+            if not self._generation_current(generation) or not self.fc_runner.running():
+                return
+            raise RuntimeError("FC firmware did not enable USB")
+        previous_ttys = sitl_usbip.serial_devices()
+        attached = sitl_usbip.attach(
+            host="127.0.0.1",
+            port=self.fc_usbip_port(),
+            busid="1-0",
+        )
         if attached is None or attached is False:
-            raise RuntimeError(
-                "FC USB did not enumerate%s"
-                % (": %s" % last_error if last_error is not None else "")
-            )
+            raise RuntimeError("FC USB/IP attach was refused")
         self._remember_usb(attached)
-        tty = self._find_fc_tty(timeout=15, usb_port=attached)
+        tty = self._find_fc_tty(
+            timeout=15, usb_port=attached, previous_ttys=previous_ttys
+        )
         published = False
         with self.lifecycle_lock:
             if generation == self.generation and self.fc_runner.running():
@@ -1086,6 +1143,38 @@ class Lab(object):
             if error is not None:
                 self.log("USB/IP detach failed after cancelled FC start: %s" % error)
 
+    def _wait_fc_usb_ready(self, generation, timeout=120, monitor=None):
+        """Wait until firmware has connected the Renode USB/IP device.
+
+        Do not probe the USB/IP TCP port itself. usbip-win2 can leave its
+        kernel helper wedged if an import begins while the server exists but
+        has no connected device yet.
+        """
+        deadline = time.monotonic() + timeout
+        while (
+            time.monotonic() < deadline
+            and self._generation_current(generation)
+            and self.fc_runner.running()
+        ):
+            current = monitor
+            if current is None:
+                with self.fc_monitor_lock:
+                    current = self.fc_monitor
+            if current is None:
+                time.sleep(0.2)
+                continue
+            try:
+                with self.fc_monitor_io_lock:
+                    text = current.command(FC_USB_STATE_COMMAND, timeout=10)
+                values = re.findall(r"(?m)^\s*(0x[0-9A-Fa-f]+)\s*$", text)
+                if values and (int(values[-1], 16) & 1) != 0:
+                    return True
+            except (OSError, TimeoutError):
+                if monitor is not None:
+                    return False
+            time.sleep(0.5)
+        return False
+
     def _watch_fc_usb(self, generation):
         """Re-import firmware USB after its bootloader/application reset.
 
@@ -1095,14 +1184,34 @@ class Lab(object):
         again once it enumerates.  This also covers repeated Betaflight DFU
         flashes and ordinary ArduPilot reboots.
         """
+        observed_state = None
         while self._generation_current(generation) and self.fc_runner.running():
+            state = self._fc_usb_connection_state()
+            if state is None:
+                time.sleep(0.5)
+                continue
             with self.lifecycle_lock:
                 ports = list(self.usb_ports)
-            if ports and any(sitl_usbip.port_attached(port) for port in ports):
+            changed = observed_state is not None and state != observed_state
+            observed_state = state
+            if (
+                ports
+                and not changed
+                and any(sitl_usbip.port_attached(port) for port in ports)
+            ):
                 time.sleep(0.5)
                 continue
             for port in ports:
+                if os.name == "nt":
+                    try:
+                        sitl_usbip.detach(port)
+                    except (OSError, RuntimeError):
+                        pass
                 self._forget_usb(port)
+            if (state & 1) == 0:
+                time.sleep(0.5)
+                continue
+            previous_ttys = sitl_usbip.serial_devices()
             try:
                 attached = sitl_usbip.attach(
                     host="127.0.0.1",
@@ -1118,7 +1227,9 @@ class Lab(object):
             if not self._generation_current(generation):
                 self._detach_owned_usb(attached)
                 return
-            tty = self._find_fc_tty(timeout=5, usb_port=attached)
+            tty = self._find_fc_tty(
+                timeout=5, usb_port=attached, previous_ttys=previous_ttys
+            )
             with self.lifecycle_lock:
                 if generation != self.generation:
                     continue
@@ -1126,8 +1237,23 @@ class Lab(object):
                 self.status = "running - flight controller: %s" % self.conf_port
             self.log("flight-controller USB reattached: %s" % self.conf_port)
 
+    def _fc_usb_connection_state(self):
+        with self.fc_monitor_lock:
+            monitor = self.fc_monitor
+        if monitor is None:
+            return None
+        try:
+            with self.fc_monitor_io_lock:
+                text = monitor.command(FC_USB_STATE_COMMAND, timeout=10)
+        except (OSError, TimeoutError):
+            return None
+        values = re.findall(r"(?m)^\s*(0x[0-9A-Fa-f]+)\s*$", text)
+        return int(values[-1], 16) if values else None
+
     @staticmethod
-    def _find_fc_tty(timeout=10, usb_port=None):
+    def _find_fc_tty(timeout=10, usb_port=None, previous_ttys=()):
+        if os.name == "nt":
+            return sitl_usbip.find_new_tty(previous_ttys, timeout=timeout)
         if os.name != "nt" and usb_port is not None:
             return sitl_usbip.find_tty_on_port(usb_port, timeout=timeout)
         deadline = time.time() + timeout
@@ -1164,7 +1290,11 @@ class Lab(object):
             with self.lifecycle_lock:
                 if generation != self.generation:
                     return
-                self.fc_runner.start(self.fc_command, env=generator_environment())
+                self.fc_runner.start(
+                    self.fc_command,
+                    env=generator_environment(),
+                    log_path=self.log_dir / "flight-controller.log",
+                )
                 self.fc_runner_required = True
             monitor = renode_monitor.MonitorClient("127.0.0.1", self.fc_monitor_port())
             deadline = time.time() + 120
@@ -1180,12 +1310,12 @@ class Lab(object):
             if text is None or error is not None:
                 monitor.close()
                 raise RuntimeError(error or "FC monitor did not become ready")
+            self._attach_firmware_usb(generation, monitor=monitor)
             threading.Thread(
                 target=self._metrics_loop,
                 args=(generation, "FC", monitor, True),
                 daemon=True,
             ).start()
-            self._attach_firmware_usb(generation)
         except Exception as error:
             self.status = "DFU handoff failed: %s" % error
             self.log(self.status)
@@ -1345,14 +1475,14 @@ def main(argv=None):
     ap.add_argument(
         "--gui-port",
         type=int,
-        default=57833,
-        help="emulator input port (default off the SITL's 57733, so both can run)",
+        default=DEFAULT_GUI_PORT,
+        help="emulator input port (below Windows' dynamic port range by default)",
     )
-    ap.add_argument("--state-port", type=int, default=57834)
+    ap.add_argument("--state-port", type=int, default=DEFAULT_STATE_PORT)
     ap.add_argument(
         "--monitor-port",
         type=int,
-        default=57835,
+        default=DEFAULT_MONITOR_PORT,
         help="Renode telnet monitor port, polled for the live PC / speedup display",
     )
     ap.add_argument(
@@ -1851,8 +1981,8 @@ def main(argv=None):
     grid.addWidget(status_label, 12, 0, 1, 2)
     metrics_labels = []
     metrics_tooltip = (
-        "Live from one Renode monitor: current PC (labelled when it is\n"
-        "executing the bootloader), emulation speed against real time,\n"
+        "Live from one Renode monitor: current PC (ESC instances are labelled\n"
+        "when executing their bootloader), emulation speed against real time,\n"
         "instructions actually retired per wall second against the\n"
         "configured PerformanceInMips, and the machine's virtual time."
     )

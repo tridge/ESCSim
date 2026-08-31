@@ -52,8 +52,13 @@ def test_windows_installer_is_per_user_and_bundles_verified_usbip_driver():
     assert "SetupIconFile=escsim.ico" in installer
     assert "USBip-0.9.7.7-x64.exe" in installer
     assert "ExtractTemporaryFile" in installer
+    assert "RegQueryStringValue(HKLM64" in installer
+    assert "{199505b0-b93d-4521-a8c7-897818e0205a}_is1" in installer
+    assert "InstalledVersion = '0.9.7.7'" in installer
     assert "GetVersionNumbers" in installer
     assert "Build = 8" in installer
+    assert "ewNoWait" in installer
+    assert "ewWaitUntilTerminated" not in installer
     assert "temporarily restarts" in installer
     assert "may require a Windows reboot" in installer
     assert "WizardSilent" in installer
@@ -81,3 +86,16 @@ def test_native_build_uses_make_without_cmake():
     assert '"pip",' in installer
     assert "staged.unlink(missing_ok=True)" in installer
     assert "staged.unlink(missing_ok=True)" in wheel_builder
+
+
+def test_win11_target_builds_remote_installer_from_current_tree():
+    root = Path(__file__).parents[1]
+    makefile = (root / "Makefile").read_text()
+
+    assert "WIN11_HOST ?= win11" in makefile
+    assert "WIN11_DIR ?= ESCSim-win11-build" in makefile
+    assert 'ssh "$(WIN11_HOST)"' in makefile
+    assert '"$(WIN11_HOST):$(WIN11_DIR)/"' in makefile
+    assert "make windows-installer" in makefile
+    assert "dist/ESCSim/ESCSim.exe targets status" in makefile
+    assert "ESCSim-installer.exe" in makefile

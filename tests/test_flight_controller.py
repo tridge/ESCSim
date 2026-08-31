@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import struct
 import threading
+from pathlib import PureWindowsPath
 
 import pytest
 
@@ -16,6 +17,7 @@ from escsim.renode.flight_controller import (
     ensure_flash,
     flight_controller_firmware,
     flight_controller_firmwares,
+    has_betaflight_source_speedup,
     load_image,
     recognize_betaflight_hotpatches,
     select_firmware,
@@ -64,6 +66,7 @@ def test_speedybee_platform_wires_four_escs_and_fixed_sensors(tmp_path):
     assert "adc1 FeedSample 1500 17 -1" in script_text
     assert "sysbus WriteWord 0x1FFF7A2A 1500" in script_text
     assert 'emulation CreateUSBIPServer 5200 "usb"' in script_text
+    assert "sysbus.usbOtg RegisterUSBIP" in script_text
     assert 'emulation SetGlobalQuantum "0.001"' in script_text
     assert "macro reset" in script_text
     assert "cpu VectorTableOffset 0x08000000" in script_text
@@ -77,6 +80,26 @@ def test_speedybee_platform_wires_four_escs_and_fixed_sensors(tmp_path):
     assert "register == GyroConfig0" in imu
     assert "case 3: sampleTimer.Limit = 125" in imu
     assert "IRQ.Blink();" in imu
+
+
+def test_source_speedup_marker_selects_coalesced_usb_sof(tmp_path):
+    flash = ensure_flash(tmp_path / "flash.bin")
+    marker = flight_controller.BETAFLIGHT_SOURCE_SPEEDUP_MARKER
+    data = bytearray(flash.read_bytes())
+    data[0x200 : 0x200 + len(marker)] = marker
+    flash.write_bytes(data)
+
+    assert has_betaflight_source_speedup(flash)
+    platform = write_speedybee_platform(tmp_path, (5101,), flash)
+    script = write_speedybee_script(
+        tmp_path,
+        platform,
+        flash,
+        5200,
+        source_speedup=True,
+    ).read_text()
+    assert "# Betaflight source-level ESCSim speed profile" in script
+    assert "sysbus.usbOtg SetSOFInterval 80" in script
 
 
 def test_speedybee_script_installs_verified_elf_hotpatches(tmp_path):
@@ -94,6 +117,9 @@ def test_speedybee_script_installs_verified_elf_hotpatches(tmp_path):
             delay=0x08001000,
             scheduler=0x08002000,
             scheduler_wait_poll=0x08002100,
+            gyro_sample_rate_setup=0x08002300,
+            serial_task_period=0x20000200,
+            usb_sof_interval_compares=(0x08002200, 0x08002210),
             system_state=0x20000100,
             systick_uptime=0x20000104,
             read_byte_crc_poll=0x0800300C,
@@ -112,7 +138,14 @@ def test_speedybee_script_installs_verified_elf_hotpatches(tmp_path):
     assert "skip_betaflight_delays.py" in script
     assert "cpu AddHook 0x08002000" in script
     assert "finish_betaflight_hotpatches.py" in script
+    assert "serial_task_period_address=0x20000200" in script
     assert "WFI-patch scheduler" in script
+    assert "sysbus.usbOtg SetSOFInterval 1" in script
+    assert "sysbus WriteWord 0x08002304 0x2200" in script
+    assert "sysbus WriteWord 0x08002312 0xF44F" in script
+    assert "sysbus WriteWord 0x08002314 0x717A" in script
+    assert "sysbus WriteWord 0x08002200 0x2B00" in script
+    assert "sysbus WriteWord 0x08002210 0x2B00" in script
     assert "sysbus WriteWord 0x08002100" in script
     assert "sysbus WriteWord 0x080FFFDC 0xBF30" in script
     assert "cpu AddHook 0x0800300C" not in script
@@ -151,6 +184,8 @@ def test_betaflight_hotpatches_require_exact_flash_identity(tmp_path, monkeypatc
                 (
                     Symbol("delay", FLASH_BASE + 1),
                     Symbol("scheduler", FLASH_BASE + 5),
+                    Symbol("gyroInit", FLASH_BASE + 0x41),
+                    Symbol("task_attributes", 0x20000100),
                     Symbol("systemState", 0x20000100),
                     Symbol("sysTickUptime.lto_priv.0", 0x20000104),
                     Symbol("ReadByteCrc.isra.0", FLASH_BASE + 0x11),
@@ -188,6 +223,12 @@ def test_betaflight_hotpatches_require_exact_flash_identity(tmp_path, monkeypatc
             delay=None,
             scheduler=None,
             scheduler_wait_poll=FLASH_BASE + 0x320,
+            gyro_sample_rate_setup=FLASH_BASE + 0x250,
+            serial_task_period=0x200001D0,
+            usb_sof_interval_compares=(
+                FLASH_BASE + 0x324,
+                FLASH_BASE + 0x334,
+            ),
             system_state=None,
             systick_uptime=0x20000104,
             read_byte_crc_poll=FLASH_BASE + 0x1C,
@@ -284,6 +325,8 @@ def test_stm32f4_otg_uses_connected_hardware_reset_state():
     assert "registers[DeviceControl] = 0;" in otg
     assert "(GetRegister(DeviceControl) & SoftDisconnect) == 0" in otg
     assert "(value & GlobalInterruptEnable) == 0" in otg
+    assert "public uint USBIPReady()" in otg
+    assert "return connected ? 1u : 0u;" in otg
     legacy = otg.index("if(setConnected == null)")
     assert "return true;" in otg[legacy : legacy + 500]
 
@@ -299,10 +342,50 @@ def test_stm32f4_otg_assigns_firmware_address_before_usbip_setup():
     # USB/IP imports an already-addressed remote device, so vhci_hcd does not
     # forward the physical bus SET_ADDRESS transaction.  Betaflight's USB
     # state machine must still see it before accepting SET_CONFIGURATION.
-    assert "if(!firmwareAddressAssigned)" in otg
+    assert "if(!firmwareAddressAssigned &&" in otg
+    assert "(byte)StandardRequest.GetDescriptor" in otg
     assert "Request = (byte)StandardRequest.SetAddress" in otg
     assert "Value = SyntheticUsbAddress" in otg
-    assert "_ => HandleSetupPacket(packet, additionalData," in otg
+    assert "QueueSetupPacket(packet, additionalData, response);" in otg
+
+
+def test_stm32f4_otg_serializes_firmware_setup_transactions():
+    otg = (
+        flight_controller_firmware("SPEEDYBEEF405V5").parents[1]
+        / "peripherals"
+        / "apm_stm32"
+        / "AP_STM32_OTG.cs"
+    ).read_text(encoding="utf-8")
+
+    # usbip-win2 completes descriptor-side control transfers immediately,
+    # while the emulated firmware handles the corresponding setup packets
+    # asynchronously.  Preserve their order instead of replacing the active
+    # transaction when Windows sends its CDC initialization burst.
+    assert "Queue<PendingSetupPacket> pendingSetup" in otg
+    assert "pendingSetup.Enqueue(new PendingSetupPacket" in otg
+    assert "var next = pendingSetup.Dequeue();" in otg
+    assert "pendingSetup.Clear();" in otg
+    assert "Replacing an unfinished USB setup transaction" not in otg
+
+
+def test_stm32f4_otg_exports_firmware_descriptors_directly():
+    otg = (
+        flight_controller_firmware("SPEEDYBEEF405V5").parents[1]
+        / "peripherals"
+        / "apm_stm32"
+        / "AP_STM32_OTG.cs"
+    ).read_text(encoding="utf-8")
+
+    assert "customSetupPacketHandler: HandleFirmwareSetupPacket" in otg
+    assert "parameters[0].ParameterType.IsInstanceOfType(this)" in otg
+    assert "method.Invoke(server, new object[] { this, 0 })" in otg
+    assert "USBIPDeviceProxy" not in otg
+    assert "manufacturerName:" not in otg
+    assert "vendorId:" not in otg
+    assert "cdcControlInterfaces.Contains(packet.Index)" in otg
+    assert "Other interface classes (notably MSC and DFU) continue" in otg
+    assert "public uint USBIPConnectionState()" in otg
+    assert "usbConnectionGeneration << 1" in otg
 
 
 @pytest.mark.parametrize(
@@ -347,6 +430,9 @@ def test_bundled_betaflight_sequences_resolve_without_elf(tmp_path):
     assert patches.delay == 0x0800AB1C
     assert patches.scheduler == 0x08026EF8
     assert patches.scheduler_wait_poll == 0x08027214
+    assert patches.gyro_sample_rate_setup == 0x0803AA80
+    assert patches.serial_task_period == 0x2000085C
+    assert patches.usb_sof_interval_compares == (0x08049704, 0x08049888)
     assert patches.system_state == 0x2000243D
     assert patches.systick_uptime == 0x200013CC
     assert patches.read_byte_crc_poll == 0x08050EAC
@@ -380,7 +466,7 @@ def test_flight_controller_automatically_installs_recognized_hooks(tmp_path):
     select_firmware(flash, flight_controller_firmware("SPEEDYBEEF405V5"))
     outdir = tmp_path / "run"
 
-    FlightControllerSpec(
+    command = FlightControllerSpec(
         model="SpeedyBeeF405Mini",
         outdir=outdir,
         flash=flash,
@@ -392,6 +478,13 @@ def test_flight_controller_automatically_installs_recognized_hooks(tmp_path):
     ).command()
     script = (outdir / "SpeedyBeeF405Mini.resc").read_text()
 
+    assert command[command.index("--config") + 1] == str(
+        outdir / "renode-config" / "config"
+    )
+    assert (
+        "history-path = %s" % (outdir / "renode-config" / "history")
+        in (outdir / "renode-config" / "config").read_text()
+    )
     assert "LoadSymbolsFrom" not in script
     assert "# Betaflight hot patches: sequence-recognized" in script
     assert "cpu AddHook 0x08050EAC" not in script
@@ -404,6 +497,60 @@ def test_flight_controller_automatically_installs_recognized_hooks(tmp_path):
     assert "cpu AddHook 0x08050E28" in script
     assert "cpu AddHook 0x0803A0C4" in script
     assert "cpu AddHook 0x0803B7B4" in script
+
+
+def test_flight_controller_normalizes_windows_paths(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        flight_controller,
+        "renode_path",
+        lambda path: str(path).replace("\\", "/"),
+    )
+    monkeypatch.setattr(
+        flight_controller,
+        "resource_root",
+        lambda: PureWindowsPath(r"C:\Program Files\ESCSim\resources"),
+    )
+    script = write_speedybee_script(
+        tmp_path,
+        PureWindowsPath(r"C:\Temp\ESCSim run\SpeedyBeeF405Mini.repl"),
+        PureWindowsPath(r"C:\Users\pilot\ESCSim Cache\flash.bin"),
+        57916,
+    ).read_text()
+
+    assert "include @C:/Program Files/ESCSim/resources/peripherals/" in script
+    assert (
+        "machine LoadPlatformDescription "
+        "@C:/Temp/ESCSim run/SpeedyBeeF405Mini.repl" in script
+    )
+    assert "sysbus LoadBinary @C:/Users/pilot/ESCSim Cache/flash.bin" in script
+    assert "\\" not in script
+
+
+def test_flight_controller_platform_normalizes_windows_paths(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        flight_controller,
+        "renode_path",
+        lambda path: str(path).replace("\\", "/"),
+    )
+    monkeypatch.setattr(
+        flight_controller,
+        "resource_root",
+        lambda: PureWindowsPath(r"C:\Program Files\ESCSim\resources"),
+    )
+
+    platform = write_speedybee_platform(
+        tmp_path,
+        (57833,),
+        PureWindowsPath(r"C:\Users\pilot\ESCSim Cache\flash.bin"),
+        (57834,),
+    ).read_text()
+
+    assert (
+        'using "C:/Program Files/ESCSim/resources/flight_controllers/'
+        'stm32f405_base.repl"' in platform
+    )
+    assert 'fileName: "C:/Users/pilot/ESCSim Cache/flash.bin"' in platform
+    assert "\\" not in platform
 
 
 def test_persisted_instruction_patches_preserve_fc_configuration(tmp_path):
@@ -420,6 +567,11 @@ def test_persisted_instruction_patches_preserve_fc_configuration(tmp_path):
         for address, value in words:
             stream.seek(address - FLASH_BASE)
             stream.write(struct.pack("<H", value))
+        for address in patches.usb_sof_interval_compares:
+            stream.seek(address - FLASH_BASE)
+            stream.write(struct.pack("<H", 0x2B00))
+        stream.seek(patches.gyro_sample_rate_setup - FLASH_BASE)
+        stream.write(flight_controller.BETAFLIGHT_GYRO_RATE_1KHZ)
 
     # Both the recognizer and image identity check accept their own complete,
     # exact persisted patches.  Saved settings must not be factory-reset.

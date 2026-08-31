@@ -6,6 +6,7 @@ import sys
 
 import pytest
 
+from escsim.renode import process as process_module
 from escsim.renode.monitor import (
     clean_monitor_text,
     parse_elapsed,
@@ -146,6 +147,26 @@ def test_process_tree_starts_and_stops():
     assert not tree.running()
 
 
+def test_windows_process_windows_are_hidden(monkeypatch):
+    class StartupInfo:
+        dwFlags = 0
+        wShowWindow = None
+
+    monkeypatch.setattr(process_module.os, "name", "nt")
+    monkeypatch.setattr(
+        process_module.subprocess, "STARTUPINFO", StartupInfo, raising=False
+    )
+    monkeypatch.setattr(
+        process_module.subprocess, "STARTF_USESHOWWINDOW", 0x00000001, raising=False
+    )
+    monkeypatch.setattr(process_module.subprocess, "SW_HIDE", 0, raising=False)
+
+    startupinfo = process_module.hidden_process_startupinfo()
+
+    assert startupinfo.dwFlags == 0x00000001
+    assert startupinfo.wShowWindow == 0
+
+
 def make_session_files(tmp_path):
     values = {}
     for name in (
@@ -203,6 +224,7 @@ def test_frozen_generator_command(monkeypatch):
 def test_generator_environment_supports_source_and_frozen(monkeypatch):
     monkeypatch.setenv("PYTHONPATH", "/existing")
     environment = generator_environment()
+    assert environment["PYTHONUNBUFFERED"] == "1"
     assert environment["PYTHONPATH"].endswith("/existing")
     assert "src" in environment["PYTHONPATH"].split(os.pathsep)[0]
 

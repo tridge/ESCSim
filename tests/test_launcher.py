@@ -3,7 +3,25 @@ from __future__ import annotations
 import socket
 from types import SimpleNamespace
 
-from escsim.gui import Lab
+from escsim.gui import (
+    DEFAULT_GUI_PORT,
+    DEFAULT_MONITOR_PORT,
+    DEFAULT_STATE_PORT,
+    INSTANCE_PORT_STRIDE,
+    Lab,
+    MAX_ESC_COUNT,
+)
+
+
+def test_default_ports_avoid_windows_dynamic_exclusions():
+    # Windows' default dynamic range begins at 49152. Hyper-V and usbip can
+    # reserve large blocks there without a process owning a socket.
+    assert (DEFAULT_GUI_PORT, DEFAULT_STATE_PORT, DEFAULT_MONITOR_PORT) == (
+        47833,
+        47834,
+        47835,
+    )
+    assert DEFAULT_MONITOR_PORT + MAX_ESC_COUNT * INSTANCE_PORT_STRIDE < 49152
 
 
 def test_emulator_ports_bound_requires_both_udp_ports():

@@ -17,6 +17,9 @@ PUBLISH_CHANNEL ?= stable
 PUBLISH_JOBS ?= 8
 PUBLISH_RSYNC_FLAGS ?= -a --chmod=Du=rwx,Dgo=rx,Fu=rw,Fgo=r
 PARITY_OUTPUT ?= $(BUILD_DIR)/parity-all-mcus.json
+WIN11_HOST ?= win11
+WIN11_DIR ?= ESCSim-win11-build
+WIN11_PYTHON ?= ../ESCSim/.venv-win/Scripts/python.exe
 
 ifeq ($(OS),Windows_NT)
 NATIVE_NAME := am32sim.dll
@@ -30,7 +33,7 @@ NATIVE_LIBRARY := $(NATIVE_BUILD_DIR)/$(NATIVE_NAME)
 
 .DEFAULT_GOAL := all
 .PHONY: all native wheel test native-test python-test package windows-installer install \
-	parity-all-mcus windows-usbip-test publish clean
+	parity-all-mcus windows-usbip-test win11 publish clean
 
 all: native wheel
 
@@ -66,6 +69,38 @@ parity-all-mcus:
 
 windows-usbip-test:
 	$(PYTHON) scripts/run-windows-usbip-test.py
+
+# Synchronize the current working tree into a disposable directory on the
+# Windows lab host. Keep its build/dist caches between runs, but delete stale
+# source files. The existing Windows-native virtualenv supplies PySide6 and
+# PyInstaller without modifying the host's intentionally dirty ESCSim checkout.
+win11:
+	@case "$(WIN11_DIR)" in ESCSim-win11-*) ;; *) \
+		echo "WIN11_DIR must start with ESCSim-win11-" >&2; exit 2;; esac
+	ssh "$(WIN11_HOST)" 'mkdir -p "$(WIN11_DIR)"'
+	rsync -a --delete \
+		--exclude=/.git/ \
+		--exclude=/.venv*/ \
+		--exclude=/build/ \
+		--exclude=/dist/ \
+		--exclude=/.pytest_cache/ \
+		--exclude=/.ruff_cache/ \
+		--exclude='__pycache__/' \
+		--exclude='*.egg-info/' \
+		--exclude=/base.parm \
+		--exclude=/sb405.parm \
+		--exclude=/mav.parm \
+		--exclude='/mav.tlog*' \
+		"$(CURDIR)/" "$(WIN11_HOST):$(WIN11_DIR)/"
+	ssh "$(WIN11_HOST)" 'set -eu; \
+		cd "$(WIN11_DIR)"; \
+		test -x "$(WIN11_PYTHON)"; \
+		"$(WIN11_PYTHON)" -m pip install -e ".[test,gui]" pyinstaller; \
+		CC=x86_64-w64-mingw32-gcc make windows-installer \
+			PYTHON="$(WIN11_PYTHON)"; \
+		dist/ESCSim/ESCSim.exe targets status; \
+		printf "\nWindows installer ready: "; \
+		cygpath -w "$$PWD/dist/installer/ESCSim-installer.exe"'
 
 install: native
 	$(PYTHON) scripts/install-package.py --native "$(NATIVE_LIBRARY)" \

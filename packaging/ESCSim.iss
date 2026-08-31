@@ -38,13 +38,32 @@ Filename: "{app}\ESCSim.exe"; Description: "Launch ESCSim"; Flags: nowait postin
 [Code]
 const
   UsbipInstallerName = 'USBip-0.9.7.7-x64.exe';
+  UsbipUninstallKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{199505b0-b93d-4521-a8c7-897818e0205a}_is1';
 
 function UsbipReady(): Boolean;
 var
   Major, Minor, Revision, Build: Cardinal;
   VersionMS, VersionLS: Cardinal;
-  Executable: String;
+  Executable, InstalledVersion: String;
 begin
+  { usbip.exe does not contain a Windows file-version resource. Prefer the
+    version its installer records, while retaining the file check as a
+    fallback for copies installed without the upstream installer. }
+  if RegQueryStringValue(HKLM64, UsbipUninstallKey, 'DisplayVersion',
+                         InstalledVersion) then
+  begin
+    if InstalledVersion = '0.9.7.7' then
+    begin
+      Result := True;
+      Exit;
+    end;
+    if InstalledVersion = '0.9.7.8' then
+    begin
+      Result := False;
+      Exit;
+    end;
+  end;
+
   Executable := ExpandConstant('{autopf}\USBip\usbip.exe');
   Result := GetVersionNumbers(Executable, VersionMS, VersionLS);
   if not Result then
@@ -79,12 +98,12 @@ begin
 
   ExtractTemporaryFile(UsbipInstallerName);
   if Exec(ExpandConstant('{tmp}\' + UsbipInstallerName), '/NORESTART', '',
-          SW_SHOWNORMAL, ewWaitUntilTerminated, ResultCode) and
-     ((ResultCode = 0) or (ResultCode = 3010)) then
+          SW_SHOWNORMAL, ewNoWait, ResultCode) then
     SuppressibleMsgBox(
-      'usbip-win2 setup finished. Restart Windows before using ESCSim with ' +
-      'the browser USB configurator, even if the driver installer did not ' +
-      'request it.', mbInformation, MB_OK, IDOK)
+      'usbip-win2 setup started in a separate window. Finish that setup and ' +
+      'restart Windows before using ESCSim with the browser USB configurator, ' +
+      'even if the driver installer does not request it.',
+      mbInformation, MB_OK, IDOK)
   else
     SuppressibleMsgBox(
       'usbip-win2 setup could not be started. ESCSim is installed, but browser ' +

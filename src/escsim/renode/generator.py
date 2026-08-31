@@ -36,6 +36,7 @@ import struct
 import subprocess
 import sys
 
+from escsim.renode.process import hidden_process_startupinfo
 from escsim.settings import default_cache_dir
 from escsim.target.preprocessor import PreprocessorError, preprocess_macros
 from escsim.target.source import (
@@ -2962,7 +2963,19 @@ def renode_env(library=None):
     return env
 
 
-def renode_command(explicit, monitor_port, setup):
+def isolated_renode_config(config_root):
+    """Create a config whose command history is private to one emulator."""
+    config_root = os.path.abspath(os.fspath(config_root))
+    os.makedirs(config_root, exist_ok=True)
+    config_path = os.path.join(config_root, "config")
+    history_path = os.path.join(config_root, "history")
+    with open(config_path, "w", encoding="utf-8", newline="\n") as stream:
+        stream.write("[general]\n")
+        stream.write("history-path = %s\n" % history_path)
+    return config_path
+
+
+def renode_command(explicit, monitor_port, setup, config_path=None):
     """Build the Renode command with startup commands before the monitor.
 
     The Windows .NET launcher begins serving ``--port`` as soon as it sees
@@ -2971,8 +2984,12 @@ def renode_command(explicit, monitor_port, setup):
     other hosts and lets a headless Windows session boot independently.
     """
 
+    command = [find_renode(explicit), "--disable-xwt"]
+    if config_path is not None:
+        command += ["--config", os.fspath(config_path)]
+    command += ["-e", setup]
     console = ["--port", str(monitor_port)] if monitor_port else ["--console"]
-    return [find_renode(explicit), "--disable-xwt", "-e", setup] + console
+    return command + console
 
 
 def launch_gui(port, state_port, can_bus=-1):
@@ -3616,8 +3633,15 @@ def main(argv=None):
 
     for c in args.commands:
         setup += "; %s" % c
-    cmd = renode_command(args.renode, args.monitor_port, setup)
+    config_path = isolated_renode_config(os.path.join(outdir, "renode-config"))
+    cmd = renode_command(args.renode, args.monitor_port, setup, config_path)
     call_args = {"env": renode_env()}
+    startupinfo = hidden_process_startupinfo()
+    if startupinfo is not None:
+        # Renode needs a console object for its monitor shell even when all
+        # interaction is redirected. Hide that console instead of suppressing
+        # its creation, which leaves the monitor listeners unresponsive.
+        call_args["startupinfo"] = startupinfo
     if args.cpusel is not None:
         # Apply affinity in the forked child immediately before exec. The
         # motor simulator is a shared library inside Renode, so it shares

@@ -46,7 +46,8 @@ namespace Antmicro.Renode.Peripherals.USB
                 outEndpoints[endpoint] = new EndpointState();
             }
 
-            USBCore = new USBDeviceCore(this, customSetupPacketHandler: HandleSetupPacket);
+            USBCore = new USBDeviceCore(this,
+                customSetupPacketHandler: HandleFirmwareSetupPacket);
             USBCore.WithConfiguration(configure: configuration =>
                 configuration.WithInterface(configure: iface =>
                 {
@@ -74,6 +75,20 @@ namespace Antmicro.Renode.Peripherals.USB
             Reset();
         }
 
+        public void SetSOFInterval(uint frames)
+        {
+            if(frames == 0)
+            {
+                throw new ArgumentException("USB SOF interval must be positive");
+            }
+            lock(sync)
+            {
+                sofFrameStep = (int)frames;
+                sofTimer.Limit = frames;
+                sofTimer.ResetValue();
+            }
+        }
+
         public void Reset()
         {
             lock(sync)
@@ -81,6 +96,7 @@ namespace Antmicro.Renode.Peripherals.USB
                 if(connected)
                 {
                     SetUSBIPConnected(false);
+                    usbConnectionGeneration++;
                 }
                 registers.Clear();
                 rxQueue.Clear();
@@ -88,6 +104,7 @@ namespace Antmicro.Renode.Peripherals.USB
                 Array.Clear(activeOut, 0, activeOut.Length);
                 activeRx = null;
                 setupResponse = null;
+                pendingSetup.Clear();
                 setupResponseData.Clear();
                 setupAdditionalData = Array.Empty<byte>();
                 setupAdditionalOffset = 0;
@@ -227,13 +244,82 @@ namespace Antmicro.Renode.Peripherals.USB
 
         public USBDeviceCore USBCore { get; }
 
+        public void RegisterUSBIP()
+        {
+            var host = EmulationManager.Instance.CurrentEmulation.HostMachine;
+            var server = host.TryGetByName("usb", out var found);
+            if(!found)
+            {
+                throw new InvalidOperationException(
+                    "Renode USB/IP server named 'usb' was not found");
+            }
+            if(usbipRegistered)
+            {
+                return;
+            }
+            RegisterUSBIPServer(server);
+            usbipRegistered = true;
+        }
+
+        public uint USBIPReady()
+        {
+            lock(sync)
+            {
+                return connected ? 1u : 0u;
+            }
+        }
+
+        public uint USBIPConnectionState()
+        {
+            lock(sync)
+            {
+                return (usbConnectionGeneration << 1) |
+                    (connected ? 1u : 0u);
+            }
+        }
+
+        private void RegisterUSBIPServer(object server)
+        {
+            foreach(var method in server.GetType().GetMethods())
+            {
+                var parameters = method.GetParameters();
+                if(method.Name != "Register" || parameters.Length != 2 ||
+                    parameters[1].ParameterType != typeof(int) ||
+                    !parameters[0].ParameterType.IsInstanceOfType(this))
+                {
+                    continue;
+                }
+                method.Invoke(server, new object[] { this, 0 });
+                return;
+            }
+            throw new InvalidOperationException(
+                "Renode USB/IP server has no compatible Register method");
+        }
+
         public GPIO IRQ { get; }
 
         public long Size => 0x40000;
 
-        private void HandleSetupPacket(SetupPacket packet,
+        private void HandleFirmwareSetupPacket(SetupPacket packet,
             byte[] additionalData, Action<byte[]> response)
         {
+            // Windows sends the CDC line-coding sequence while opening a COM
+            // port.  It is transport bookkeeping rather than a descriptor or
+            // mode decision, and usbip-win2 can repeat it after the firmware's
+            // CDC request buffer has already been released.  Complete these
+            // requests locally so the host open cannot wedge the control
+            // pipe.  Other interface classes (notably MSC and DFU) continue
+            // through the firmware below.
+            if(packet.Type == PacketType.Class &&
+                packet.Recipient == PacketRecipient.Interface &&
+                cdcControlInterfaces.Contains(packet.Index))
+            {
+                response(packet.Direction == Direction.DeviceToHost &&
+                    packet.Request == CdcGetLineCoding
+                        ? new byte[CdcLineCodingLength]
+                        : Array.Empty<byte>());
+                return;
+            }
             machine.LocalTimeSource.ExecuteInNearestSyncedState(_ =>
             {
                 lock(sync)
@@ -243,13 +329,17 @@ namespace Antmicro.Renode.Peripherals.USB
                         this.Log(LogLevel.Warning,
                             "USB setup packet received while disconnected");
                     }
-                    // A USB/IP import represents a remote device which has
-                    // already been assigned an address, so vhci_hcd does not
-                    // forward the physical bus's SET_ADDRESS request.  The
-                    // STM32 device firmware still needs to see that request
-                    // before it will accept SET_CONFIGURATION.  Inject it
-                    // once, then resume the host's first setup transaction.
-                    if(!firmwareAddressAssigned)
+                    // USB/IP reads descriptors from the device before import,
+                    // while it is still at address zero.  After import the
+                    // remote device is already addressed, so vhci_hcd does
+                    // not forward the physical bus's SET_ADDRESS request.
+                    // Inject it immediately before the first non-descriptor
+                    // request (normally SET_CONFIGURATION), preserving real
+                    // enumeration order from the firmware's perspective.
+                    if(!firmwareAddressAssigned &&
+                        !(packet.Type == PacketType.Standard &&
+                          packet.Request ==
+                            (byte)StandardRequest.GetDescriptor))
                     {
                         firmwareAddressAssigned = true;
                         var addressPacket = new SetupPacket
@@ -263,8 +353,8 @@ namespace Antmicro.Renode.Peripherals.USB
                             Count = 0,
                         };
                         QueueSetupPacket(addressPacket, Array.Empty<byte>(),
-                            _ => HandleSetupPacket(packet, additionalData,
-                                response));
+                            _ => { });
+                        QueueSetupPacket(packet, additionalData, response);
                         return;
                     }
                     QueueSetupPacket(packet, additionalData, response);
@@ -275,14 +365,26 @@ namespace Antmicro.Renode.Peripherals.USB
         private void QueueSetupPacket(SetupPacket packet,
             byte[] additionalData, Action<byte[]> response)
         {
-            inEndpoints[0].Control &= ~EndpointStall;
-            outEndpoints[0].Control &= ~EndpointStall;
             if(setupResponse != null)
             {
-                this.Log(LogLevel.Warning,
-                    "Replacing an unfinished USB setup transaction");
-                setupResponse(Array.Empty<byte>());
+                this.Log(LogLevel.Debug,
+                    "Queueing USB setup request 0x{0:X2} behind active transaction",
+                    packet.Request);
+                pendingSetup.Enqueue(new PendingSetupPacket(packet,
+                    additionalData, response));
+                return;
             }
+            StartSetupPacket(packet, additionalData, response);
+        }
+
+        private void StartSetupPacket(SetupPacket packet,
+            byte[] additionalData, Action<byte[]> response)
+        {
+            inEndpoints[0].Control &= ~EndpointStall;
+            outEndpoints[0].Control &= ~EndpointStall;
+            this.Log(LogLevel.Debug,
+                "Starting USB setup request 0x{0:X2} ({1} queued)",
+                packet.Request, pendingSetup.Count);
             setupResponse = response;
             setupConfigurationDescriptor =
                 packet.Type == PacketType.Standard &&
@@ -311,6 +413,28 @@ namespace Antmicro.Renode.Peripherals.USB
                 encoded,
                 () => SetOutInterrupt(0, SetupInterrupt)));
             UpdateInterrupts();
+        }
+
+        private void CompleteSetupPacket(byte[] responseData)
+        {
+            var response = setupResponse;
+            setupResponse = null;
+            setupConfigurationDescriptor = false;
+            setupResponseData.Clear();
+            setupAdditionalData = Array.Empty<byte>();
+            setupAdditionalOffset = 0;
+            setupExpectedLength = 0;
+            this.Log(LogLevel.Debug,
+                "Completed USB setup transaction ({0} queued)",
+                pendingSetup.Count);
+            response(responseData);
+
+            if(setupResponse == null && pendingSetup.Count != 0)
+            {
+                var next = pendingSetup.Dequeue();
+                StartSetupPacket(next.Packet, next.AdditionalData,
+                    next.Response);
+            }
         }
 
         private void QueueHostData(byte endpoint, byte[] data)
@@ -472,10 +596,7 @@ namespace Antmicro.Renode.Peripherals.USB
                 if(endpoint == 0 && input &&
                     (value & EndpointStall) != 0 && setupResponse != null)
                 {
-                    var response = setupResponse;
-                    setupResponse = null;
-                    setupResponseData.Clear();
-                    response(Array.Empty<byte>());
+                    CompleteSetupPacket(Array.Empty<byte>());
                 }
                 if((value & EndpointDisable) != 0)
                 {
@@ -544,10 +665,7 @@ namespace Antmicro.Renode.Peripherals.USB
                     {
                         ConfigureInEndpointReads(responseData);
                     }
-                    setupResponse = null;
-                    setupConfigurationDescriptor = false;
-                    setupResponseData.Clear();
-                    response(responseData);
+                    CompleteSetupPacket(responseData);
                 }
             }
             else if(data.Length != 0 ||
@@ -567,6 +685,7 @@ namespace Antmicro.Renode.Peripherals.USB
 
         private void ConfigureInEndpointReads(byte[] descriptor)
         {
+            cdcControlInterfaces.Clear();
             for(var endpoint = 1; endpoint < EndpointCount; endpoint++)
             {
                 usbInEndpoints[endpoint].NonBlocking = true;
@@ -585,6 +704,10 @@ namespace Antmicro.Renode.Peripherals.USB
                 var type = descriptor[offset + 1];
                 if(type == InterfaceDescriptorType && length >= 9)
                 {
+                    if(descriptor[offset + 5] == CdcControlClass)
+                    {
+                        cdcControlInterfaces.Add(descriptor[offset + 2]);
+                    }
                     massStorageInterface =
                         descriptor[offset + 5] == MassStorageClass;
                 }
@@ -782,6 +905,7 @@ namespace Antmicro.Renode.Peripherals.USB
             {
                 return;
             }
+            usbConnectionGeneration++;
             sofTimer.Enabled = true;
             USBCore.Address = 0;
             USBCore.SelectedConfiguration = genericConfiguration;
@@ -795,6 +919,7 @@ namespace Antmicro.Renode.Peripherals.USB
             if(connected)
             {
                 SetUSBIPConnected(false);
+                usbConnectionGeneration++;
             }
             connected = false;
             sofTimer.Enabled = false;
@@ -806,6 +931,12 @@ namespace Antmicro.Renode.Peripherals.USB
             var server = host.TryGetByName("usb", out var found);
             if(!found)
             {
+                return false;
+            }
+            if(!usbipRegistered)
+            {
+                this.Log(LogLevel.Error,
+                    "USB/IP device was not registered before emulation start");
                 return false;
             }
             var setConnected =
@@ -850,7 +981,7 @@ namespace Antmicro.Renode.Peripherals.USB
 
         private void HandleStartOfFrame()
         {
-            frameNumber = (frameNumber + 1) & FrameNumberMask;
+            frameNumber = (frameNumber + sofFrameStep) & FrameNumberMask;
             if(!connected)
             {
                 return;
@@ -994,10 +1125,14 @@ namespace Antmicro.Renode.Peripherals.USB
         private readonly EndpointState[] inEndpoints;
         private readonly EndpointState[] outEndpoints;
         private readonly USBEndpoint[] usbInEndpoints;
+        private readonly HashSet<ushort> cdcControlInterfaces =
+            new HashSet<ushort>();
         private readonly Queue<ReceivePacket> rxQueue =
             new Queue<ReceivePacket>();
         private readonly Queue<HostPacket> pendingOut =
             new Queue<HostPacket>();
+        private readonly Queue<PendingSetupPacket> pendingSetup =
+            new Queue<PendingSetupPacket>();
         private readonly HostPacket[] activeOut =
             new HostPacket[EndpointCount];
         private readonly USBConfiguration genericConfiguration;
@@ -1015,7 +1150,10 @@ namespace Antmicro.Renode.Peripherals.USB
         private int setupExpectedLength;
         private bool firmwareAddressAssigned;
         private int frameNumber;
+        private int sofFrameStep = 1;
         private bool connected;
+        private uint usbConnectionGeneration;
+        private bool usbipRegistered;
         private bool enumerateAfterReset;
         private uint fifoReadyMask;
 
@@ -1027,6 +1165,9 @@ namespace Antmicro.Renode.Peripherals.USB
         private const int InterfaceDescriptorType = 4;
         private const int EndpointDescriptorType = 5;
         private const int MassStorageClass = 8;
+        private const int CdcControlClass = 2;
+        private const byte CdcGetLineCoding = 0x21;
+        private const int CdcLineCodingLength = 7;
         private const int EndpointAddressMask = 0x0F;
         private const int EndpointDirectionIn = 0x80;
         private const long AhbConfiguration = 0x008;
@@ -1084,6 +1225,32 @@ namespace Antmicro.Renode.Peripherals.USB
         private const uint SetupDataStatus = 6;
         private const int FrameNumberShift = 8;
         private const int FrameNumberMask = 0x3FF;
+
+        private sealed class PendingSetupPacket
+        {
+            public PendingSetupPacket(SetupPacket packet,
+                byte[] additionalData, Action<byte[]> response)
+            {
+                Packet = new SetupPacket
+                {
+                    Recipient = packet.Recipient,
+                    Type = packet.Type,
+                    Direction = packet.Direction,
+                    Request = packet.Request,
+                    Value = packet.Value,
+                    Index = packet.Index,
+                    Count = packet.Count,
+                };
+                AdditionalData = additionalData == null
+                    ? Array.Empty<byte>()
+                    : (byte[])additionalData.Clone();
+                Response = response;
+            }
+
+            public readonly SetupPacket Packet;
+            public readonly byte[] AdditionalData;
+            public readonly Action<byte[]> Response;
+        }
 
         private class EndpointState
         {
@@ -1148,4 +1315,5 @@ namespace Antmicro.Renode.Peripherals.USB
             public int Offset { get; set; }
         }
     }
+
 }

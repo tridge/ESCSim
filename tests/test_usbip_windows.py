@@ -65,6 +65,21 @@ def test_windows_attach_rejects_noisy_output(monkeypatch):
         usbip._windows_attach("127.0.0.1", 49152, "1-1")
 
 
+def test_windows_attach_recommends_reboot_for_stopped_host_controller(monkeypatch):
+    monkeypatch.setattr(
+        usbip, "_windows_usbip_checked", lambda: ("usbip.exe", (0, 9, 7, 7))
+    )
+    monkeypatch.setattr(
+        usbip.subprocess,
+        "run",
+        lambda *args, **kwargs: completed(
+            stderr="error: VHCI device not found, driver not loaded?", returncode=1
+        ),
+    )
+    with pytest.raises(RuntimeError, match="reboot Windows"):
+        usbip._windows_attach("127.0.0.1", 49152, "1-1")
+
+
 def test_unsafe_usbip_win2_release_is_rejected(monkeypatch):
     monkeypatch.setattr(usbip, "windows_usbip_executable", lambda: "usbip.exe")
     monkeypatch.setattr(
@@ -101,6 +116,20 @@ def test_windows_com_discovery_matches_identity(monkeypatch):
         sys.modules, "serial.tools", SimpleNamespace(list_ports=fake_list_ports)
     )
     assert usbip.find_tty("RENODE", timeout=0) == "COM12"
+
+
+def test_windows_firmware_com_discovery_uses_pre_attach_snapshot(monkeypatch):
+    ports = [
+        SimpleNamespace(device="COM8"),
+        SimpleNamespace(device="COM12"),
+    ]
+    fake_list_ports = SimpleNamespace(comports=lambda: ports)
+    monkeypatch.setattr(usbip, "IS_WINDOWS", True)
+    monkeypatch.setitem(
+        sys.modules, "serial.tools", SimpleNamespace(list_ports=fake_list_ports)
+    )
+
+    assert usbip.find_new_tty({"COM8"}, timeout=0) == "COM12"
 
 
 def test_bulk_out_completion_reports_consumed_length():

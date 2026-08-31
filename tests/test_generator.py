@@ -109,6 +109,17 @@ def test_renode_setup_precedes_monitor_listener():
     ]
 
 
+def test_renode_config_isolates_command_history(tmp_path):
+    config_root = tmp_path / "renode-config"
+
+    config = generator.isolated_renode_config(config_root)
+
+    assert config == str(config_root / "config")
+    assert Path(config).read_text() == (
+        "[general]\nhistory-path = %s\n" % (config_root / "history").resolve()
+    )
+
+
 def test_renode_execfile_uses_unescaped_path():
     expression = generator.renode_execfile(r"C:\Users\test user\ESCSim\work\status.py")
     assert "\\" not in expression

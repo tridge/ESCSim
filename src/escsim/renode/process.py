@@ -7,6 +7,21 @@ import subprocess
 import time
 
 
+def hidden_process_creationflags():
+    """Windows flags for a short helper that needs no console object."""
+    return subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+
+def hidden_process_startupinfo(startupinfo=None):
+    """Hide a Windows console window while retaining its console semantics."""
+    if os.name != "nt":
+        return startupinfo
+    startupinfo = startupinfo or subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = subprocess.SW_HIDE
+    return startupinfo
+
+
 class _WindowsJob:
     """A Job Object whose members are killed when the handle is closed."""
 
@@ -100,6 +115,9 @@ class ProcessTree:
             kwargs["creationflags"] = (
                 kwargs.get("creationflags", 0) | subprocess.CREATE_NEW_PROCESS_GROUP
             )
+            kwargs["startupinfo"] = hidden_process_startupinfo(
+                kwargs.get("startupinfo")
+            )
         else:
             kwargs["start_new_session"] = True
         self.process = subprocess.Popen(command, **kwargs)
@@ -126,6 +144,7 @@ class ProcessTree:
                     check=False,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
+                    creationflags=hidden_process_creationflags(),
                 )
                 try:
                     process.wait(timeout=graceful_timeout)

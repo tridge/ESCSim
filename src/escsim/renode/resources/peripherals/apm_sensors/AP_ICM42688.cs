@@ -152,6 +152,13 @@ namespace Antmicro.Renode.Peripherals.Sensors
             case 4: sampleTimer.Limit = 250; break;  // 4 kHz
             case 5: sampleTimer.Limit = 500; break;  // 2 kHz
             case 6: sampleTimer.Limit = 1000; break; // 1 kHz
+            case 7: sampleTimer.Limit = 5000; break; // 200 Hz
+            case 8: sampleTimer.Limit = 10000; break; // 100 Hz
+            case 9: sampleTimer.Limit = 20000; break; // 50 Hz
+            case 10: sampleTimer.Limit = 40000; break; // 25 Hz
+            case 11: sampleTimer.Limit = 80000; break; // 12.5 Hz
+            case 13: sampleTimer.Limit = 320000; break; // 3.125 Hz
+            case 15: sampleTimer.Limit = 2000; break; // 500 Hz
             }
         }
 

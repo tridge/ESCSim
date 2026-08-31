@@ -23,6 +23,9 @@ def generator_command() -> list[str]:
 def generator_environment() -> dict[str, str]:
     """Environment in which the internal generator can import this package."""
     environment = os.environ.copy()
+    # The GUI consumes this pipe line-by-line and mirrors it to a line-buffered
+    # log. Do not let a source-mode Python generator retain output in blocks.
+    environment["PYTHONUNBUFFERED"] = "1"
     if not getattr(sys, "frozen", False):
         source_root = str(Path(__file__).resolve().parents[2])
         existing = environment.get("PYTHONPATH")
@@ -120,6 +123,7 @@ class RenodeSession:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            bufsize=1,
             errors="replace",
             env=generator_environment(),
         )
