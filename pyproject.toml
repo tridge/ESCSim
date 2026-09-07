@@ -60,7 +60,13 @@ addopts = "-ra"
 testpaths = ["tests"]
 
 [tool.ruff]
-extend-exclude = ["src/escsim/renode/resources/scripts"]
+extend-exclude = [
+    "src/escsim/renode/resources/scripts",
+    # the SITL tooling and the pinned firmware checkouts keep the AM32
+    # repository's own style
+    "SITL",
+    "modules",
+]
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F"]

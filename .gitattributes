@@ -1,3 +1,6 @@
 # Keep the bundled upstream snapshot byte-for-byte identical to its recorded
 # SHA-256, including upstream trailing whitespace.
 src/escsim/resources/default-targets.h -whitespace
+
+# the SITL GUI launcher is run from cmd.exe
+*.bat text eol=crlf

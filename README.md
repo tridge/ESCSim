@@ -69,6 +69,30 @@ cache as ArduPilot's Renode launcher. Versioned firmware/bootloader downloads
 and the artifact publisher are covered in
 [docs/artifact-repository.md](docs/artifact-repository.md).
 
+## SITL
+
+Alongside the Renode emulation, `SITL/` holds everything around AM32's
+native software-in-the-loop simulator: the motor/battery models, the
+calibration datasets captured from real hardware, the Qt control GUI,
+the DroneCAN measurement and capture tools and the test suites. The
+simulator itself is C in the firmware repo (`Mcu/SITL`) and is built
+from the pinned submodule:
+
+```sh
+git submodule update --init modules/am32-firmware modules/am32-bootloader
+make sitl-test
+```
+
+`AM32_ROOT` selects a different firmware checkout, which is how AM32's
+own CI tests a branch against these models and tests:
+
+```sh
+AM32_ROOT=/path/to/AM32 python3 SITL/run_ci_tests.py
+```
+
+See [SITL/README.md](SITL/README.md) for the simulator's options, the
+GUI, and the calibration workflow.
+
 ## Licensing
 
 ESCSim is licensed under GPL-3.0-only. See [THIRD_PARTY.md](THIRD_PARTY.md)

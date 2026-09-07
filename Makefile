@@ -21,6 +21,9 @@ WIN11_HOST ?= win11
 WIN11_DIR ?= ESCSim-win11-build
 WIN11_PYTHON ?= ../ESCSim/.venv-win/Scripts/python.exe
 XEPHYR_WEBSERIAL_ARGS ?=
+# the AM32 firmware checkout the SITL simulator is built from
+AM32_ROOT ?= $(CURDIR)/modules/am32-firmware
+SITL_MAKE_FLAGS ?=
 
 ifeq ($(OS),Windows_NT)
 NATIVE_NAME := am32sim.dll
@@ -34,7 +37,8 @@ NATIVE_LIBRARY := $(NATIVE_BUILD_DIR)/$(NATIVE_NAME)
 
 .DEFAULT_GOAL := all
 .PHONY: all native wheel test native-test python-test package windows-installer install \
-	parity-all-mcus windows-usbip-test xephyr xephyr-webserial win11 publish clean
+	parity-all-mcus windows-usbip-test xephyr xephyr-webserial win11 publish clean \
+	sitl sitl-test sitl-gui
 
 all: native wheel
 
@@ -55,6 +59,18 @@ native-test:
 
 python-test:
 	$(PYTHON) -m pytest
+
+# the SITL simulator: built in the firmware checkout, driven from here.
+# SITL_MAKE_FLAGS passes the build variants through, eg
+#   make sitl-test SITL_MAKE_FLAGS=SITL_SANITIZE=address
+sitl:
+	$(MAKE) -C $(AM32_ROOT) AM32_SITL_CAN $(SITL_MAKE_FLAGS)
+
+sitl-test: sitl
+	AM32_ROOT=$(AM32_ROOT) $(PYTHON) SITL/run_ci_tests.py
+
+sitl-gui: sitl
+	AM32_ROOT=$(AM32_ROOT) $(PYTHON) SITL/sitl_gui.py
 
 package:
 	$(PYTHON) scripts/build-package.py --configuration $(CONFIGURATION)
