@@ -45,8 +45,11 @@ jobs:
         run: make -C modules/am32-firmware AM32_SITL_CAN ${{ matrix.sanitize && format('SITL_SANITIZE={0}', matrix.sanitize) || '' }}
 
       # the 4-way passthrough and direct serial tests boot through the
-      # bootloader, as a configurator does
+      # bootloader, as a configurator does. The bootloader SITL needs the
+      # fixed low flash mapping, which macOS does not allow, so upstream
+      # excludes SITL_CAN there and those two tests skip on macOS
       - name: Check out and build the bootloader
+        if: runner.os == 'Linux'
         run: |
           git submodule update --init --depth 1 modules/am32-bootloader
           make -C modules/am32-bootloader AM32_SITL_BOOTLOADER_PB4_CAN
@@ -66,7 +69,7 @@ jobs:
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: |
           mkdir sitl_test_run && cd sitl_test_run
-          python3 ../SITL/run_ci_tests.py --bootloader
+          python3 ../SITL/run_ci_tests.py ${{ runner.os == 'Linux' && '--bootloader' || '' }}
 
       - name: Upload SITL log on failure
         if: failure()

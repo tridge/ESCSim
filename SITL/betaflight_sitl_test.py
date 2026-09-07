@@ -49,15 +49,58 @@ def main():
             assert data[2:3] == b'>', (cmd, data)
             return data[5:-1] if version == 1 else data[8:-1]
 
+        def sim_now():
+            """the simulator's own clock, or None before it streams"""
+            with stream.lock:
+                return stream.samples[-1][0] if stream.samples else None
+
+        def sim_elapsed(mark):
+            """simulated seconds since mark, tolerating a reboot: a reset
+            restarts the simulator at t=0, so treat a clock that went
+            backwards as a fresh mark rather than as negative time"""
+            now = sim_now()
+            if now is None or mark is None:
+                return None, mark
+            if now < mark:
+                return 0.0, now
+            return now - mark, mark
+
         def wait_for(description, predicate, timeout=12):
-            deadline = time.monotonic() + timeout
-            while time.monotonic() < deadline:
+            """wait `timeout` simulated seconds for a condition.
+
+            The ESC experiences simulated time, and under CPU contention
+            the simulator falls behind the wall clock - so a wall-clock
+            deadline silently shortens the experiment on a loaded runner
+            instead of just taking longer. The wall-clock limit is only a
+            backstop for the state stream stopping altogether.
+            """
+            mark = sim_now()
+            wall_deadline = time.monotonic() + timeout * 8 + 30
+            while True:
                 request(150)  # normal app background polling
                 if predicate():
                     print('PASS: ' + description, flush=True)
                     return
+                elapsed, mark = sim_elapsed(mark)
+                if mark is None:
+                    mark = sim_now()
+                if elapsed is not None and elapsed > timeout:
+                    raise AssertionError(description)
+                if time.monotonic() > wall_deadline:
+                    raise AssertionError(description + ' (no simulator state)')
                 time.sleep(0.1)
-            raise AssertionError(description)
+
+        def sim_sleep(seconds):
+            """let `seconds` of simulated time pass"""
+            mark = sim_now()
+            wall_deadline = time.monotonic() + seconds * 8 + 30
+            while time.monotonic() < wall_deadline:
+                elapsed, mark = sim_elapsed(mark)
+                if mark is None:
+                    mark = sim_now()
+                if elapsed is not None and elapsed >= seconds:
+                    return
+                time.sleep(0.05)
 
         try:
             wait_for('bidirectional DShot and EDT from firmware', lambda: fc.edt_seen and fc.temp > 0 and fc.volt_raw > 0)
@@ -78,11 +121,13 @@ def main():
                 return data
             fc.port.get_replies = observed
             request(0x3003, bytes([1, 255, 1, 14]), 2)
-            time.sleep(1)
+            # let the disable take effect and the frames already on the wire
+            # drain, measured on the simulator's clock
+            sim_sleep(1.0)
             after = time.monotonic()
             for _ in range(20):
                 request(139)
-                time.sleep(0.1)
+                sim_sleep(0.1)
             kinds = []
             while not replies.empty():
                 stamp, kind = replies.get()
@@ -103,8 +148,10 @@ def main():
             wait_for('stop before bidirectional setting change', lambda: fc.rpm == 0)
             request(222, struct.pack('<HHHBB', 1070, 2000, 1000, 14, 0))
             request(250); request(68)
+            # the ESC restarts to detect the new signal; give it that in
+            # simulated time, not wall time
             for _ in range(35):
-                request(150); time.sleep(0.1)
+                request(150); sim_sleep(0.1)
             request(214, struct.pack('<H', 1400))
             wait_for('normal DShot runs with bidirectional disabled',
                      lambda: bool(stream.samples) and abs(stream.samples[-1][1]) > 150)
@@ -115,6 +162,7 @@ def main():
             request(214, struct.pack('<H', 1400))
             wait_for('motor runs after bidirectional re-enable', lambda: fc.rpm > 1500)
             # Simulate a vanished browser: no polling or motor requests.
+            # The stub's own cutoff is on the wall clock, so this wait is too
             time.sleep(3)
             assert fc.motor_value == 1000
             print('PASS: lost MSP connection stops motor output', flush=True)
