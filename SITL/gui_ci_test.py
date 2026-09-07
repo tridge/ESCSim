@@ -111,6 +111,10 @@ def test_launcher(args, env):
             send('ds_bidir 1', 0.1)
             send('ds_enable 1', 4.0)
             send('sim_status')
+            # no bootloader in the panel, so a USB mode has nothing to
+            # configure: it must say so rather than come up dead
+            send('usb 1', 1.0)
+            send('usb_status', 1.0)
             send('sim_log')
             send('sim_stop')
             send('quit')
@@ -136,9 +140,107 @@ def test_launcher(args, env):
         check('GUI-launched SITL stays alive',
               'simulator exited with status' not in log,
               log[-300:] or 'clean')
+        usb = [r for r in responses if r.startswith('STATUS usb:')]
+        if sys.platform.startswith(('linux', 'win')):
+            check('GUI usb needs a bootloader',
+                  bool(usb) and 'no bootloader' in usb[-1],
+                  usb[-1] if usb else 'no status')
+        else:
+            check('GUI reports unsupported USB platform',
+                  bool(usb) and 'USB requires Linux or Windows' in usb[-1],
+                  usb[-1] if usb else 'no status')
         out = gui.stdout.read() if gui.stdout else ''
         check('launcher GUI no tracebacks', 'Traceback' not in out,
               out[-300:] if 'Traceback' in out else 'clean')
+
+
+def test_usb(args, env):
+    """pick each USB mode in the GUI: the virtual device and whatever
+    sits behind it (the fake FC for 4-way, the linker bridge for direct
+    serial) has to come up (or fail cleanly, since the attach wants
+    vhci_hcd and root) without hanging the UI, switching between the two
+    has to swap the device, and going back to none has to give the port
+    back"""
+    if not sys.platform.startswith('linux'):
+        print('SKIP: gui usb, linux only')
+        return
+    control_port = free_control_port()
+    gui = subprocess.Popen(
+        [args.gui_python, os.path.join(HERE, 'sitl_gui.py'),
+         '--control-port', str(control_port),
+         '--port', '29933', '--state-port', '29934', '--can-uri', 'none'],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+    responses = []
+    sock = None
+    try:
+        deadline = time.time() + 45
+        while time.time() < deadline:
+            try:
+                sock = socket.create_connection(('127.0.0.1', control_port),
+                                                timeout=5)
+                break
+            except OSError:
+                if gui.poll() is not None:
+                    break
+                time.sleep(1.0)
+        if sock is None:
+            check('GUI usb control port', False, 'GUI exit=%s' % gui.poll())
+            return
+        sock.settimeout(None)
+        f = sock.makefile('r')
+        threading.Thread(target=lambda: [responses.append(ln.rstrip())
+                                         for ln in f], daemon=True).start()
+
+        def send(command, delay=0.2):
+            sock.sendall((command + '\n').encode())
+            time.sleep(delay)
+
+        def usb_state(timeout=30):
+            """the status line once it stops saying 'starting...'"""
+            end = time.time() + timeout
+            state = ''
+            while time.time() < end:
+                send('usb_status', 1.0)
+                hits = [r for r in responses if r.startswith('STATUS usb:')]
+                state = hits[-1][len('STATUS usb:'):].strip() if hits else ''
+                if state and state != 'starting...':
+                    break
+            return state
+
+        send('usb fourway', 1.0)
+        state = usb_state()
+        up = state.startswith('/dev')
+        check('GUI usb settles', up or state.startswith('failed:'),
+              'status=%r' % state)
+        if up:
+            # straight from one mode to the other: the old device has to
+            # go away and the new one come up on the same status line
+            del responses[:]
+            send('usb serial', 1.0)
+            state = usb_state()
+            check('GUI usb serial mode', state.startswith('/dev'),
+                  'status=%r' % state)
+            del responses[:]
+            send('usb 0', 2.0)
+            check('GUI usb releases the port', usb_state(10) == 'off',
+                  'status=%r' % usb_state(1))
+        else:
+            print('  (no attach here: %s)' % state)
+        send('quit')
+        gui.wait(timeout=20)
+    except (OSError, subprocess.TimeoutExpired) as ex:
+        check('GUI usb exits cleanly', False, str(ex))
+    finally:
+        if sock is not None:
+            sock.close()
+        if gui.poll() is None:
+            gui.kill()
+            gui.wait()
+    check('GUI usb exits cleanly', gui.returncode == 0,
+          'exit=%s' % gui.returncode)
+    out = gui.stdout.read() if gui.stdout else ''
+    check('GUI usb no tracebacks', 'Traceback' not in out,
+          out[-300:] if 'Traceback' in out else 'clean')
 
 
 def main():
@@ -151,6 +253,7 @@ def main():
 
     env = dict(os.environ)
     env['QT_QPA_PLATFORM'] = 'offscreen'
+    env['PYTHONFAULTHANDLER'] = '1'
     control_port = free_control_port()
 
     with Sitl(args.sitl, ['--can-uri', 'none', '--input-type', '1']):
@@ -192,7 +295,17 @@ def main():
         threading.Thread(target=reader, daemon=True).start()
 
         def send(cmd):
-            s.sendall((cmd + '\n').encode())
+            try:
+                s.sendall((cmd + '\n').encode())
+            except OSError:
+                print('GUI connection failed sending %r (exit=%s)' % (cmd, gui.poll()))
+                if gui.stdout:
+                    os.set_blocking(gui.stdout.fileno(), False)
+                    try:
+                        print(os.read(gui.stdout.fileno(), 65536).decode(errors='replace'))
+                    except BlockingIOError:
+                        pass
+                raise
 
         for delay, cmd in [
                 (0.1, 'ds_type dshot600'), (0.1, 'ds_bidir 1'),
@@ -283,6 +396,7 @@ def main():
               (out[-300:] if 'Traceback' in out else 'clean'))
 
     test_launcher(args, env)
+    test_usb(args, env)
 
     if failures:
         print('\n%d FAILED' % len(failures))

@@ -152,7 +152,126 @@ am32-bootloader repo), which bit-bangs the 4-way configuration protocol
 on the signal pin and detects the input type from the line state at
 boot; the main firmware ignores type 4 and uses type 5 only as the idle
 line level. The bootloader replies with type 4 packets carrying its
-serial output. `sitl_fourway.py` implements the 4-way client side.
+serial output. `sitl_fourway.py` implements the one-wire client side.
+
+### Configurators against the SITL
+
+There are two ways a configurator reaches an ESC, and the SITL emulates
+both. Through a flight controller it talks MSP, asks for BLHeli 4-way
+passthrough, and the FC translates each 4-way command into the ESC's
+one-wire bootloader protocol; `msp_stub_fc.py` is that flight
+controller. Direct - what the am32-configurator calls direct mode and
+the Offline-Configurator drives at 19200 baud - it talks the bootloader
+protocol itself, through a 1-wire USB linker soldered onto the signal
+wire; `sitl_serial_bridge.py` is that linker. Either way an unmodified
+configurator reads and writes the settings and flash of a simulated ESC.
+
+The GUI does all of this for you: give the **SITL process** panel a
+bootloader as well as a binary, start it, and pick **USB 4-way** or
+**USB serial** from the mode box. The status next to it becomes the
+serial port to hand to the configurator, and **No USB device** gives it
+back. Picking a mode for a simulator this GUI started without a
+bootloader is refused rather than left to fail silently - both modes
+end up at the ESC bootloader, and the application answers neither
+protocol. The rest of this section is what that does, for running it by
+hand.
+
+**USB serial (direct)** uses a separate linker USB identity so am32.ca
+automatically chooses its direct protocol at 19200 baud. After changing
+USB modes, use the browser's **Port select** to select the newly attached
+device before connecting. Direct mode reaches only the **Direct ESC** target.
+
+Run the SITL chained with the bootloader, then the stub:
+
+```
+obj/AM32_AM32_SITL_CAN_*.elf --can-uri none \
+    --bootloader <am32-bootloader>/obj/AM32_SITL_BOOTLOADER_PB4_CAN_*.elf
+python3 SITL/msp_stub_fc.py --no-motor --verbose
+```
+
+The stub prints the pty to use as the serial port, e.g.
+
+```
+SerialPortConnector_CLI settings /dev/pts/7
+```
+
+`--esc-ports` lists the input ports of several SITL instances to serve
+as separate ESCs on the 4-way interface, `--no-motor` leaves the DShot
+output off (it would otherwise share the signal wire with the 4-way
+session), and an ESC that is running the application instead of the
+bootloader is reset into it over the state port, the way a real FC
+power cycles one.
+
+#### Direct mode: the 1-wire linker
+
+`sitl_serial_bridge.py` takes the FC out of the picture and pipes the
+serial port straight to the signal wire:
+
+```
+python3 SITL/sitl_serial_bridge.py --verbose
+```
+
+It prints a pty the same way, takes the same `--usbip` options, and
+resets a running ESC into the bootloader on the first command just as
+the 4-way path does. Two details make it behave like the hardware
+rather than like a socket:
+
+- a real linker shorts TX to RX, so the host reads back everything it
+  sent before the ESC answers. Both configurators use that echo to find
+  the start of a response and the web one requires it, so the bridge
+  reproduces it. `--no-echo` turns it off for a client that cannot cope.
+- the echo comes back at 19200 baud, not instantly. The bootloader
+  separates a command from the buffer upload that follows it by the
+  line idle in between, and a configurator only sends that buffer once
+  it has read the echo of the command - so echoing early would let the
+  two run together into one frame the bootloader cannot parse. Bytes
+  the host hands over while the wire is still busy continue the current
+  frame; bytes that arrive after it has drained start a new one.
+
+#### A virtual USB serial device
+
+A pty is enough for tools that open a port by path, but not for a
+browser: Chrome's Web Serial only lists what the kernel enumerated as a
+USB serial device. `--usbip` therefore serves the same byte stream as a
+simulated USB CDC-ACM adapter over the USB/IP protocol
+(`sitl_usbip.py`), which the Linux `vhci_hcd` driver attaches as a real
+device:
+
+```
+sudo modprobe vhci_hcd
+python3 SITL/msp_stub_fc.py --usbip --attach --no-motor
+```
+
+The device then appears in `dmesg`, as `/dev/ttyACM*` and as
+`/dev/serial/by-id/usb-AM32_AM32_SITL_serial_SITL-if00`, and is
+indistinguishable from hardware to anything above the driver - Chrome
+included. It enumerates as pid.codes `1209:0001`, which the AM32
+configurator accepts as a flight controller. `sitl_serial_bridge.py`
+takes the same options and serves the same device.
+
+vhci_hcd is handed the socket to speak USB/IP over rather than opening
+it itself, and does not care what kind it is, so the export defaults to
+an abstract unix socket (`@am32-sitl-usbip.<uid>`): no port for anything
+to collide with, nothing reachable from the network, and nothing left in
+the filesystem if the process is killed. `--usbip-socket` names a
+different one, a name without a leading `@` being a filesystem path,
+which is the one to use when the socket should be protected by its
+permissions rather than open to the network namespace. `--usbip-port`
+exports over tcp instead, for a client on another machine or one that
+can only attach the `usbip` way.
+
+`--attach` does the import and the attach itself (re-running itself
+under sudo for the sysfs write, since only that needs root), so the
+usbip userspace package is not required; without it the command to run
+by hand is printed. `python3 SITL/sitl_usbip.py --detach` detaches
+everything again, as does `sudo usbip detach -p 0`.
+
+A second instance needs its own `--usbip-serial`, since udev names the
+`/dev/serial/by-id` link after the usb serial string.
+
+Windows has no equivalent in the box: attaching a remote USB/IP device
+needs a signed client driver, so a bridge or a virtual COM port driver
+is the practical route there for now.
 
 Tools in `SITL/`:
 
@@ -172,8 +291,13 @@ Tools in `SITL/`:
   on the ports this GUI drives, instead of starting it separately: pick
   the binary (one is bundled with the packaged build, or Browse), an
   eeprom and an optional bootloader, and Start; leave it stopped to
-  drive a simulator you ran yourself. The simulation panel also has
-  optional high rate views, both default off:
+  drive a simulator you ran yourself. The USB mode box in the same panel
+  presents the running ESC to configurators as a virtual USB serial
+  device (see above), either as **USB 4-way** through the fake flight
+  controller or as **USB serial** straight onto the signal wire; it
+  stops the DShot input while either is on, since a configurator
+  session and a DShot stream cannot share one signal wire. The
+  simulation panel also has optional high rate views, both default off:
   pyqtgraph scopes of the phase currents and the phase terminal
   voltages, each in its own window (sample period down to the 500ns
   physics step and adjustable window; the sample rate is automatically
@@ -207,6 +331,15 @@ python3 SITL/make_gui_env.py
   executable with the SITL bundled (so it runs the simulator out of the
   box); CI builds one for Linux and Windows. The UI backends
   live in `sitl_gui_backend.py`, UI-independent for headless tests
+- `sitl_serial_bridge.py` — 1-wire USB linker emulation: a serial port
+  (a pty, or a virtual USB serial device) piped straight to the signal
+  wire, which is the configurators' direct mode.
+- `msp_stub_fc.py` — fake Betaflight FC: MSP on a pty (or on a virtual
+  USB serial device, `sitl_usbip.py`), DShot to the SITL, and BLHeli
+  4-way passthrough to the simulated ESC bootloader
+  (`sitl_fourway_server.py`). Used by `SITL/scripts/esc_capture_fc.py` for
+  hardware-free telemetry capture and by configurators for settings and
+  flashing
 - `dshot_test.py` — headless scripted test (arming, throttle, EDT,
   bad-CRC injection), e.g.:
 
@@ -333,3 +466,126 @@ enough to reach states real silicon cannot, which used to show up as
 spurious desyncs. [TIMING-DESIGN.md](TIMING-DESIGN.md) is the design
 of the scheduler that makes the simulation immune to that, implemented
 in the firmware repo's `Mcu/SITL/Src/sitl_sched.c`.
+
+### Building the Windows ZIP locally
+
+From this checkout on Linux, run:
+
+```
+python3 SITL/build_win11.py
+```
+
+This copies the current working sources (including uncommitted edits) to
+`win11:am32-sitl-gui-build`, builds there through its Cygwin SSH shell, and
+retrieves `dist/am32-sitl-gui-windows.zip`. It does not commit or push.
+The remote machine needs Cygwin `gcc-core`, `make`, `python3`, `git`, `rsync`
+and native Windows Python 3.12 (`py -3.12`). The Python build environment is
+created automatically from `windows/requirements-build.txt`. The packaged
+GUI is tested before retrieving the ZIP; add `--test-usb` to also test a real
+virtual COM port when the bundled USBip driver is installed on the build host.
+Use `--host`, `--remote-dir`, `--python` or
+`--ssh-config` to override the defaults.
+
+The build fetches the latest upstream bootloader `master` on every run and
+logs the selected commit, so upstream regressions are caught by CI.
+Use `--bootloader-source modules/am32-bootloader` to test a different
+checkout, including its local edits. Select another Windows host firmware or bootloader
+with the GUI's Browse controls; ARM hardware ELF files cannot execute on the
+host. The packaged defaults include both host executables and their Cygwin
+runtime, so end users do not need development tools.
+
+The upstream bootloader includes Windows multicast support, seeded
+flash checksum recovery and the Cygwin linker settings for its 32-bit
+device-info addresses. Both executables use a separate `build/windows-obj`
+directory to keep Windows objects separate from other host builds. The
+bootloader's Windows objects are rebuilt from scratch on every run.
+
+CI runs the same script with `--local` under Cygwin, then uploads the common
+`dist/windows-package` contents as `am32-sitl-gui-windows`. The local ZIP and
+the CI download have the same layout and packaging inputs; their executable
+bytes and ZIP timestamps can differ with source, compiler and dependency
+versions. `package_windows.py` downloads the checksum-pinned USB/IP installer
+from the ArduPilot mirror and includes it with a CRLF `README.txt`. Install
+that prerequisite and reboot to enable the GUI's Windows COM port support.
+
+### Betaflight App
+
+Use the **ESCs** selector above the tabs to choose 1–8 independent ESCs;
+the default is one. Each **ESC N** tab has its own motor controls, plots,
+model and persistent EEPROM. Choosing or editing the SITL binary or bootloader
+in any tab selects it for all ESCs, including tabs added later. These changes
+apply when the simulators are next started. New tabs inherit ESC 1's input
+options. **Start all** and **Stop all** operate the whole
+bench; each tab also retains its individual Start/Stop buttons. DShot is
+the default launch input. Stop all simulations and select **No USB device**
+before changing the ESC count.
+
+The shared **USB 4-way** and **USB Betaflight** connections advertise the
+configured count to am32.ca and Betaflight. Motor/ESC numbers match the tab
+numbers. Direct USB wiring reaches only the ESC chosen in **Direct ESC**;
+select that target while USB is off. Disconnect the browser before changing
+USB modes. After editing ESC settings, use **Stop all**, then **Start all**
+to reload them.
+
+Extra EEPROM files use `.esc2.bin` through `.esc8.bin` beside the first
+default EEPROM and survive tab removal and recreation. Each ESC must use a
+different EEPROM file. Signal/state ports increase by 10 per ESC (default
+ESC 2: 57743/57744). CAN controls use separate multicast buses, starting at
+`--can-uri mcast:N` and increasing by one per tab, to avoid cross-control or
+node-ID collisions. Multiple tabs support multicast CAN or `--can-uri none`.
+Use `--esc-count 8` to start the GUI with eight tabs. The control socket
+accepts `esc 8 ds_value 500` to address a tab; unprefixed commands address
+ESC 1, while `esc_count`, `sim_start_all` and `sim_stop_all` address the bench.
+
+Betaflight USB mode uses the emulated STM32 VCP ID `0483:5740`, which
+Betaflight's default serial-port chooser accepts. The USB product remains
+`AM32 SITL serial`. After updating the Python sources, restart the GUI and
+select this mode again to re-enumerate the device with the new ID.
+
+Select **USB Betaflight (motor control)** in the GUI, start the simulator
+with **Input: DShot**, and connect [Betaflight App](https://app.betaflight.com)
+to the displayed serial port. The Setup tab reports a stationary, level
+accelerometer and gyro. In Motors, enable motor testing and use each motor's or
+the master slider. Leave throttle at zero for two seconds after startup.
+RPM, temperature, voltage and current are decoded from the simulated ESC's
+actual bidirectional DShot/EDT replies.
+
+The simulated FC supports MSP API 1.46, MSPv1, native MSPv2 and MSPv2-over-v1.
+Motors can select DSHOT150/300/600, bidirectional DShot and motor pole count,
+then Save and Reboot. Enable Auto-Connect in the app, or reconnect after
+reboot. Changing the DShot rate or polarity also restarts the simulated ESC
+to detect the new signal. The CLI supports `get`, `set`, `save`, `exit`, `version`
+and `status`, with `motor_pwm_protocol`, `dshot_bidir`, `dshot_edt`
+(OFF/ON/FORCE) and `motor_poles`. Betaflight also sends an EDT-enable command
+when motor testing starts, regardless of the saved `dshot_edt` setting.
+DShot direction commands reach AM32 through the simulated signal wire.
+
+GUI DShot and CAN controls are disabled while Betaflight owns motor control.
+The output stops after two seconds without MSP requests; CLI entry, reboot
+and 4-way passthrough also stop motor testing. Disconnect the app before
+switching USB modes. The existing USB 4-way mode remains available for ESC
+configuration and flashing without a motor command stream.
+
+FC settings persist in `<selected EEPROM>.fc.json`, separately from the
+AM32 EEPROM. Standalone `msp_stub_fc.py --config FILE` provides the same
+persistence. `--esc-ports` drives and reports up to eight ESCs; each state
+port defaults to the corresponding signal port plus the first ESC's
+state/signal port offset. Motor ordering is fixed in ESC tab order.
+PID/filter fields are retained for Motors
+tab compatibility; there is no flight dynamics or PID loop emulation.
+GPS/barometer/magnetometer, full CLI/configurator coverage, and Betaflight FC
+flashing are unsupported. A bootloader is needed for ESC passthrough, but
+not for Betaflight motor testing.
+
+Run the protocol regressions with:
+
+```sh
+python3 -m unittest discover -s SITL -t SITL -p test_msp_betaflight.py -v
+python3 SITL/multi_esc_gui_test.py
+python3 SITL/multi_esc_sitl_test.py
+```
+
+Pass `--bootloader PATH` to the multi-ESC integration test to also exercise
+4-way discovery and independent settings writes. On Linux, `--usb` tests
+the same traffic over a real USB/IP serial device (requires passwordless
+sudo for attach/detach).

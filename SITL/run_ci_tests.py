@@ -11,7 +11,9 @@ exits non-zero if any test fails.
 
 import argparse
 import os
+import select
 import signal
+import socket
 import struct
 import subprocess
 import sys
@@ -21,8 +23,10 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import am32_paths
 import sitl_dshot as sd
+import sitl_fourway
 import sitl_params
 import sitl_tones
+from sitl_fourway_server import crc16_xmodem
 from sitl_gui_backend import EepromClient, SimStream, ToneStream, AudioStream
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -657,7 +661,7 @@ def test_fc_capture(sitl_path):
     import msp_stub_fc
     tool = am32_paths.scripts_dir('esc_capture_fc.py')
     with Sitl(sitl_path, ['--can-uri', 'none', '--input-type', '1']):
-        stub = msp_stub_fc.MspStubFC()
+        stub = msp_stub_fc.MspStubFC(sitl_port=INPUT_PORT)
         try:
             r = subprocess.run(
                 [sys.executable, tool, 'sweep', '--port', stub.slave_path,
@@ -701,12 +705,436 @@ def test_fc_capture(sitl_path):
             stub.close()
 
 
+class FourWayClient(object):
+    '''the configurator side of the link: MSP on a serial port, then
+    BLHeli 4-way after MSP_SET_PASSTHROUGH. The framing here is written
+    from the protocol rather than shared with sitl_fourway_server, so the
+    two implementations have to agree'''
+
+    MSP_SET_PASSTHROUGH = 245
+
+    def __init__(self, path):
+        import tty
+        self.fd = os.open(path, os.O_RDWR | os.O_NOCTTY)
+        tty.setraw(self.fd)
+
+    def close(self):
+        os.close(self.fd)
+
+    def _read(self, n, timeout=3.0):
+        out = b''
+        deadline = time.time() + timeout
+        while len(out) < n and time.time() < deadline:
+            ready, _, _ = select.select([self.fd], [], [], 0.1)
+            if ready:
+                out += os.read(self.fd, n - len(out))
+        return out
+
+    def msp(self, cmd, payload=b''):
+        hdr = struct.pack('<BB', len(payload), cmd)
+        ck = 0
+        for b in hdr + payload:
+            ck ^= b
+        os.write(self.fd, b'$M<' + hdr + payload + bytes([ck]))
+        head = self._read(5)
+        if head[:3] != b'$M>':
+            raise IOError('bad msp reply %r' % head)
+        size = head[3]
+        return self._read(size + 1)[:size]
+
+    def passthrough(self):
+        return self.msp(self.MSP_SET_PASSTHROUGH)[0]
+
+    def cmd(self, command, address=0, params=b'\x00'):
+        '''one 4-way transaction, returning (params, ack)'''
+        body = (bytes([0x2F, command, (address >> 8) & 0xFF, address & 0xFF,
+                       len(params) & 0xFF]) + bytes(params))
+        os.write(self.fd, body + struct.pack('>H', crc16_xmodem(body)))
+        head = self._read(5)
+        if len(head) != 5 or head[0] != 0x2E:
+            raise IOError('bad 4-way reply %r' % head)
+        size = head[4] or 256
+        rest = self._read(size + 3)
+        if len(rest) != size + 3:
+            raise IOError('short 4-way reply')
+        if struct.unpack('>H', rest[-2:])[0] != crc16_xmodem(head + rest[:-2]):
+            raise IOError('4-way reply crc error')
+        return rest[:size], rest[size]
+
+
+def test_fc_fourway(sitl_path, bootloader):
+    '''the fake FC\'s 4-way passthrough: a configurator speaking MSP to
+    the stub must reach the ESC bootloader through it, exactly as it
+    would through a real flight controller'''
+    if bootloader is None:
+        print('SKIP: fc 4-way, no --bootloader given')
+        sys.stdout.flush()
+        return
+    try:
+        import pty  # noqa: F401  (POSIX only)
+    except ImportError as ex:
+        print('SKIP: fc 4-way, %s' % ex)
+        sys.stdout.flush()
+        return
+    import msp_stub_fc
+    from sitl_fourway_server import (CMD_DEVICE_INIT_FLASH, CMD_DEVICE_READ,
+                                     CMD_DEVICE_WRITE, CMD_INTERFACE_EXIT,
+                                     CMD_INTERFACE_TEST_ALIVE, ACK_OK)
+    with Sitl(sitl_path, ['--can-uri', 'none', '--bootloader', bootloader],
+              nosleep=False):
+        stub = msp_stub_fc.MspStubFC(sitl_port=INPUT_PORT,
+                                     state_port=STATE_PORT, motor=False)
+        client = None
+        try:
+            client = FourWayClient(stub.slave_path)
+            check('fc 4-way esc count', client.passthrough() == 1, '')
+
+            info, ack = client.cmd(CMD_DEVICE_INIT_FLASH, params=b'\x00')
+            # escDeviceInfo_t: signature (little endian), pin code, boot pages
+            sig = info[0] | (info[1] << 8) if len(info) == 4 else 0
+            check('fc 4-way init flash', ack == ACK_OK and (sig & 0xFF) == 0x06,
+                  'ack=0x%02x info=%s' % (ack, info.hex()))
+            check('fc 4-way boot pin', len(info) == 4 and (info[2] & 0x0F) < 16,
+                  'pin=0x%02x' % (info[2] if len(info) == 4 else 0))
+
+            _, ack = client.cmd(CMD_INTERFACE_TEST_ALIVE)
+            check('fc 4-way keep alive', ack == ACK_OK, 'ack=0x%02x' % ack)
+
+            # the v3 devinfo block, read through the magic address as a
+            # configurator does, tells us where the eeprom lives
+            block, ack = client.cmd(CMD_DEVICE_READ, address=0x23,
+                                    params=bytes([27]))
+            m1, m2 = struct.unpack('<II', block[0:8]) if len(block) >= 8 else (0, 0)
+            check('fc 4-way devinfo read',
+                  ack == ACK_OK and (m1, m2) == (0x5925E3DA, 0x4EB863D9),
+                  'ack=0x%02x magic=0x%08x,0x%08x' % (ack, m1, m2))
+            if ack != ACK_OK or len(block) < 27:
+                return
+            eeprom_start = struct.unpack('<H', block[23:25])[0]
+
+            settings, ack = client.cmd(CMD_DEVICE_READ, address=eeprom_start,
+                                       params=bytes([48]))
+            check('fc 4-way eeprom read', ack == ACK_OK and len(settings) == 48,
+                  'ack=0x%02x len=%d' % (ack, len(settings)))
+
+            # write it back with one byte changed and read it again: the
+            # whole set address / set buffer / program sequence in one go
+            written = bytearray(settings)
+            written[0] = 0x01
+            written[26] = (written[26] + 1) & 0xFF
+            _, ack = client.cmd(CMD_DEVICE_WRITE, address=eeprom_start,
+                                params=bytes(written))
+            check('fc 4-way eeprom write', ack == ACK_OK, 'ack=0x%02x' % ack)
+            back, ack = client.cmd(CMD_DEVICE_READ, address=eeprom_start,
+                                   params=bytes([48]))
+            # byte 2 is BOOT_LOADER_REVISION, which the bootloader stamps
+            # with its own version as it programs the page
+            check('fc 4-way eeprom readback',
+                  ack == ACK_OK and len(back) == 48
+                  and back[:2] + back[3:] == bytes(written[:2] + written[3:]),
+                  'ack=0x%02x back=%s' % (ack, back.hex()))
+            check('fc 4-way bootloader version stamp',
+                  len(back) == 48 and back[2] not in (0x00, 0xFF),
+                  'version=0x%02x' % (back[2] if len(back) == 48 else 0))
+
+            _, ack = client.cmd(CMD_INTERFACE_EXIT)
+            check('fc 4-way exit', ack == ACK_OK, 'ack=0x%02x' % ack)
+        finally:
+            if client is not None:
+                client.close()
+            stub.close()
+
+
+class DirectClient(object):
+    """the configurator side of direct mode: raw bootloader commands on
+    a serial port, each answered by the linker's echo of the command
+    followed by the ESC's reply. Written from the protocol rather than
+    shared with sitl_fourway, so the two implementations have to agree"""
+
+    def __init__(self, path):
+        import tty
+        self.fd = os.open(path, os.O_RDWR | os.O_NOCTTY)
+        tty.setraw(self.fd)
+
+    def close(self):
+        os.close(self.fd)
+
+    def _read(self, n, timeout=3.0):
+        out = b''
+        deadline = time.time() + timeout
+        while len(out) < n and time.time() < deadline:
+            ready, _, _ = select.select([self.fd], [], [], 0.1)
+            if ready:
+                out += os.read(self.fd, n - len(out))
+        return out
+
+    def _txn(self, frame, reply_len, timeout=3.0):
+        os.write(self.fd, frame)
+        got = self._read(len(frame) + reply_len, timeout=timeout)
+        if got[:len(frame)] != frame:
+            raise IOError('no echo: %s' % got.hex(' '))
+        return got[len(frame):]
+
+    def connect(self):
+        """the 21 byte init the configurator sends, answered by the 9
+        byte deviceInfo"""
+        init = bytes(12) + bytes([0x0D]) + b'BLHeli' + bytes([0xF4, 0x7D])
+        # the ESC may need resetting into the bootloader first, which the
+        # bridge does for us; allow for that whole window
+        return self._txn(init, 9, timeout=8.0)
+
+    def cmd(self, buf, reply_len):
+        frame = bytes(buf) + struct.pack('<H', sitl_fourway.crc16(bytes(buf)))
+        return self._txn(frame, reply_len)
+
+    def set_address(self, address):
+        return self.cmd([0xFF, 0x00, (address >> 8) & 0xFF, address & 0xFF], 1)
+
+    def read_flash(self, size):
+        """size data bytes, then the CRC16 and the ack"""
+        return self.cmd([0x03, size & 0xFF], size + 3)
+
+
+def test_direct_serial(sitl_path, bootloader):
+    """direct mode: the 1-wire USB linker emulation, which is how a
+    configurator reaches an ESC with no flight controller in between"""
+    if bootloader is None:
+        print('SKIP: direct serial, no --bootloader given')
+        sys.stdout.flush()
+        return
+    try:
+        import pty  # noqa: F401  (POSIX only)
+    except ImportError as ex:
+        print('SKIP: direct serial, %s' % ex)
+        sys.stdout.flush()
+        return
+    import sitl_serial_bridge
+    with Sitl(sitl_path, ['--can-uri', 'none', '--bootloader', bootloader],
+              nosleep=False):
+        bridge = sitl_serial_bridge.SerialBridge(sitl_port=INPUT_PORT,
+                                                 state_port=STATE_PORT)
+        client = None
+        try:
+            client = DirectClient(bridge.slave_path)
+            info = client.connect()
+            check('direct devinfo', info[0:3] == b'471' and info[8] == 0x30,
+                  'info=%s' % info.hex(' '))
+            if info[0:3] != b'471':
+                return
+
+            # the v3 devinfo block through the magic address, as the
+            # configurator reads it to find the eeprom
+            check('direct set devinfo address',
+                  client.set_address(0x0023) == b'\x30', '')
+            block = client.read_flash(27)
+            m1, m2 = struct.unpack('<II', block[0:8])
+            check('direct devinfo block',
+                  (m1, m2) == (0x5925E3DA, 0x4EB863D9) and block[29] == 0x30,
+                  'magic=0x%08x,0x%08x' % (m1, m2))
+            if (m1, m2) != (0x5925E3DA, 0x4EB863D9):
+                return
+            eeprom_start = struct.unpack('<H', block[23:25])[0]
+
+            check('direct set eeprom address',
+                  client.set_address(eeprom_start) == b'\x30', '')
+            settings = client.read_flash(48)
+            check('direct eeprom read', settings[50] == 0x30,
+                  'ack=0x%02x' % settings[50])
+
+            # write it back with one byte changed: set address, set
+            # buffer size, send the buffer, program it
+            written = bytearray(settings[:48])
+            written[0] = 0x01
+            written[26] = (written[26] + 1) & 0xFF
+            check('direct set write address',
+                  client.set_address(eeprom_start) == b'\x30', '')
+            # cmd_SetBufferSize is the one command with no reply at all
+            client.cmd([0xFE, 0x00, 0x00, len(written)], 0)
+            check('direct send buffer',
+                  client.cmd(written, 1) == b'\x30', '')
+            check('direct write flash',
+                  client.cmd([0x01, 0x00], 1) == b'\x30', '')
+
+            check('direct set readback address',
+                  client.set_address(eeprom_start) == b'\x30', '')
+            back = client.read_flash(48)[:48]
+            # byte 2 is BOOT_LOADER_REVISION, which the bootloader stamps
+            # with its own version as it programs the page
+            check('direct eeprom readback',
+                  back[:2] + back[3:] == bytes(written[:2] + written[3:]),
+                  'back=%s' % back.hex())
+        finally:
+            if client is not None:
+                client.close()
+            bridge.close()
+
+
+def test_fc_reconnect():
+    """a configurator may open several passthrough sessions against one
+    FC - a browser does it every time you reconnect - and each has to
+    work. Needs no ESC: the interface commands are answered by the FC
+    itself"""
+    try:
+        import pty  # noqa: F401  (POSIX only)
+    except ImportError as ex:
+        print('SKIP: fc reconnect, %s' % ex)
+        sys.stdout.flush()
+        return
+    import msp_stub_fc
+    from sitl_fourway_server import (CMD_INTERFACE_EXIT,
+                                     CMD_INTERFACE_TEST_ALIVE,
+                                     CMD_PROTOCOL_GET_VERSION, ACK_OK,
+                                     PROTOCOL_VERSION)
+    stub = msp_stub_fc.MspStubFC(sitl_port=INPUT_PORT, motor=False)
+    client = None
+    try:
+        client = FourWayClient(stub.slave_path)
+        for session in (1, 2, 3):
+            ok = True
+            detail = ''
+            try:
+                count = client.passthrough()
+                version, ack = client.cmd(CMD_PROTOCOL_GET_VERSION)
+                ok = (count == 1 and ack == ACK_OK
+                      and version == bytes([PROTOCOL_VERSION]))
+                _, ack = client.cmd(CMD_INTERFACE_TEST_ALIVE)
+                ok = ok and ack == ACK_OK
+                _, ack = client.cmd(CMD_INTERFACE_EXIT)
+                ok = ok and ack == ACK_OK
+            except IOError as ex:
+                ok, detail = False, str(ex)
+            check('fc 4-way session %u' % session, ok, detail)
+    finally:
+        if client is not None:
+            client.close()
+        stub.close()
+
+
+def test_usbip_device(unix=False):
+    '''the virtual USB serial device: enumeration and both data
+    directions, driven straight over the USB/IP socket so it needs no
+    vhci_hcd and no root. Both transports, since the export can be a
+    unix socket (no port to collide with anything) or tcp'''
+    import sitl_usbip
+
+    name = '@am32-usbip-test.%u' % os.getpid()
+    what = 'usbip unix' if unix else 'usbip tcp'
+    server = sitl_usbip.UsbipServer(unix_path=name if unix else None,
+                                    port=None if unix else 0, serial='TEST')
+    if unix:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    else:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(5.0)
+        if unix:
+            sock.connect(sitl_usbip.socket_address(name))
+        else:
+            sock.connect(('127.0.0.1', server.port))
+
+        def recv(n):
+            out = b''
+            while len(out) < n:
+                b = sock.recv(n - len(out))
+                if not b:
+                    raise IOError('usbip connection closed')
+                out += b
+            return out
+
+        seq = [0]
+
+        def submit(direction, ep, length, setup=b'\0' * 8, data=b''):
+            seq[0] += 1
+            sock.sendall(struct.pack('>IIIII', 1, seq[0], 0, direction, ep)
+                         + struct.pack('>Iiiii8s', 0, length, 0, 0, 0, setup)
+                         + data)
+            hdr = recv(48)
+            command, sq = struct.unpack('>II', hdr[:8])
+            status, actual = struct.unpack('>ii', hdr[20:28])
+            payload = recv(actual) if direction == 1 and actual > 0 else b''
+            return command, sq, status, payload
+
+        # import the device, as the vhci driver does when it attaches
+        sock.sendall(struct.pack('>HHI', 0x0111, 0x8003, 0)
+                     + b'1-1'.ljust(32, b'\0'))
+        version, code, status = struct.unpack('>HHI', recv(8))
+        dev = recv(312)
+        vid, pid = struct.unpack('>HH', dev[300:304])
+        check('%s import' % what, code == 0x0003 and status == 0
+              and (vid, pid) == (0x1209, 0x0001),
+              'code=0x%04x status=%u id=%04x:%04x' % (code, status, vid, pid))
+
+        # GET_DESCRIPTOR(device), the host\'s first control transfer
+        setup = struct.pack('<BBHHH', 0x80, 6, 0x0100, 0, 18)
+        _, _, st, desc = submit(1, 0, 18, setup)
+        check('%s device descriptor' % what,
+              st == 0 and len(desc) == 18 and desc[1] == 1
+              and struct.unpack('<HH', desc[8:12]) == (0x1209, 0x0001),
+              'status=%d len=%d' % (st, len(desc)))
+
+        setup = struct.pack('<BBHHH', 0x80, 6, 0x0200, 0, 255)
+        _, _, st, cfg = submit(1, 0, 255, setup)
+        total = struct.unpack('<H', cfg[2:4])[0] if len(cfg) >= 4 else 0
+        check('%s config descriptor' % what,
+              st == 0 and len(cfg) == total and cfg[4] == 2
+              and bytes([0x0A, 0x00, 0x00]) in cfg,
+              'status=%d len=%d total=%d ifaces=%d'
+              % (st, len(cfg), total, cfg[4] if len(cfg) > 4 else 0))
+
+        # host to device, then device to host on the bulk pair
+        _, _, st, _ = submit(0, sitl_usbip.EP_BULK, 5, data=b'hello')
+        got = server.read(1.0)
+        check('%s bulk out' % what, st == 0 and got == b'hello',
+              'status=%d got=%r' % (st, got))
+
+        # a read urb queued before there is anything to send must be
+        # completed by the write, not answered empty
+        seq[0] += 1
+        pending = seq[0]
+        sock.sendall(struct.pack('>IIIII', 1, pending, 0, 1,
+                                 sitl_usbip.EP_BULK)
+                     + struct.pack('>Iiiii8s', 0, 64, 0, 0, 0, b'\0' * 8))
+        time.sleep(0.2)
+        server.write(b'world')
+        hdr = recv(48)
+        sq = struct.unpack('>I', hdr[4:8])[0]
+        actual = struct.unpack('>i', hdr[24:28])[0]
+        payload = recv(actual)
+        check('%s bulk in' % what, sq == pending and payload == b'world',
+              'seq=%u payload=%r' % (sq, payload))
+
+        # the notification endpoint never completes, so the host has to
+        # be able to take its urb back
+        seq[0] += 1
+        intr = seq[0]
+        sock.sendall(struct.pack('>IIIII', 1, intr, 0, 1, sitl_usbip.EP_INTR)
+                     + struct.pack('>Iiiii8s', 0, 8, 0, 0, 0, b'\0' * 8))
+        time.sleep(0.2)
+        seq[0] += 1
+        sock.sendall(struct.pack('>IIIII', 2, seq[0], 0, 0, 0)
+                     + struct.pack('>I24s', intr, b''))
+        hdr = recv(48)
+        command = struct.unpack('>I', hdr[:4])[0]
+        st = struct.unpack('>i', hdr[20:24])[0]
+        check('%s unlink' % what, command == 4 and st != 0,
+              'command=%u status=%d' % (command, st))
+    finally:
+        sock.close()
+        server.close()
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--sitl', help='SITL binary (default: the one built '
                     'in the AM32 checkout)')
+    ap.add_argument('--bootloader', nargs='?', const='', default=None,
+                    help='bootloader SITL elf, enabling the 4-way '
+                         'passthrough and direct serial tests (default: '
+                         'the one built in the bootloader checkout)')
     args = ap.parse_args()
     args.sitl = am32_paths.sitl_binary(args.sitl)
+    if args.bootloader is not None:
+        args.bootloader = am32_paths.bootloader_binary(args.bootloader or None)
 
     test_dshot(args.sitl, 'dshot600 bidir edt', sd.TYPE_DSHOT600,
                bidir=True, edt=True, value=800, rpm_lo=2000, rpm_hi=4000)
@@ -728,6 +1156,11 @@ def main():
     test_dronecan_params(args.sitl)
     test_dataset_params()
     test_fc_capture(args.sitl)
+    test_fc_fourway(args.sitl, args.bootloader)
+    test_direct_serial(args.sitl, args.bootloader)
+    test_fc_reconnect()
+    test_usbip_device(unix=False)
+    test_usbip_device(unix=True)
 
     if failures:
         print('\n%d FAILED: %s' % (len(failures), ', '.join(failures)))

@@ -22,6 +22,7 @@ SUBMODULE = os.path.join(ESCSIM_ROOT, 'modules', 'am32-firmware')
 BOOTLOADER_SUBMODULE = os.path.join(ESCSIM_ROOT, 'modules', 'am32-bootloader')
 
 SITL_GLOB = 'AM32_AM32_SITL_CAN_*.elf'
+BOOTLOADER_GLOB = 'AM32_SITL_BOOTLOADER_*.elf'
 
 
 def _is_am32(path):
@@ -89,6 +90,33 @@ def sitl_binary(given=None, required=True):
     raise SystemExit(
         'no SITL binary in %s/obj: build it with\n'
         '  make -C %s AM32_SITL_CAN' % (root, root))
+
+
+def bootloader_binary(given=None, required=True):
+    '''the built SITL bootloader, for the chained-boot, 4-way and direct
+    serial tests: an explicit path, $AM32_BOOTLOADER, or the newest one
+    in the bootloader checkout's obj/'''
+    if given:
+        if not os.path.isfile(given):
+            raise SystemExit('bootloader %s does not exist' % given)
+        return given
+    env = os.environ.get('AM32_BOOTLOADER')
+    if env:
+        hits = sorted(glob.glob(env))
+        if not hits:
+            raise SystemExit('AM32_BOOTLOADER=%s matches no file' % env)
+        return hits[-1]
+    root = bootloader_root(required=required)
+    if root is None:
+        return None
+    hits = sorted(glob.glob(os.path.join(root, 'obj', BOOTLOADER_GLOB)))
+    if hits:
+        return hits[-1]
+    if not required:
+        return None
+    raise SystemExit(
+        'no bootloader in %s/obj: build one there, or pass an explicit path'
+        % root)
 
 
 def data_dir(*parts):

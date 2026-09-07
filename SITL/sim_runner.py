@@ -44,7 +44,7 @@ def bundled_sitl():
     return am32_paths.sitl_binary(required=False)
 
 
-def bundled_eeprom():
+def bundled_eeprom(esc_index=0):
     '''a default eeprom image to seed the simulated ESC.
 
     The packaged build ships one generated at build time. From a
@@ -52,10 +52,32 @@ def bundled_eeprom():
     file into build/ - the simulator opens its eeprom read/write, and
     handing it a file in the source tree corrupts the tree.
     '''
+    if not 0 <= esc_index < 8:
+        raise ValueError('ESC index must be 0..7')
+    if esc_index:
+        import shutil
+        from pathlib import Path
+        seed = bundled_eeprom()
+        if seed is None:
+            return None
+        seed = Path(seed)
+        out = seed.with_name('%s.esc%u%s' % (seed.stem, esc_index + 1, seed.suffix))
+        if not out.exists():
+            shutil.copyfile(seed, out)
+        return str(out)
     base = _resource_dir()
     packaged = os.path.join(base, 'sitl', 'default_eeprom.bin')
     if os.path.isfile(packaged):
-        return packaged
+        # PyInstaller's onefile directory is temporary. Keep user settings
+        # (and the bootloader flash/backup files alongside them) across runs.
+        import shutil
+        data = os.environ.get('LOCALAPPDATA') if sys.platform.startswith('win') else None
+        data = data or os.path.join(os.path.expanduser('~'), '.local', 'share')
+        out = os.path.join(data, 'AM32-SITL', 'eeprom.bin')
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        if not os.path.exists(out):
+            shutil.copyfile(packaged, out)
+        return out
     import am32_paths
     params = am32_paths.data_dir('VIMDRONES_NANO_2216', 'sitl.param')
     if not os.path.isfile(params):
@@ -67,6 +89,12 @@ def bundled_eeprom():
         os.makedirs(os.path.dirname(out), exist_ok=True)
         sitl_params.write_eeprom(params, out)
     return out
+
+
+def bundled_bootloader():
+    '''the host bootloader executable shipped with the GUI'''
+    path = os.path.join(_resource_dir(), 'sitl', _exe('AM32_SITL_BOOTLOADER'))
+    return path if os.path.isfile(path) else None
 
 
 # On Windows the SITL emulates an MCU reset by re-exec (execv has no true
@@ -191,6 +219,8 @@ class SimRunner(object):
                                'one with Browse')
         if not eeprom or not os.path.isfile(eeprom):
             raise RuntimeError('no eeprom file for the simulator')
+        if bootloader and not os.path.isfile(bootloader):
+            raise RuntimeError('bootloader file does not exist: %s' % bootloader)
         cmd = [binary,
                '--input-port', str(input_port),
                '--state-port', str(state_port),
@@ -198,7 +228,7 @@ class SimRunner(object):
                '--eeprom', eeprom]
         if model and os.path.isfile(model):
             cmd += ['--config', model]
-        if bootloader and os.path.isfile(bootloader):
+        if bootloader:
             cmd += ['--bootloader', bootloader]
         # force the firmware's input mode (0 auto, 1 dshot, 5 dronecan) so
         # the pane the user drives actually reaches the ESC - a
@@ -222,9 +252,16 @@ class SimRunner(object):
         self._log('launching: %s' % ' '.join(
             os.path.basename(c) if i == 0 else c
             for i, c in enumerate(cmd)))
+        startupinfo = None
+        if sys.platform.startswith('win'):
+            # As in ESCSim, hide the window while retaining console
+            # semantics for the simulator and its bootloader re-execs.
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
         self.proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1)
+            text=True, bufsize=1, startupinfo=startupinfo)
         self._requested_stop = None
         if sys.platform.startswith('win'):
             try:
