@@ -1,0 +1,78 @@
+name: sitl-calibration
+
+# Compares the SITL physics against the real-hardware bench captures in
+# SITL/data: steady sweep, square amplitude sweep and 120s chirp per
+# calibrated model, checked against SITL/data/*/expected.json. Heavier
+# than the functional SITL tests (~25 min), so it runs only when the
+# models, datasets or measurement tools change, plus nightly.
+#
+# All measurements are paced against SITL simulation time, so a slow
+# runner simply takes longer in wall time and measures the same
+# experiment. The datasets run as parallel matrix jobs.
+# Comparison graphs are uploaded as artifacts on every run.
+
+on:
+  push:
+    paths:
+      - "SITL/models/**"
+      - "SITL/data/**"
+      - "SITL/scripts/esc_*.py"
+      - "SITL/run_calibration_tests.py"
+      - ".github/workflows/sitl-calibration.yml"
+  pull_request:
+    paths:
+      - "SITL/models/**"
+      - "SITL/data/**"
+      - "SITL/scripts/esc_*.py"
+      - "SITL/run_calibration_tests.py"
+      - ".github/workflows/sitl-calibration.yml"
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+jobs:
+  calibration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        dataset: [gt2215, nano2216]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Check out the firmware submodule
+        run: git submodule update --init --depth 1 modules/am32-firmware
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build SITL
+        run: make -C modules/am32-firmware AM32_SITL_CAN
+
+      - name: Install python dependencies
+        run: python3 -m pip install dronecan plotly numpy matplotlib
+
+      - name: Run calibration tests
+        run: |
+          mkdir calibration_run && cd calibration_run
+          python3 ../SITL/run_calibration_tests.py \
+            --dataset ${{ matrix.dataset }} \
+            --artifacts ../calibration_artifacts
+
+      - name: Upload comparison graphs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: calibration-graphs-${{ matrix.dataset }}
+          path: calibration_artifacts/
+
+      - name: Upload run logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: calibration-logs-${{ matrix.dataset }}
+          path: calibration_run/calrun_*/

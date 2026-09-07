@@ -1,0 +1,168 @@
+name: sitl
+
+# The SITL simulator is C in the AM32 firmware repo; the models,
+# datasets, GUI and tests are here. These jobs build the simulator from
+# the pinned modules/am32-firmware submodule and run the suites against
+# it, which is the same thing AM32's own CI does with AM32_ROOT pointed
+# at the branch under test.
+
+on:
+  push:
+    paths: ["SITL/**", ".github/workflows/sitl.yml"]
+  pull_request:
+    paths: ["SITL/**", ".github/workflows/sitl.yml"]
+  workflow_dispatch:
+
+jobs:
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            sanitize: ''
+          - os: ubuntu-latest
+            sanitize: address
+          - os: ubuntu-latest
+            sanitize: undefined
+          - os: macos-latest
+            sanitize: ''
+    runs-on: ${{ matrix.os }}
+    name: tests ${{ matrix.os }} ${{ matrix.sanitize && format('({0})', matrix.sanitize) || '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Check out the firmware submodule
+        run: git submodule update --init --depth 1 modules/am32-firmware
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build SITL
+        run: make -C modules/am32-firmware AM32_SITL_CAN ${{ matrix.sanitize && format('SITL_SANITIZE={0}', matrix.sanitize) || '' }}
+
+      - name: Install pydronecan
+        run: python3 -m pip install dronecan pyserial
+
+      # GitHub macOS runners do not loop the DroneCAN multicast group
+      # back on the default interface, so route it to loopback
+      - name: Route the DroneCAN multicast group to loopback
+        if: runner.os == 'macOS'
+        run: sudo route -n add -net 239.65.82.0/24 -interface lo0 || true
+
+      - name: Run SITL tests
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=0:abort_on_error=0
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: |
+          mkdir sitl_test_run && cd sitl_test_run
+          python3 ../SITL/run_ci_tests.py
+
+      - name: Upload SITL log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sitl-test-log-${{ matrix.os }}-${{ matrix.sanitize || 'plain' }}
+          path: sitl_test_run/sitl_ci.log
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Check out the firmware submodule
+        run: git submodule update --init --depth 1 modules/am32-firmware
+
+      - name: Install python and gcovr
+        run: python3 -m pip install dronecan pyserial gcovr
+
+      - name: Build and run with coverage
+        run: |
+          mkdir sitl_test_run && cd sitl_test_run
+          bash ../SITL/run_coverage.sh
+
+      - name: Coverage summary
+        run: cat sitl_test_run/coverage/coverage.txt || true
+
+      - name: Upload HTML coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sitl-coverage-report
+          path: sitl_test_run/coverage/
+
+  gui-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Check out the firmware submodule
+        run: git submodule update --init --depth 1 modules/am32-firmware
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Qt system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1 libegl1 libxkbcommon0 libfontconfig1 \
+                                  libdbus-1-3 libxcb-cursor0
+
+      - name: Build SITL
+        run: make -C modules/am32-firmware AM32_SITL_CAN
+
+      - name: Install GUI dependencies
+        run: python3 -m pip install -r SITL/requirements.txt
+
+      - name: Headless GUI test
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          mkdir gui_test_run && cd gui_test_run
+          python3 ../SITL/gui_ci_test.py --gui-python python3
+
+      - name: Upload SITL log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sitl-gui-test-log
+          path: gui_test_run/sitl_ci.log
+
+  capture-gui-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Check out the firmware submodule
+        run: git submodule update --init --depth 1 modules/am32-firmware
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1 libegl1 libxkbcommon0 libfontconfig1 \
+                                  libdbus-1-3 libxcb-cursor0
+          python3 -m pip install -r SITL/scripts/requirements-capture-gui.txt
+
+      # a simulated ESC to capture from, so the test covers the paths
+      # that need a live motor - notably that Abort stops a run
+      - name: Build SITL
+        run: make -C modules/am32-firmware AM32_SITL_CAN
+
+      - name: Headless GUI test
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python3 SITL/scripts/capture_gui_test.py --sitl
