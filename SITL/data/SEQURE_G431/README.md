@@ -85,7 +85,7 @@ workaround) was superseded by the durable fixes in Mcu/SITL:
 the firmware progress lease (sim.fw_lag_max_ns) and the comparator
 response-time latch (sim.comparator_min_toggle_ns) — with both, the
 full load reproduction runs desync-free without privileges. See
-modules/am32-firmware/Mcu/SITL/TIMING-DESIGN.md for the complete story.
+SITL/TIMING-DESIGN.md for the complete story.
 
 ## model v9 (current)
 

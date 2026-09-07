@@ -327,3 +327,9 @@ current, and battery voltage sag from internal resistance. The
 comparator compares the floating phase against the virtual neutral with
 configurable noise and hysteresis, so the firmware's blanking and
 filtering logic is genuinely exercised at PWM switching level.
+
+Under host CPU load the firmware thread can be descheduled for long
+enough to reach states real silicon cannot, which used to show up as
+spurious desyncs. [TIMING-DESIGN.md](TIMING-DESIGN.md) is the design
+of the scheduler that makes the simulation immune to that, implemented
+in the firmware repo's `Mcu/SITL/Src/sitl_sched.c`.
