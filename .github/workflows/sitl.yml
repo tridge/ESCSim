@@ -44,6 +44,13 @@ jobs:
       - name: Build SITL
         run: make -C modules/am32-firmware AM32_SITL_CAN ${{ matrix.sanitize && format('SITL_SANITIZE={0}', matrix.sanitize) || '' }}
 
+      # the 4-way passthrough and direct serial tests boot through the
+      # bootloader, as a configurator does
+      - name: Check out and build the bootloader
+        run: |
+          git submodule update --init --depth 1 modules/am32-bootloader
+          make -C modules/am32-bootloader AM32_SITL_BOOTLOADER_PB4_CAN
+
       - name: Install pydronecan
         run: python3 -m pip install dronecan pyserial
 
@@ -59,7 +66,7 @@ jobs:
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: |
           mkdir sitl_test_run && cd sitl_test_run
-          python3 ../SITL/run_ci_tests.py
+          python3 ../SITL/run_ci_tests.py --bootloader
 
       - name: Upload SITL log on failure
         if: failure()
@@ -122,12 +129,32 @@ jobs:
       - name: Install GUI dependencies
         run: python3 -m pip install -r SITL/requirements.txt
 
+      - name: Betaflight motor integration
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python3 SITL/betaflight_sitl_test.py
+
+      - name: Eight ESC motor integration
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python3 SITL/multi_esc_sitl_test.py
+
+      - name: Multiple ESC tabs and USB routing
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python3 SITL/multi_esc_gui_test.py
+
       - name: Headless GUI test
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
           mkdir gui_test_run && cd gui_test_run
           python3 ../SITL/gui_ci_test.py --gui-python python3
+
+      - name: MSP, Windows packaging and USB protocol regressions
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python3 -m unittest discover -s SITL -t SITL -p 'test_*.py' -v
 
       - name: Upload SITL log on failure
         if: failure()
