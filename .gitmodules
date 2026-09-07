@@ -1,0 +1,8 @@
+[submodule "modules/am32-firmware"]
+	path = modules/am32-firmware
+	url = https://github.com/am32-firmware/AM32.git
+	branch = main
+[submodule "modules/am32-bootloader"]
+	path = modules/am32-bootloader
+	url = https://github.com/am32-firmware/AM32-bootloader.git
+	branch = master
