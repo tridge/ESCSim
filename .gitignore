@@ -13,8 +13,9 @@ wheelhouse/
 src/escsim/renode/lib/*
 !src/escsim/renode/lib/.gitkeep
 
-# SITL GUI environment and the generated comparison plots
+# SITL GUI environment, generated comparison plots and test reports
 SITL/venv/
 plots/
 report/
 coverage/
+test_outputs/
