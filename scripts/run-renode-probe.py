@@ -138,7 +138,9 @@ def main(argv: list[str] | None = None) -> int:
                 f"log {log_path}",
                 flush=True,
             )
-            while tree.running() and stop_signal is None and time.monotonic() < deadline:
+            while (
+                tree.running() and stop_signal is None and time.monotonic() < deadline
+            ):
                 time.sleep(0.1)
             if stop_signal is not None:
                 reason = f"signal-{signal.Signals(stop_signal).name}"

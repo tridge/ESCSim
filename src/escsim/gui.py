@@ -2377,9 +2377,7 @@ def main(argv=None):
                 item = lab.log_q.get_nowait()
             except queue.Empty:
                 break
-            if isinstance(item, tuple) and item[0].startswith(
-                "__fc_firmware_download"
-            ):
+            if isinstance(item, tuple) and item[0].startswith("__fc_firmware_download"):
                 tag = item[0]
                 if tag == "__fc_firmware_download_progress__":
                     _tag, received, total = item
@@ -2390,9 +2388,7 @@ def main(argv=None):
                 elif tag == "__fc_firmware_download_done__":
                     _tag, name, path = item
                     fc_download_active = False
-                    lines.append(
-                        "[FC firmware] downloaded %s to %s" % (name, path)
-                    )
+                    lines.append("[FC firmware] downloaded %s to %s" % (name, path))
                     start_btn.setEnabled(True)
                     fc_combo.setEnabled(True)
                     protocol_changed()

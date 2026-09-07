@@ -443,9 +443,7 @@ def test_flight_controller_finds_windows_com_port(monkeypatch):
     monkeypatch.setattr(gui.sitl_usbip, "find_new_tty", find_new_tty)
 
     assert (
-        gui.Lab._find_fc_tty(
-            timeout=7, usb_port=1, previous_ttys={"COM5", "COM9"}
-        )
+        gui.Lab._find_fc_tty(timeout=7, usb_port=1, previous_ttys={"COM5", "COM9"})
         == "COM26"
     )
     assert calls == [

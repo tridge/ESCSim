@@ -353,9 +353,7 @@ def test_speedybee_dshot_bridge_supports_betaflight_channel_dma():
     assert "FastBootParkAddress = 0x20000000" in gui_link
     assert "DirectBootProbeTimeoutMs = 1500" in bridge
     assert "DirectBootProbeRetryMs = 250" in bridge
-    generator = (resource_root.parent / "generator.py").read_text(
-        encoding="utf-8"
-    )
+    generator = (resource_root.parent / "generator.py").read_text(encoding="utf-8")
     assert '"--gui-signal-timeout-ms"' in generator
     assert "guilink SignalTimeoutMs %d" in generator
     assert '"--gate-throttle-until-armed"' in generator
@@ -510,9 +508,10 @@ def test_ardupilot_app_elf_keeps_bundled_bootloader(tmp_path):
     assert select_firmware(flash, image, bootloader=bootloader)
     assert flash.read_bytes()[:8] == bytes.fromhex("00060020e1010008")
     assert flash.read_bytes()[0xC000:0xC008] == bytes.fromhex("0020002099d20008")
-    assert flight_controller_firmware_bootloader(
-        "ARDUPILOT_SPEEDYBEEF405MINI", image
-    ) == bootloader
+    assert (
+        flight_controller_firmware_bootloader("ARDUPILOT_SPEEDYBEEF405MINI", image)
+        == bootloader
+    )
     assert flight_controller_firmware_bootloader(str(image), image) == bootloader
 
 
@@ -539,9 +538,10 @@ def test_managed_fc_firmware_download_is_atomic_and_cached(tmp_path):
         "ARDUPILOT_SPEEDYBEEF405MINI", tmp_path
     )
     assert destination.read_bytes() == content
-    assert flight_controller_firmware(
-        "ARDUPILOT_SPEEDYBEEF405MINI", tmp_path
-    ) == destination
+    assert (
+        flight_controller_firmware("ARDUPILOT_SPEEDYBEEF405MINI", tmp_path)
+        == destination
+    )
     assert requests[0][0].full_url.endswith(
         "/Copter/latest/SpeedyBeeF405Mini/arducopter.elf"
     )

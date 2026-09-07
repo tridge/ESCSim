@@ -164,7 +164,9 @@ def main(argv: list[str] | None = None) -> int:
     profile.mkdir(exist_ok=True)
 
     if not args.no_firmware_update and args.firmware in flight_controller_firmwares():
-        print(f"Updating {args.firmware} from its configured firmware URL...", flush=True)
+        print(
+            f"Updating {args.firmware} from its configured firmware URL...", flush=True
+        )
         download_flight_controller_firmware(args.firmware, default_cache_dir())
 
     logs = {

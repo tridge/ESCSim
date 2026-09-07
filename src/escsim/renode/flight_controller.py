@@ -235,7 +235,9 @@ def download_flight_controller_firmware(
                     break
                 received += len(block)
                 if received > FC_FIRMWARE_DOWNLOAD_LIMIT:
-                    raise RuntimeError("flight-controller firmware download is too large")
+                    raise RuntimeError(
+                        "flight-controller firmware download is too large"
+                    )
                 output.write(block)
                 if progress is not None:
                     progress(received, total)
@@ -945,9 +947,7 @@ def _firmware_chunks(image: Path) -> list[tuple[int, bytes]]:
         raise ValueError(f"cannot read FC firmware {image}: {error}") from error
 
 
-def select_firmware(
-    flash: Path, image: Path, bootloader: Path | None = None
-) -> bool:
+def select_firmware(flash: Path, image: Path, bootloader: Path | None = None) -> bool:
     """Select an Intel HEX or ELF FC image, preserving settings on repeat starts.
 
     Returns true when flash was replaced. The first changed immutable byte
