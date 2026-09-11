@@ -541,11 +541,15 @@ class SimStream(object):
     vu, vv, vw, vbus, ibus, modes, comp_phase, comp_out)"""
 
     SAMPLE = struct.Struct('<Qfffffffffff3sBB3x')
+    SCOPE_SAMPLE = struct.Struct('<Qfffffffffff3sBB3x7f3sxfI')
     MAGIC_CMD = 0x5353
     MAGIC_DATA = 0x5354
     MAGIC_REPLY = 0x5355
 
     def __init__(self, host='127.0.0.1', port=57734, period_us=50, maxlen=40000):
+        from sitl_scope import ScopeCapture
+        self.scope = ScopeCapture()
+        self.scope_enabled = False
         self.addr = (host, port)
         self.period_us = period_us
         self.enabled = False
@@ -555,6 +559,9 @@ class SimStream(object):
         self.model_status = ''
         self.running = True
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # Fine capture can deliver 20 MB/s in scheduler bursts. Buffer a
+        # short reader scheduling pause without dropping whole PWM edges.
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
         self.sock.bind(('127.0.0.1', 0))
         self.sock.settimeout(0.2)
         _udp_ignore_connreset(self.sock)
@@ -567,7 +574,7 @@ class SimStream(object):
                 # averaged sampling at coarse periods, so a slow scope
                 # shows the mean over each period instead of aliased
                 # point samples of the PWM
-                flags = 1 if self.period_us >= 10 else 0
+                flags = 2 if self.scope_enabled else (1 if self.period_us >= 10 else 0)
                 pkt = struct.pack('<HBBI', self.MAGIC_CMD, 0, flags,
                                   int(round(self.period_us * 1000)))
                 try:
@@ -593,18 +600,20 @@ class SimStream(object):
             if magic == self.MAGIC_REPLY:
                 self.model_status = d[4:].split(b'\0')[0].decode(errors='replace')
                 continue
-            if magic != self.MAGIC_DATA or b2 != 2:
+            if magic != self.MAGIC_DATA or b2 not in (2, 3):
                 continue
             count = b3
+            layout = self.SCOPE_SAMPLE if b2 == 3 else self.SAMPLE
             batch = []
             for k in range(count):
-                off = 4 + k * self.SAMPLE.size
-                if off + self.SAMPLE.size > len(d):
+                off = 4 + k * layout.size
+                if off + layout.size > len(d):
                     break
-                smp = self.SAMPLE.unpack_from(d, off)
+                smp = layout.unpack_from(d, off)
                 batch.append((smp[0] * 1e-9,) + smp[1:])
             with self.lock:
                 self.samples.extend(batch)
+            self.scope.feed(batch)
             self.rate.tick(len(batch))
 
     def latest(self):

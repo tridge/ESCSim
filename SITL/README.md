@@ -589,3 +589,15 @@ Pass `--bootloader PATH` to the multi-ESC integration test to also exercise
 4-way discovery and independent settings writes. On Linux, `--usb` tests
 the same traffic over a real USB/IP serial device (requires passwordless
 sudo for attach/detach).
+
+### Demagnetisation bench and DHO804-style virtual scope
+
+The **Virtual scope (DHO804)** checkbox opens a four-channel triggered scope
+with physical voltage/current traces, time/div and channel scales, Single
+capture, pre-trigger history, cursors and CSV/PNG export. Select a recipe
+from **Benchmark** (default **None**) and use **Start benchmark** / **Stop
+benchmark**. Recipes include full duty at about 50 A, light load, PWM and
+a full-duty load increase into desync. They use the selected firmware,
+with physical current decay enabled and an isolated EEPROM. See
+[DEMAG.md](DEMAG.md) for the workflow, model assumptions and automated
+capture/comparison commands.

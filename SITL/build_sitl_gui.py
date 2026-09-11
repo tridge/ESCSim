@@ -34,7 +34,7 @@ HIDDEN = [
     'pyqtgraph', 'numpy', 'serial', 'serial.tools.list_ports',
     'sitl_dshot', 'sitl_tones', 'sitl_params', 'sitl_gui_backend',
     'sitl_param_dialog', 'sitl_wave_dialog', 'sim_runner', 'model_builder',
-    'am32_paths',
+    'am32_paths', 'sitl_scope', 'sitl_scope_ui', 'demag_bench', 'sitl_benchmarks',
     'sitl_usbip', 'msp_stub_fc', 'sitl_fourway', 'sitl_fourway_server',
     'sitl_serial_bridge',
 ]

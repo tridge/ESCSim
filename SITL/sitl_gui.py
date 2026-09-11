@@ -26,6 +26,9 @@ actual UI paths:
   usb 0|1|2|3 (or none|fourway|serial|betaflight), usb_status,
   esc_count 1..8, esc N COMMAND, esc_select N, esc_status,
   sim_start_all, sim_stop_all, usb_target N (direct USB only),
+  benchmark KEY|None, benchmark_start, benchmark_stop, benchmark_status,
+  demag_bench, demag_stop, scope 0|1, scope_single, scope_status,
+  scope_trigger NAME, scope_save CSV, scope_snap PNG,
   snap FILE [rpm], status, quit
 responses go back to the client prefixed with OK/STATUS/ERR. A client
 disconnect leaves the GUI running.
@@ -1419,6 +1422,7 @@ def create_esc_panel(args, app, fleet, esc_index):
 
     graph_i_check = QCheckBox('Current graph')
     graph_v_check = QCheckBox('Voltage graph')
+    demag_scope_check = QCheckBox('Virtual scope (DHO804)')
     graph_rpm_check = QCheckBox('RPM/throttle graph')
     motorview_check = QCheckBox('Motor view')
     graph_i_check.setToolTip(
@@ -1454,6 +1458,7 @@ def create_esc_panel(args, app, fleet, esc_index):
         'clock). It is the sample period in simulated time divided by the\n'
         'speedup, capped at about 200k samples/s.')
     g4.addWidget(sim_rate_label, 1, 4)
+    g4.addWidget(demag_scope_check, 3, 2, 1, 3)
 
     # simulation speedup, logarithmic 0.001x .. 2x, for slow motion in
     # the motor view
@@ -1647,8 +1652,9 @@ def create_esc_panel(args, app, fleet, esc_index):
         # the status pane always needs the stream; scopes and the motor
         # view raise the rate from the coarse status sampling
         fine = (graph_i_check.isChecked() or graph_v_check.isChecked()
-                or motorview_check.isChecked())
+                or motorview_check.isChecked() or demag_scope_check.isChecked())
         sim.period_us = sample_spin.value() if fine else 2000
+        sim.scope_enabled = demag_scope_check.isChecked()
         sim.enabled = True
 
     update_sim_enable()   # status pane streams from startup
@@ -1722,6 +1728,67 @@ def create_esc_panel(args, app, fleet, esc_index):
         lambda: graph_toggled('i', graph_i_check, 'phase currents'))
     graph_v_check.toggled.connect(
         lambda: graph_toggled('v', graph_v_check, 'phase voltages'))
+
+    demag_scope = None
+
+    scope_file_cache = {}
+
+    def scope_metadata():
+        import hashlib
+        result = {'firmware': sim_bin_edit.text().strip(),
+                  'model_name': model_combo.currentText(),
+                  'benchmark': bench.get('recipe'),
+                  'benchmark_history': list(bench.get('history', []))}
+        try:
+            path = model_paths.get(model_combo.currentText())
+            if path:
+                with open(path) as f:
+                    result['model'] = json.load(f)
+            with open(sim_ee_edit.text().strip(), 'rb') as f:
+                result['eeprom_hex'] = f.read().hex()
+            binary = sim_bin_edit.text().strip()
+            stat = os.stat(binary)
+            key = (binary, stat.st_size, stat.st_mtime_ns)
+            if key != scope_file_cache.get('key'):
+                with open(binary, 'rb') as f:
+                    scope_file_cache.update(key=key, digest=hashlib.sha256(f.read()).hexdigest())
+            result['firmware_sha256'] = scope_file_cache['digest']
+        except OSError as ex:
+            result['metadata_error'] = str(ex)
+        return result
+
+    def scope_fine_capture():
+        sample_spin.setValue(0.5)
+        speed_slider.setValue(100)  # 0.1x: permits 500 ns instantaneous samples
+
+    def demag_scope_toggled():
+        nonlocal demag_scope
+        if demag_scope_check.isChecked():
+            if not HAVE_PYQTGRAPH:
+                model_status.setText('pyqtgraph not available')
+                demag_scope_check.setChecked(False)
+                return
+            if demag_scope is None:
+                from sitl_scope_ui import DemagScopeWindow
+                demag_scope = DemagScopeWindow(
+                    sim, lambda: demag_scope_check.setChecked(False),
+                    scope_fine_capture, title='ESC %d' % (esc_index + 1),
+                    metadata=scope_metadata,
+                    benchmark_status=lambda: (bench_label.text(), bench['active'])
+                    if bench.get('recipe') else None)
+            elif not sim.scope.enabled:
+                demag_scope.arm()
+            # Do not slow startup/arming automatically; Fine capture is
+            # available once the motor is running. The scope reports the
+            # actual sample period, including the stream's wall-rate cap.
+            sample_spin.setValue(0.5)
+        elif demag_scope is not None:
+            sim.scope.stop()
+        if demag_scope is not None:
+            demag_scope.setVisible(demag_scope_check.isChecked())
+        update_sim_enable()
+
+    demag_scope_check.toggled.connect(demag_scope_toggled)
 
     # rpm and throttle share a time axis but not a scale, so the throttle
     # gets its own right hand axis (0..1) on a linked view box
@@ -2157,6 +2224,200 @@ def create_esc_panel(args, app, fleet, esc_index):
         sim_stop_btn.setEnabled(False)
         sim_launch_status.setText('stopped')
 
+    # Benchmarks share explicit selection and Start/Stop controls. Merely
+    # selecting a recipe never changes the running ESC or its settings.
+    from sitl_benchmarks import registry
+    benchmark_recipes = registry()
+    bench = {'active': False, 'completed': False, 'stage': -1,
+             'deadline': None, 'wall_deadline': 0, 'recipe': None}
+    bench_select = QComboBox()
+    bench_select.addItem('None', None)
+    for recipe in benchmark_recipes.values():
+        bench_select.addItem(recipe.name, recipe.key)
+        bench_select.setItemData(bench_select.count()-1, recipe.description, Qt.ToolTipRole)
+    bench_btn = QPushButton('Start benchmark')
+    bench_cancel = QPushButton('Stop benchmark')
+    bench_label = QLabel('No benchmark selected')
+    bench_label.setWordWrap(True)
+    g4.addWidget(QLabel('Benchmark:'), 6, 0)
+    g4.addWidget(bench_select, 6, 1, 1, 3)
+    g4.addWidget(bench_btn, 6, 4)
+    g4.addWidget(bench_cancel, 6, 5)
+    g4.addWidget(bench_label, 7, 0, 1, 6)
+
+    def benchmark_controls():
+        bench_select.setEnabled(not bench['active'])
+        bench_btn.setEnabled(not bench['active'] and bench_select.currentData() is not None)
+        bench_cancel.setEnabled(bench['active'])
+
+    def benchmark_selected(*_):
+        key = bench_select.currentData()
+        bench_label.setText(benchmark_recipes[key].description if key else 'No benchmark selected')
+        benchmark_controls()
+
+    bench_select.currentIndexChanged.connect(benchmark_selected)
+    benchmark_controls()
+
+    def stop_bench():
+        bench['active'] = False
+        bench['completed'] = False
+        ds_value.setValue(0)
+        benchmark_controls()
+        bench_label.setText('Benchmark stopped; zero throttle; scope capture retained')
+
+    def start_bench():
+        key = bench_select.currentData()
+        if key is None or bench['active']:
+            return
+        recipe = benchmark_recipes[key]
+        if usb_mode.currentIndex() != USB_OFF:
+            bench_label.setText('Disconnect USB motor control before running the benchmark')
+            return
+        bench.update(recipe=key, completed=False)
+        import tempfile
+        from sitl_benchmarks import eeprom_image
+        wave_stop()
+        if can is not None:
+            can_enable.setChecked(False)
+        sim_halt()
+        ds_value.setValue(0)
+        ds_type.setCurrentText('dshot300')
+        ds_bidir.setChecked(False)
+        ds_edt.setChecked(False)
+        ds_rate.setValue(1000)
+        ds_enable.setChecked(True)
+        seed = sim_runner.bundled_eeprom(esc_index)
+        if not seed:
+            bench_label.setText('No bundled EEPROM seed available')
+            return
+        folder = tempfile.mkdtemp(prefix='am32-benchmark-esc%d-' % (esc_index + 1))
+        path = os.path.join(folder, 'eeprom.bin')
+        try:
+            with open(seed, 'rb') as f:
+                image = eeprom_image(f.read(), recipe.settings)
+            with open(path, 'wb') as f:
+                f.write(image)
+            # Snapshot models as well as EEPROM. Only load torque changes
+            # between stages; winding parameters and rotor state stay fixed.
+            with open(model_paths[recipe.model]) as f:
+                model = json.load(f)
+            stage_models = {}
+            for i, stage in enumerate(recipe.stages):
+                if i == 0 or stage.load is not None:
+                    if stage.load is not None:
+                        model['motor']['load_k_omega2'] = stage.load
+                    name = recipe.key + '_stage_%d' % i
+                    model_path = os.path.join(folder, name + '.json')
+                    with open(model_path, 'w') as f:
+                        json.dump(model, f, indent=2)
+                    stage_models[i] = model_path
+        except (OSError, ValueError, KeyError) as ex:
+            bench_label.setText(str(ex))
+            return
+        sim_ee_edit.setText(path)
+        model_saved(stage_models[0])
+        sim_input.setCurrentIndex(1)
+        sim_accurate.setChecked(True)
+        sim_verbose.setChecked(True)
+        speed_slider.setValue(150)
+        stuck_slider.setValue(0)
+        with sim.lock:
+            sim.samples.clear()
+        demag_scope_check.setChecked(True)
+        for channel, signal_key in zip(demag_scope.channels, ('vA', 'iA', 'eA', 'comp')):
+            enabled, source, _, _ = channel
+            source.setCurrentIndex(source.findData(signal_key))
+            enabled.setChecked(signal_key in ('vA', 'iA'))
+        demag_scope.phase.setCurrentIndex(0)
+        demag_scope.timebase.setCurrentIndex(demag_scope.timebase.findData(recipe.time_div_us))
+        demag_scope.pre.setValue(recipe.pretrigger * 100)
+        demag_scope.trigger.setCurrentText(recipe.trigger)
+        demag_scope.setup_changed()
+        demag_scope.phase.setCurrentIndex(3 if recipe.any_phase else 0)
+        demag_scope.edge.setCurrentText('Rising')
+        sim.scope.stop()  # capture after the recipe's startup stages
+        if not sim_launch():
+            bench_label.setText('Benchmark could not start: ' + sim_launch_status.text())
+            return
+        bench.update(active=True, completed=False, recipe=key, stage=0,
+                     deadline=recipe.stages[0].seconds, fine_ready=False, scaled=False,
+                     stage_models=stage_models, history=[], capture_metadata=None,
+                     capture_generation=sim.scope.snapshot()[0],
+                     wall_deadline=time.monotonic() + 120)
+        benchmark_controls()
+        bench_label.setText('Arming at zero throttle…')
+
+    def update_bench():
+        if not bench['active']:
+            return
+        recipe = benchmark_recipes[bench['recipe']]
+        demag_scope.refresh()
+        if (demag_scope.frame is not None and
+                demag_scope.generation > bench.get('capture_generation', -1) and
+                not bench.get('scaled', False)):
+            demag_scope.auto_scale()
+            bench['scaled'] = True
+        if time.monotonic() > bench['wall_deadline']:
+            stop_bench()
+            bench_label.setText('Benchmark timed out; inspect simulator output')
+            return
+        smp = sim.latest()
+        if not runner.is_running():
+            stop_bench()
+            bench_label.setText('Simulator exited; inspect its output below')
+            return
+        if smp is None or smp[0] < bench['deadline']:
+            return
+        stage_index = bench['stage'] + 1
+        if stage_index == len(recipe.stages):
+            bench['active'] = False
+            bench['completed'] = True
+            ds_value.setValue(0)
+            benchmark_controls()
+            captured = sim.scope.snapshot()[0] > bench.get('capture_generation', -1)
+            bench_label.setText('Benchmark complete; zero throttle. ' +
+                                ('Capture held.' if captured else 'No matching trigger captured.'))
+            return
+        stage = recipe.stages[stage_index]
+        if stage.capture and not bench.get('fine_ready', False):
+            # Settle both pacing and subscriber rate BEFORE arming or
+            # applying the load transition. This does not change physics dt.
+            scope_fine_capture()
+            bench['fine_ready'] = True
+            bench['deadline'] = smp[0] + .2
+            return
+        if stage.capture:
+            if recipe.full_duty and (len(smp) < 25 or smp[23] < .999):
+                stop_bench()
+                bench_label.setText('Full duty was not reached; inspect firmware/startup before comparing traces')
+                return
+            demag_scope.arm('Single')
+        model_path = bench['stage_models'].get(stage_index)
+        if model_path:
+            model_saved(model_path)
+            model_load()
+        bench['history'].append(dict(stage=stage_index, time_s=smp[0],
+                                     throttle=stage.throttle, load=stage.load))
+        bench.update(stage=stage_index, deadline=smp[0] + stage.seconds)
+        bench['setting_throttle'] = True
+        ds_value.setValue(stage.throttle)
+        bench['setting_throttle'] = False
+        bench_label.setText(stage.label or ('DShot %d · %.1f s simulated' %
+                                           (stage.throttle, stage.seconds)))
+
+    def manual_bench_override(*_):
+        if bench['active'] and not bench.get('setting_throttle', False):
+            bench['active'] = False
+            bench['completed'] = False
+            benchmark_controls()
+            bench_label.setText('Manual control; benchmark cancelled')
+
+    ds_value.valueChanged.connect(manual_bench_override)
+    ds_enable.toggled.connect(manual_bench_override)
+
+    bench_btn.clicked.connect(start_bench)
+    bench_cancel.clicked.connect(stop_bench)
+
     sim_start_btn.clicked.connect(sim_launch)
     sim_stop_btn.clicked.connect(sim_halt)
     top.addWidget(fl, 5, 0, 1, 2)
@@ -2468,6 +2729,67 @@ def create_esc_panel(args, app, fleet, esc_index):
                 sim.load_model(cargs[0])
         elif cmd == 'graph_i' or cmd == 'graphs':
             graph_i_check.setChecked(bool(int(cargs[0])))
+        elif cmd == 'benchmark':
+            if bench['active']:
+                raise ValueError('stop the active benchmark before selecting another')
+            key = ' '.join(cargs)
+            index = (0 if key.lower() == 'none' else bench_select.findData(key))
+            if index < 0:
+                index = bench_select.findText(key)
+            if index < 0:
+                raise ValueError('unknown benchmark: ' + key)
+            bench_select.setCurrentIndex(index)
+        elif cmd == 'benchmark_start':
+            if bench_select.currentData() is None:
+                raise ValueError('select a benchmark first')
+            start_bench()
+        elif cmd == 'benchmark_stop':
+            stop_bench()
+        elif cmd == 'demag_bench':
+            # Compatibility with the original partial-duty regression.
+            if bench['active']:
+                raise ValueError('a benchmark is already running')
+            bench_select.setCurrentIndex(bench_select.findData('demag_partial_desync'))
+            start_bench()
+        elif cmd == 'demag_stop':
+            stop_bench()
+        elif cmd == 'scope':
+            demag_scope_check.setChecked(bool(int(cargs[0])))
+        elif cmd in ('scope_status', 'benchmark_status'):
+            generation, frame, state = sim.scope.snapshot()
+            info = dict(generation=generation, state=state, bench_active=bench['active'],
+                        benchmark=bench_select.currentData(), benchmark_message=bench_label.text(),
+                        throttle_command=ds_value.value(), bench_stage=bench['stage'],
+                        bench_complete=bench.get('completed', False),
+                        points=len(frame.samples) if frame else 0)
+            if frame:
+                stats = frame.measurements(frame.trigger_phase)
+                info.update(sample_us=stats['sample_interval_s'] * 1e6,
+                            gaps=stats['gaps'], trigger=frame.reason, trigger_phase=frame.trigger_phase,
+                            measurements=stats,
+                            trigger_duty=min(frame.samples, key=lambda s: abs(s[0]-frame.trigger_time))[23] if len(frame.samples[0]) >= 25 else None)
+            smp = sim.latest()
+            if smp and len(smp) >= 25:
+                info['desync_count'] = smp[24]
+            reply('STATUS scope: ' + json.dumps(info))
+        elif cmd == 'scope_single':
+            demag_scope_check.setChecked(True)
+            demag_scope.arm('Single')
+        elif cmd == 'scope_trigger':
+            demag_scope_check.setChecked(True)
+            text = ' '.join(cargs)
+            index = demag_scope.trigger.findText(text)
+            if index < 0:
+                raise ValueError('unknown scope trigger: ' + text)
+            demag_scope.trigger.setCurrentIndex(index)
+        elif cmd == 'scope_save':
+            if demag_scope is None or demag_scope.frame is None:
+                raise ValueError('no scope capture')
+            demag_scope.save_csv(' '.join(cargs))
+        elif cmd == 'scope_snap':
+            if demag_scope is None:
+                raise ValueError('scope is closed')
+            demag_scope.save_png(' '.join(cargs))
         elif cmd == 'graph_v':
             graph_v_check.setChecked(bool(int(cargs[0])))
         elif cmd == 'signals':
@@ -2689,6 +3011,7 @@ def create_esc_panel(args, app, fleet, esc_index):
 
     def update():
         update_sim_status()
+        update_bench()
         if wave['kind'] is not None:
             # follow the waveform thread's throttle on the driven input's
             # slider (display only; the real command already went out on
@@ -2753,6 +3076,7 @@ def create_esc_panel(args, app, fleet, esc_index):
         if closed:
             return
         closed = True
+        bench['active'] = False
         eeprom_poll.close()
         for timer in (sim_view_timer, usb_timer, sim_out_timer, cmd_timer, update_timer):
             timer.stop()
@@ -2774,6 +3098,9 @@ def create_esc_panel(args, app, fleet, esc_index):
         runner.stop()
         sim.close()
         can_fps.close()
+        if demag_scope is not None:
+            demag_scope.timer.stop()
+            demag_scope.close()
         for graph in list(graph_windows.values()):
             graph[0].close()
         if 'win' in rpm_graph:

@@ -1123,6 +1123,35 @@ def test_usbip_device(unix=False):
         server.close()
 
 
+def test_scope_stream(sitl_path):
+    """Old subscriptions retain v2; opt-in scope packets expose v3."""
+    import unittest
+    import test_sitl_scope
+    suite = unittest.defaultTestLoader.loadTestsFromModule(test_sitl_scope)
+    result = unittest.TextTestRunner(verbosity=1).run(suite)
+    check('scope acquisition', result.wasSuccessful(), '%d tests' % result.testsRun)
+    with Sitl(sitl_path, ['--input-type', '1', '--can-uri', 'none']):
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.bind(('127.0.0.1', 0))
+            sock.settimeout(.2)
+            for flags, version, size in ((0, 2, 60), (2, 3, 100), (3, 3, 100), (1, 2, 60)):
+                sock.sendto(struct.pack('<HBBI', 0x5353, 0, flags, 50000),
+                            ('127.0.0.1', STATE_PORT))
+                deadline = time.monotonic() + 2
+                packet = None
+                while time.monotonic() < deadline:
+                    try:
+                        data = sock.recv(4096)
+                    except socket.timeout:
+                        continue
+                    if len(data) >= 4 and data[:3] == struct.pack('<HB', 0x5354, version):
+                        packet = data
+                        break
+                good = packet is not None and len(packet) == 4 + packet[3] * size
+                check('scope wire flags=%d' % flags, good,
+                      'version=%d bytes=%s' % (version, len(packet) if packet else 'none'))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--sitl', help='SITL binary (default: the one built '
@@ -1143,6 +1172,7 @@ def main():
     test_dshot(args.sitl, 'pwm', sd.TYPE_PWM,
                bidir=False, edt=False, value=1500, rpm_lo=3000, rpm_hi=7000,
                input_type=2)
+    test_scope_stream(args.sitl)
     test_startup_tune(args.sitl)
     test_beacon_tone(args.sitl)
     test_physics_audio(args.sitl)

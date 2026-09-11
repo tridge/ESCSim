@@ -109,3 +109,32 @@ They remain when tabs are removed, so adding a tab again restores its
 settings. FC protocol, bidirectional mode and pole count apply to all
 motors; motor order is fixed in tab order. Each tab's DroneCAN controls use
 a separate multicast bus. Signal/state ports increase by 10 per ESC.
+
+DEMAGNETISATION BENCH / VIRTUAL OSCILLOSCOPE
+
+In the simulation panel, choose a Benchmark (default: None), then click
+"Start benchmark". Selecting a benchmark does not start it. Each run uses
+the selected ESC, a private EEPROM and model snapshots in your Windows
+temporary directory. "Stop benchmark" cancels the run and sends zero throttle.
+
+Choose "Demag: full duty, 6S / 50 A" for the full-duty waveform and a
+roughly 16 microsecond current-decay pulse. The run arms, ramps to full
+throttle, then captures at 500 ns/sample and returns to zero throttle.
+"Demag: full duty, light load" shows a shorter pulse; "Demag: partial-duty
+PWM" shows the separate PWM-on/off voltage levels. "Demag: full duty, load
+to desync" increases mechanical load after reaching full duty and captures
+the first masked crossing. Its current rises above 50 A before the failure.
+
+"Virtual scope (DHO804)" opens the four-channel scope. Use RUN / STOP,
+SINGLE, time/div, per-channel scale/position and A/B cursors as on the
+physical scope. Channels include phase voltage/current, back EMF,
+virtual neutral and comparator output. "Fine capture" allows 500 ns
+samples at 0.1x simulation speed, preserving PWM on/off voltage levels.
+Save CSV + setup exports the physical data and firmware/model/settings
+metadata; Save screen PNG exports the view. Both use a Windows save dialog.
+
+The model is an estimated test case, not a calibrated copy of Alka's
+motor or an emulation of the Rigol instrument's bandwidth/ADC. Select a
+different native SITL executable with Browse to compare firmware fixes.
+If a fix prevents the fault, Single may keep waiting: select a Commutation
+or Edge trigger and RUN to inspect the healthy waveform instead.
