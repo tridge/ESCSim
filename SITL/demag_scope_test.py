@@ -5,6 +5,7 @@ AM32_ROOT=/path/to/AM32 python3 SITL/demag_scope_test.py --outdir /tmp/demag
 The default recipe checks the steady full-duty waveform at approximately 50 A.
 For failure tests choose --benchmark demag_full_overload --expect-masked.
 Omit --expect-masked when a firmware fix should leave the fault trigger waiting.
+Use --exe dist/am32-sitl-gui.exe to test the packaged Windows GUI and firmware.
 """
 import argparse
 import csv
@@ -26,7 +27,9 @@ def free_port(kind):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--outdir', type=Path, required=True)
-    ap.add_argument('--sitl')
+    binaries = ap.add_mutually_exclusive_group()
+    binaries.add_argument('--sitl')
+    binaries.add_argument('--exe', type=Path, help='test a packaged GUI with its bundled firmware')
     from sitl_benchmarks import registry
     recipes = registry()
     ap.add_argument('--benchmark', choices=recipes, default='demag_full_duty')
@@ -40,17 +43,29 @@ def main():
     ports = [free_port(socket.SOCK_DGRAM) for _ in range(2)]
     while ports[0] == ports[1]:
         ports[1] = free_port(socket.SOCK_DGRAM)
-    env = dict(os.environ, QT_QPA_PLATFORM='offscreen')
+    env = dict(os.environ)
+    env.setdefault('QT_QPA_PLATFORM', 'offscreen')
     if args.sitl:
         env['AM32_SITL'] = os.path.abspath(args.sitl)
     path = Path(__file__).with_name('sitl_gui.py')
+    launcher = [sys.executable, str(path)]
+    if args.exe:
+        launcher = [str(args.exe.resolve())]
+        env['LOCALAPPDATA'] = str(args.outdir.resolve()/'appdata')
+        env.pop('AM32_SITL', None)
+        # Verify the packaged runtime without relying on installed Cygwin DLLs.
+        env['PATH'] = os.pathsep.join(p for p in env.get('PATH', '').split(os.pathsep)
+                                      if 'cygwin' not in p.lower())
     with (args.outdir/'gui.log').open('w') as log:
-        proc = subprocess.Popen([sys.executable, str(path), '--can-uri', 'mcast:8',
+        proc = subprocess.Popen(launcher + ['--can-uri', 'mcast:8',
             '--port', str(ports[0]), '--state-port', str(ports[1]),
             '--control-port', str(control)], stdout=log, stderr=log, env=env)
         def command(text):
             with socket.create_connection(('127.0.0.1', control), timeout=5) as s:
                 s.sendall((text+'\n').encode())
+                # Quit has no reply; wait for normal process cleanup below.
+                if text == 'quit':
+                    return []
                 response = []
                 with s.makefile() as f:
                     for line in f:
@@ -62,7 +77,7 @@ def main():
                         response.append(line)
                 raise RuntimeError('GUI disconnected')
         try:
-            deadline = time.monotonic()+30
+            deadline = time.monotonic()+(120 if args.exe else 30)
             while True:
                 try:
                     command('scope_status')
@@ -178,7 +193,7 @@ def main():
             except (OSError, RuntimeError):
                 proc.terminate()
             try:
-                proc.wait(timeout=10)
+                proc.wait(timeout=20)
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
